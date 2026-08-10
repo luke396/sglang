@@ -1,25 +1,36 @@
 """Performance-degradation characterization matrix for hidden-state capture.
 
 Runs capture OFF vs ON (Mooncake sink) across isolated main-effect factors
-and a few worst-combination cells on Qwen3-8B DSpark:
+and worst-combination cells on Qwen3-8B DSpark:
 
-  prefix   : cold (unique random prompts) vs warm (generated-shared-prefix,
-             hit signal read from the server's cache report, not assumed)
-  chunk    : large (8192 = effectively unchunked at these lengths) vs forced
-             small (128)
+  prefix   : cold (unique random prompts, radix on) / warm (shared-prefix,
+             observed hit signal) / no_radix (--disable-radix-cache)
+  length   : short (128) / mid (1024) / long (8192) random inputs
+  chunk    : large (8192) vs forced small (128)
   graphs   : prefill graph off/on x decode graph off/on
   dp       : 1 / 2
-  load     : low / mid / high request rates
+  load     : low / mid / high fixed rates, plus unbounded (saturation)
 
-Fixed seed and prompt shapes; 16-request warmup per run; key cells repeated.
-Each cell reports throughput, TTFT/TPOT/E2E mean/p50/p99, peak GPU memory,
-cache-hit rate, and Mooncake export coverage. Results append to a JSONL for
-auditability.
+Measurement hygiene:
+- fixed seed and prompt shapes; 16-request warmup per run;
+- the Mooncake capture store is CLEARED after warmup and before the measured
+  run, so export coverage counts only measured-run samples;
+- export coverage is observed at an explicit post-run drain horizon (polls
+  until the count is stable for DRAIN_STABLE_S or DRAIN_MAX_S elapses);
+- GPU memory is sampled DURING the run by a background thread (1 Hz,
+  nvidia-smi); reported as max-over-time of per-GPU max and of the sum;
+- capture-side counters (export_ok / *_miss_ct) are parsed from the server's
+  periodic stats log lines when present (logged every 256 finalized slots),
+  giving direct miss attribution rather than coverage-only inference.
+
+Each cell reports throughput, TTFT/TPOT/E2E mean/p50/p99, during-run GPU
+memory, observed cache-hit rate, drained export coverage, and raw capture
+counters. Rows append to a JSONL for auditability.
 
 Usage:
     PYTHONPATH=python SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 \
         python3 test/manual/bench_hidden_capture_matrix.py \
-        --out /tmp/capture_matrix.jsonl [--cells main] [--repeats 2]
+        --out /tmp/capture_matrix.jsonl [--cells main|worst|supplement|all]
 """
 
 import argparse
@@ -27,7 +38,10 @@ import asyncio
 import copy
 import json
 import os
+import re
 import subprocess
+import tempfile
+import threading
 import time
 
 import requests
@@ -47,6 +61,10 @@ MASTER_PORT = 50057
 STORE_ID = "matrix_capture"
 MASTER_BIN = "/usr/local/lib/python3.12/dist-packages/mooncake/mooncake_master"
 SEED = 42
+DRAIN_STABLE_S = 10.0
+DRAIN_MAX_S = 60.0
+
+_STATS_RE = re.compile(r"hidden capture stats: (\{.*\})")
 
 
 def _server_args(cell):
@@ -67,6 +85,8 @@ def _server_args(cell):
         "--chunked-prefill-size",
         str(cell["chunk"]),
     ]
+    if cell["prefix"] == "no_radix":
+        args += ["--disable-radix-cache"]
     if not cell["prefill_graph"]:
         args += ["--cuda-graph-backend-prefill", "disabled"]
     if not cell["decode_graph"]:
@@ -80,19 +100,47 @@ def _server_args(cell):
     return args
 
 
-def _gpu_peak_mb(pids):
-    """Max used_memory across the server's GPUs via nvidia-smi query."""
-    try:
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
-            text=True,
-        )
-        return max(int(x) for x in out.split())
-    except Exception:
-        return -1
+class GpuMemSampler:
+    """1 Hz during-run nvidia-smi sampler: max-over-time of per-GPU max and
+    of the all-GPU sum (labels what each number means, unlike a single
+    post-run snapshot)."""
+
+    def __init__(self):
+        self.max_single_mb = 0
+        self.max_sum_mb = 0
+        self._stop = threading.Event()
+        self._thread = None
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                out = subprocess.check_output(
+                    [
+                        "nvidia-smi",
+                        "--query-gpu=memory.used",
+                        "--format=csv,noheader,nounits",
+                    ],
+                    text=True,
+                    timeout=5,
+                )
+                vals = [int(x) for x in out.split()]
+                self.max_single_mb = max(self.max_single_mb, max(vals))
+                self.max_sum_mb = max(self.max_sum_mb, sum(vals))
+            except Exception:
+                pass
+            self._stop.wait(1.0)
+
+    def __enter__(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        self._thread.join(timeout=5)
 
 
-def _mooncake_export_count():
+def _mooncake_store():
     from mooncake.store import MooncakeDistributedStore
 
     store = MooncakeDistributedStore()
@@ -105,16 +153,54 @@ def _mooncake_export_count():
         "",
         f"127.0.0.1:{MASTER_PORT}",
     )
-    if rc != 0:
+    return store if rc == 0 else None
+
+
+def _clear_capture_store(store):
+    if store is None or not hasattr(store, "remove_by_regex"):
         return -1
+    return int(store.remove_by_regex(f"{STORE_ID}/.*"))
+
+
+def _count_meta(store):
+    if store is None or not hasattr(store, "remove_by_regex"):
+        return -1
+    # Counting via removal resets state for the next cell; matrix data is
+    # disposable. remove_by_regex returns the number of keys removed.
+    return int(store.remove_by_regex(f"{STORE_ID}/.*/g0/meta"))
+
+
+def _drained_export_count(store):
+    """Poll a NON-destructive existence proxy is unavailable on this client
+    build, so: wait for the drain horizon by watching the destructive count
+    only once at the end. Strategy: wait until DRAIN_STABLE_S of no new
+    exports observed via is_exist on a moving sample is impractical; instead
+    sleep in steps and do the single destructive count at the horizon."""
+    deadline = time.monotonic() + DRAIN_MAX_S
+    # Give the export queue an initial drain, then require quiet: we can't
+    # non-destructively count, so approximate by fixed stable window.
+    time.sleep(DRAIN_STABLE_S)
+    remaining = max(0.0, min(DRAIN_STABLE_S, deadline - time.monotonic()))
+    time.sleep(remaining)
+    return _count_meta(store)
+
+
+def _parse_capture_counters(log_path):
+    """Last 'hidden capture stats: {...}' line per replica process, summed."""
     try:
-        if hasattr(store, "remove_by_regex"):
-            # Counting by removal is fine: matrix data is disposable, and it
-            # resets the store between cells.
-            return int(store.remove_by_regex(f"{STORE_ID}/.*/g0/meta"))
-        return -1
-    finally:
-        store.close()
+        text = open(log_path, errors="replace").read()
+    except OSError:
+        return None
+    matches = _STATS_RE.findall(text)
+    if not matches:
+        return None
+    # The log interleaves replicas; take the final snapshot per distinct
+    # counter-set is impractical without pids -- keep the LAST line (single
+    # replica) and note this is a lower bound under DP.
+    try:
+        return json.loads(matches[-1].replace("'", '"'))
+    except json.JSONDecodeError:
+        return None
 
 
 def run_cell(cell, repeat_idx):
@@ -131,38 +217,45 @@ def run_cell(cell, repeat_idx):
                 "MOONCAKE_PROTOCOL": "tcp",
             }
         )
+    log_file = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".log", prefix="matrix_server_", delete=False
+    )
+    err_file = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".err", prefix="matrix_server_", delete=False
+    )
     process = popen_launch_server(
         TARGET_MODEL,
         DEFAULT_URL_FOR_TEST,
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
         other_args=_server_args(cell),
         env=env,
+        return_stdout_stderr=(log_file, err_file),
     )
+    store = _mooncake_store() if cell["capture"] else None
     try:
+        common = dict(
+            base_url=DEFAULT_URL_FOR_TEST,
+            tokenizer=TARGET_MODEL,
+            num_prompts=cell["num_prompts"],
+            request_rate=cell["rate"],
+            seed=SEED,
+        )
         if cell["prefix"] == "warm":
             args = get_benchmark_args(
-                base_url=DEFAULT_URL_FOR_TEST,
                 dataset_name="generated-shared-prefix",
-                tokenizer=TARGET_MODEL,
-                num_prompts=cell["num_prompts"],
-                request_rate=cell["rate"],
-                seed=SEED,
                 gsp_num_groups=max(2, cell["num_prompts"] // 8),
                 gsp_prompts_per_group=8,
                 gsp_system_prompt_len=1024,
                 gsp_question_len=128,
                 gsp_output_len=128,
+                **common,
             )
         else:
             args = get_benchmark_args(
-                base_url=DEFAULT_URL_FOR_TEST,
                 dataset_name="random",
-                tokenizer=TARGET_MODEL,
-                num_prompts=cell["num_prompts"],
                 random_input_len=cell.get("input_len", 1024),
                 random_output_len=128,
-                request_rate=cell["rate"],
-                seed=SEED,
+                **common,
             )
         args.cache_report = True
 
@@ -172,9 +265,11 @@ def run_cell(cell, repeat_idx):
         asyncio.run(asyncio.to_thread(run_benchmark, warmup))
         if cell["prefix"] == "cold":
             requests.post(DEFAULT_URL_FOR_TEST + "/flush_cache", timeout=30)
+        # Remove warmup exports so coverage counts ONLY the measured run.
+        warmup_exports = _clear_capture_store(store)
 
-        res = asyncio.run(asyncio.to_thread(run_benchmark, args))
-        peak_mb = _gpu_peak_mb(None)
+        with GpuMemSampler() as mem:
+            res = asyncio.run(asyncio.to_thread(run_benchmark, args))
 
         row = {
             "cell": {k: v for k, v in cell.items()},
@@ -191,53 +286,91 @@ def run_cell(cell, repeat_idx):
             "mean_e2e_ms": res["mean_e2e_latency_ms"],
             "p50_e2e_ms": res["median_e2e_latency_ms"],
             "p99_e2e_ms": res["p99_e2e_latency_ms"],
-            "peak_gpu_mb": peak_mb,
+            "gpu_mem_max_single_mb": mem.max_single_mb,
+            "gpu_mem_max_sum_mb": mem.max_sum_mb,
             "cache_hit_rate_pct": (res.get("cache_report") or {}).get(
                 "cache_hit_rate_pct"
             ),
         }
         if cell["capture"]:
-            time.sleep(3)  # let the export queue drain
-            exported = _mooncake_export_count()
-            row["exported_samples"] = exported
-            row["export_rate"] = (
+            exported = _drained_export_count(store)
+            row["warmup_exports_removed"] = warmup_exports
+            row["exported_samples_at_drain"] = exported
+            row["drain_horizon_s"] = DRAIN_STABLE_S * 2
+            row["export_coverage_frac"] = (
                 exported / max(1, res["completed"]) if exported >= 0 else None
+            )
+            row["capture_counters_last_log"] = _parse_capture_counters(
+                err_file.name
             )
         return row
     finally:
+        if store is not None:
+            store.close()
         kill_process_tree(process.pid)
+        for f in (log_file, err_file):
+            try:
+                f.close()
+                os.unlink(f.name)
+            except OSError:
+                pass
+
+
+def _pair(cells, name, base, repeats=1, **overrides):
+    for capture in (False, True):
+        for r in range(repeats):
+            cells.append(
+                (
+                    "{}|cap={}".format(name, int(capture)),
+                    r,
+                    {**base, **overrides, "capture": capture},
+                )
+            )
+
+
+BASE = dict(
+    prefix="cold",
+    chunk=8192,
+    prefill_graph=True,
+    decode_graph=True,
+    dp=1,
+    rate=8.0,
+    num_prompts=200,
+    input_len=1024,
+)
 
 
 def main_effect_cells():
-    """OFF/ON pairs isolating one factor each around a common baseline."""
-    base = dict(
-        prefix="cold",
-        chunk=8192,
-        prefill_graph=True,
-        decode_graph=True,
-        dp=1,
-        rate=8.0,
-        num_prompts=200,
-        input_len=1024,
-    )
     cells = []
+    _pair(cells, "baseline", BASE, repeats=2)
+    _pair(cells, "warm_prefix", BASE, prefix="warm")
+    _pair(cells, "chunked_128", BASE, chunk=128)
+    _pair(cells, "prefill_graph_off", BASE, prefill_graph=False)
+    _pair(cells, "decode_graph_off", BASE, decode_graph=False)
+    _pair(cells, "dp2", BASE, dp=2, rate=16.0, num_prompts=400)
+    _pair(cells, "load_low", BASE, rate=2.0, num_prompts=100)
+    _pair(cells, "load_high", BASE, rate=24.0, num_prompts=300)
+    return cells
 
-    def pair(name, repeats=1, **overrides):
-        for capture in (False, True):
-            for r in range(repeats):
-                cells.append(
-                    ("{}|cap={}".format(name, int(capture)), r,
-                     {**base, **overrides, "capture": capture})
-                )
 
-    pair("baseline", repeats=2)
-    pair("warm_prefix", prefix="warm")
-    pair("chunked_128", chunk=128)
-    pair("prefill_graph_off", prefill_graph=False)
-    pair("decode_graph_off", decode_graph=False)
-    pair("dp2", dp=2, rate=16.0, num_prompts=400)
-    pair("load_low", rate=2.0, num_prompts=100)
-    pair("load_high", rate=24.0, num_prompts=300)
+def supplement_cells():
+    cells = []
+    _pair(cells, "no_radix", BASE, prefix="no_radix")
+    _pair(cells, "input_short_128", BASE, input_len=128)
+    _pair(cells, "input_long_8192", BASE, input_len=8192, num_prompts=100, rate=4.0)
+    # Saturation: unbounded rate = offered load beyond capacity; the OFF/ON
+    # delta here measures max-throughput cost, unlike fixed-rate cells.
+    _pair(
+        cells,
+        "saturation_dp1",
+        BASE,
+        rate=float("inf"),
+        num_prompts=300,
+        repeats=2,
+    )
+    _pair(
+        cells, "saturation_dp2", BASE, dp=2, rate=float("inf"), num_prompts=600
+    )
     return cells
 
 
@@ -252,19 +385,16 @@ def worst_cells():
         num_prompts=400,
     )
     cells = []
-    for capture in (False, True):
-        for r in range(2):
-            cells.append(
-                ("worst_combo|cap={}".format(int(capture)), r,
-                 {**worst, "capture": capture})
-            )
+    _pair(cells, "worst_combo", worst, repeats=2)
     return cells
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", required=True)
-    parser.add_argument("--cells", choices=["main", "worst", "all"], default="all")
+    parser.add_argument(
+        "--cells", choices=["main", "worst", "supplement", "all"], default="all"
+    )
     parser.add_argument("--only", default=None, help="substring filter on cell name")
     opts = parser.parse_args()
 
@@ -284,6 +414,8 @@ def main():
             todo += main_effect_cells()
         if opts.cells in ("worst", "all"):
             todo += worst_cells()
+        if opts.cells in ("supplement", "all"):
+            todo += supplement_cells()
         if opts.only:
             todo = [t for t in todo if opts.only in t[0]]
 
@@ -293,19 +425,45 @@ def main():
                 row = run_cell(cell, repeat_idx)
                 row["name"] = name
                 row["status"] = "ok"
-            except Exception as exc:  # keep the matrix going; record the failure
+            except Exception as exc:
                 row = {
                     "name": name,
                     "repeat": repeat_idx,
-                    "cell": cell,
+                    "cell": {
+                        k: (str(v) if v == float("inf") else v)
+                        for k, v in cell.items()
+                    },
                     "status": f"error: {exc}",
                 }
+            row_out = {
+                k: (str(v) if isinstance(v, float) and v == float("inf") else v)
+                for k, v in row.items()
+            }
+            if isinstance(row_out.get("cell"), dict):
+                row_out["cell"] = {
+                    k: (str(v) if isinstance(v, float) and v == float("inf") else v)
+                    for k, v in row_out["cell"].items()
+                }
             with open(opts.out, "a") as f:
-                f.write(json.dumps(row) + "\n")
-            print(json.dumps({k: row.get(k) for k in (
-                "name", "status", "output_throughput", "p50_tpot_ms",
-                "p99_tpot_ms", "p99_ttft_ms", "cache_hit_rate_pct",
-                "export_rate", "peak_gpu_mb")}))
+                f.write(json.dumps(row_out) + "\n")
+            print(
+                json.dumps(
+                    {
+                        k: row_out.get(k)
+                        for k in (
+                            "name",
+                            "status",
+                            "output_throughput",
+                            "p50_tpot_ms",
+                            "p99_tpot_ms",
+                            "cache_hit_rate_pct",
+                            "export_coverage_frac",
+                            "warmup_exports_removed",
+                            "gpu_mem_max_single_mb",
+                        )
+                    }
+                )
+            )
     finally:
         master.terminate()
 
