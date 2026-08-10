@@ -14,9 +14,12 @@ and worst-combination cells on Qwen3-8B DSpark:
 Measurement hygiene:
 - fixed seed and prompt shapes; 16-request warmup per run;
 - the Mooncake capture store is CLEARED after warmup and before the measured
-  run, so export coverage counts only measured-run samples;
-- export coverage is observed at an explicit post-run drain horizon (polls
-  until the count is stable for DRAIN_STABLE_S or DRAIN_MAX_S elapses);
+  run, so export coverage counts only measured-run samples. The recorded
+  ``pre_measure_keys_removed`` is a STORE-KEY count (meta + tensor keys, and
+  may include tensor-key residue from the previous cell whose meta counting
+  left them behind), NOT a number of warmup samples;
+- export coverage is observed at a FIXED 20-second post-run drain horizon
+  (this client build has no non-destructive count, so no stability polling);
 - GPU memory is sampled DURING the run by a background thread (1 Hz,
   nvidia-smi); reported as max-over-time of per-GPU max and of the sum;
 - capture-side counters (export_ok / *_miss_ct) are parsed from the server's
@@ -61,8 +64,7 @@ MASTER_PORT = 50057
 STORE_ID = "matrix_capture"
 MASTER_BIN = "/usr/local/lib/python3.12/dist-packages/mooncake/mooncake_master"
 SEED = 42
-DRAIN_STABLE_S = 10.0
-DRAIN_MAX_S = 60.0
+DRAIN_HORIZON_S = 20.0
 
 _STATS_RE = re.compile(r"hidden capture stats: (\{.*\})")
 
@@ -171,17 +173,14 @@ def _count_meta(store):
 
 
 def _drained_export_count(store):
-    """Poll a NON-destructive existence proxy is unavailable on this client
-    build, so: wait for the drain horizon by watching the destructive count
-    only once at the end. Strategy: wait until DRAIN_STABLE_S of no new
-    exports observed via is_exist on a moving sample is impractical; instead
-    sleep in steps and do the single destructive count at the horizon."""
-    deadline = time.monotonic() + DRAIN_MAX_S
-    # Give the export queue an initial drain, then require quiet: we can't
-    # non-destructively count, so approximate by fixed stable window.
-    time.sleep(DRAIN_STABLE_S)
-    remaining = max(0.0, min(DRAIN_STABLE_S, deadline - time.monotonic()))
-    time.sleep(remaining)
+    """Meta-key count at a FIXED 20-second post-run drain horizon.
+
+    This client build has no non-destructive count/scan, so there is no
+    stability polling — just a fixed wait, then one destructive count
+    (remove_by_regex returns the number of keys removed, which for the meta
+    pattern equals exported samples; it leaves tensor keys behind for the
+    next cell's pre-measure clear to sweep)."""
+    time.sleep(DRAIN_HORIZON_S)
     return _count_meta(store)
 
 
@@ -294,15 +293,17 @@ def run_cell(cell, repeat_idx):
         }
         if cell["capture"]:
             exported = _drained_export_count(store)
-            row["warmup_exports_removed"] = warmup_exports
+            # Store-KEY count from the pre-measure clear (meta + tensor keys,
+            # possibly including previous-cell tensor residue) — NOT a number
+            # of warmup samples. v2 raw rows recorded this same quantity
+            # under the legacy name warmup_exports_removed.
+            row["pre_measure_keys_removed"] = warmup_exports
             row["exported_samples_at_drain"] = exported
-            row["drain_horizon_s"] = DRAIN_STABLE_S * 2
+            row["drain_horizon_s"] = DRAIN_HORIZON_S
             row["export_coverage_frac"] = (
                 exported / max(1, res["completed"]) if exported >= 0 else None
             )
-            row["capture_counters_last_log"] = _parse_capture_counters(
-                err_file.name
-            )
+            row["capture_counters_last_log"] = _parse_capture_counters(err_file.name)
         return row
     finally:
         if store is not None:
@@ -368,9 +369,7 @@ def supplement_cells():
         num_prompts=300,
         repeats=2,
     )
-    _pair(
-        cells, "saturation_dp2", BASE, dp=2, rate=float("inf"), num_prompts=600
-    )
+    _pair(cells, "saturation_dp2", BASE, dp=2, rate=float("inf"), num_prompts=600)
     return cells
 
 
@@ -430,8 +429,7 @@ def main():
                     "name": name,
                     "repeat": repeat_idx,
                     "cell": {
-                        k: (str(v) if v == float("inf") else v)
-                        for k, v in cell.items()
+                        k: (str(v) if v == float("inf") else v) for k, v in cell.items()
                     },
                     "status": f"error: {exc}",
                 }
@@ -458,7 +456,7 @@ def main():
                             "p99_tpot_ms",
                             "cache_hit_rate_pct",
                             "export_coverage_frac",
-                            "warmup_exports_removed",
+                            "pre_measure_keys_removed",
                             "gpu_mem_max_single_mb",
                         )
                     }
