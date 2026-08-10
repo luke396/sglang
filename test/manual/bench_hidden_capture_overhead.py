@@ -26,7 +26,7 @@ TARGET_MODEL = "Qwen/Qwen3-8B"
 DRAFT_MODEL = "deepseek-ai/dspark_qwen3_8b_block7"
 
 
-def _server_args(capture: bool):
+def _server_args(capture: bool, dp: int = 1):
     args = [
         "--trust-remote-code",
         "--attention-backend",
@@ -44,6 +44,8 @@ def _server_args(capture: bool):
         "--cuda-graph-backend-prefill",
         "disabled",
     ]
+    if dp > 1:
+        args += ["--dp", str(dp)]
     if capture:
         args.append("--enable-hidden-state-capture")
     return args
@@ -67,7 +69,7 @@ def _run(name: str, capture: bool, opts) -> dict:
         model=TARGET_MODEL,
         num_prompts=opts.num_prompts,
         request_rate=opts.request_rate,
-        other_server_args=_server_args(capture),
+        other_server_args=_server_args(capture, dp=opts.dp),
         random_input_len=opts.input_len,
         random_output_len=opts.output_len,
         need_warmup=True,
@@ -135,6 +137,7 @@ def main():
     parser.add_argument("--rounds", type=int, default=1)
     parser.add_argument("--sink", choices=["file", "mooncake"], default="file")
     parser.add_argument("--mooncake-port", type=int, default=50053)
+    parser.add_argument("--dp", type=int, default=1)
     opts = parser.parse_args()
     assert not is_in_ci(), "manual benchmark; do not run in CI"
 

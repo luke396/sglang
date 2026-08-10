@@ -449,14 +449,36 @@ class TestHiddenCaptureMissSemantics(CustomTestCase):
 
 
 class TestHiddenCaptureDPReplicas(CustomTestCase):
-    """Replica-level DP (--dp 2, no DP attention): each replica's scheduler
-    runs its own capture pipeline into a shared sink dir. Requires 2 GPUs."""
+    """Replica-level DP (--dp 2, no DP attention) writer ownership and
+    consumer completeness against the acceptance sink (Mooncake): every
+    request exports exactly once (no missing writes, no duplicate or
+    cross-replica writes) and each sample reads back with its own content.
+    Requires 2 GPUs and the mooncake binaries."""
+
+    MASTER_PORT = 50055
+    STORE_ID = "dp_ownership"
+    MASTER_BIN = "/usr/local/lib/python3.12/dist-packages/mooncake/mooncake_master"
 
     @classmethod
     def setUpClass(cls):
         if torch.cuda.device_count() < 2:
             raise unittest.SkipTest("needs 2 GPUs")
-        cls.capture_dir = tempfile.mkdtemp(prefix="hidden_capture_dp_")
+        import subprocess
+
+        cls.master = subprocess.Popen(
+            [
+                (
+                    cls.MASTER_BIN
+                    if os.path.exists(cls.MASTER_BIN)
+                    else "mooncake_master"
+                ),
+                "--port",
+                str(cls.MASTER_PORT),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(2)
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             TARGET_MODEL,
@@ -466,7 +488,10 @@ class TestHiddenCaptureDPReplicas(CustomTestCase):
             env={
                 **os.environ,
                 "SGLANG_RAGGED_VERIFY_MODE": "compact",
-                "SGLANG_HIDDEN_CAPTURE_DIR": cls.capture_dir,
+                "SGLANG_HIDDEN_CAPTURE_SINK": "mooncake",
+                "SGLANG_HIDDEN_CAPTURE_STORE_ID": cls.STORE_ID,
+                "MOONCAKE_MASTER": f"127.0.0.1:{cls.MASTER_PORT}",
+                "MOONCAKE_PROTOCOL": "tcp",
             },
         )
         from transformers import AutoTokenizer
@@ -477,32 +502,110 @@ class TestHiddenCaptureDPReplicas(CustomTestCase):
     def tearDownClass(cls):
         if hasattr(cls, "process") and cls.process:
             kill_process_tree(cls.process.pid)
+        if hasattr(cls, "master") and cls.master:
+            cls.master.terminate()
 
-    def test_replicas_export_without_collisions(self):
-        # Distinct prompts so the round-robin router spreads them over both
-        # replicas; rids are globally unique, so no filename collisions.
+    def _consumer(self):
+        from mooncake.store import MooncakeDistributedStore
+
+        store = MooncakeDistributedStore()
+        rc = store.setup(
+            "localhost",
+            "P2PHANDSHAKE",
+            2 * 1024**3,
+            128 * 1024**2,
+            "tcp",
+            "",
+            f"127.0.0.1:{self.MASTER_PORT}",
+        )
+        self.assertEqual(rc, 0)
+        return store
+
+    def _consume_tensor(self, store, key, spec):
+        out = torch.empty(
+            [int(x) for x in spec["shape"]],
+            dtype=getattr(torch, spec["dtype"].split(".")[-1]),
+        )
+        nb = out.numel() * out.element_size()
+        store.register_buffer(out.data_ptr(), nb)
+        n = store.get_into(key, out.data_ptr(), nb)
+        store.unregister_buffer(out.data_ptr())
+        self.assertEqual(n, nb, key)
+        return out
+
+    def test_dp_writer_ownership_and_completeness(self):
+        # Pin each request to an explicit replica (routed_dp_rank alternating
+        # 0/1) so BOTH DP ranks' writers are provably exercised — no reliance
+        # on router behavior.
         prompts = [f"Write the number {i} as an English word:" for i in range(12)]
         rids = []
-        for prompt in prompts:
-            result = _generate(
-                self.base_url, self.tokenizer(prompt).input_ids, max_new_tokens=4
+        expected_ids = []
+        pinned_ranks = []
+        for i, prompt in enumerate(prompts):
+            ids = self.tokenizer(prompt).input_ids
+            rank = i % 2
+            response = requests.post(
+                self.base_url + "/generate",
+                json={
+                    "input_ids": ids,
+                    "routed_dp_rank": rank,
+                    "sampling_params": {"temperature": 0, "max_new_tokens": 4},
+                },
             )
+            response.raise_for_status()
+            result = response.json()
             rids.append(result["meta_info"]["id"])
+            pinned_ranks.append(rank)
+            # Coverage: prompt + 4 generated - 1 (final token has no row).
+            expected_ids.append((ids + result["output_ids"])[: len(ids) + 3])
+        # Both ranks served requests.
+        self.assertEqual(set(pinned_ranks), {0, 1})
+        # No duplicate rids: a duplicate would collapse two samples onto one
+        # key set (the duplicate-write failure mode). First-write-wins on a
+        # real duplicate is covered by the sink unit test
+        # (test_hidden_capture_mooncake.py::test_duplicate_sample_id_first_write_wins).
         self.assertEqual(len(set(rids)), len(rids))
 
-        exported = 0
-        for rid, prompt in zip(rids, prompts):
-            record = _wait_for_ckpt(self.capture_dir, rid)
-            self.assertIsNotNone(record, f"missing export for {rid}")
-            expected = self.tokenizer(prompt).input_ids
-            self.assertEqual(record["input_ids"][: len(expected)].tolist(), expected)
-            exported += 1
-        self.assertEqual(exported, len(prompts))
-        # Single coherent fingerprint despite two replica writers.
-        with open(os.path.join(self.capture_dir, "_fingerprint.json")) as f:
+        store = self._consumer()
+        try:
+            # Completeness across BOTH writers: every pinned request's meta
+            # appears — rank-0 and rank-1 samples alike. A dead writer on
+            # either replica fails this within one rank's half of the set.
+            deadline = time.monotonic() + 60
+            missing = set(rids)
+            while missing and time.monotonic() < deadline:
+                missing = {
+                    rid
+                    for rid in missing
+                    if int(store.is_exist(f"{self.STORE_ID}/{rid}/g0/meta")) != 1
+                }
+                if missing:
+                    time.sleep(0.5)
+            missing_ranks = {pinned_ranks[rids.index(rid)] for rid in missing}
             self.assertEqual(
-                json.load(f)["norm_contract"], "post_final_norm_pre_lm_head"
+                missing,
+                set(),
+                f"exports dropped (from dp rank(s) {missing_ranks}): {missing}",
             )
+
+            # Ownership: each sample's consumed input_ids belong to ITS
+            # request (a cross-replica mixup or kv-slot bleed would surface
+            # here), with decode rows covered on both ranks.
+            for rid, expected in zip(rids, expected_ids):
+                meta = json.loads(bytes(store.get(f"{self.STORE_ID}/{rid}/g0/meta")))
+                self.assertEqual(meta["rid"], rid)
+                self.assertEqual(meta["num_tokens"], len(expected))
+                ids_back = self._consume_tensor(
+                    store,
+                    f"{self.STORE_ID}/{rid}/g0/input_ids",
+                    meta["tensors"]["input_ids"],
+                )
+                self.assertEqual(ids_back.tolist(), expected, f"rid {rid}")
+            # Fingerprint written once, coherent across two replica writers.
+            fp = json.loads(bytes(store.get(f"{self.STORE_ID}/_fingerprint")))
+            self.assertEqual(fp["coverage"], "prefill_and_verify_commit")
+        finally:
+            store.close()
 
 
 if __name__ == "__main__":
