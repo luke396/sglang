@@ -37,7 +37,6 @@ import torch
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.cuda_graph_config import Backend as CudaGraphBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.state_capturer.hidden_host import (
@@ -176,14 +175,6 @@ class HiddenStatesCapturer:
             (
                 server_args.enable_mixed_chunk,
                 "mixed prefill/decode batches are unsupported",
-            ),
-            (
-                server_args.cuda_graph_config.prefill.backend
-                != CudaGraphBackend.DISABLED,
-                "prefill CUDA graph replays overwrite static output buffers; "
-                "every graph-run prefill would be a capture miss (zero yield). "
-                "Launch with --disable-prefill-cuda-graph "
-                "(or --cuda-graph-backend-prefill=disabled)",
             ),
         ]
         for failed, reason in gates:
@@ -366,12 +357,17 @@ class HiddenStatesCapturer:
             self.bookkeeper.mark_miss(rids)
             return None
         if can_run_graph:
-            # CUDA-graph replays overwrite static output buffers; staging from
-            # them races the next replay. M1 fails closed (see plan: verify /
-            # graph capture needs an explicit fence or device staging ring).
-            self.stats.bump("skipped_forward_ct")
-            self.bookkeeper.mark_miss(rids)
-            return None
+            # Prefill CUDA graph (BCG/Full): the graph captures only the
+            # transformer body; the LM-head/logits tail runs eagerly. The
+            # packed aux is therefore a FRESH tensor every forward (eager
+            # pack_aux_hidden_states cat; Qwen3 returns an aux list, not a
+            # pre-packed static buffer) and record_stream protection applies.
+            # The post-norm last hidden, however, is a view of the captured
+            # body's shared static output buffer, overwritten in place by the
+            # next replay — clone it on the forward stream: same-stream
+            # ordering is the overwrite fence (the next replay queues behind
+            # the clone), identical in principle to the verify device twin.
+            last = last.clone()
 
         num_rows = aux.shape[0]
         if sum(extend_lens) != num_rows or last.shape[0] != num_rows:

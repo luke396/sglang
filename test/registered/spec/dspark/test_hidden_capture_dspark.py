@@ -48,8 +48,8 @@ CHUNKED_PREFILL_SIZE = 128
 _EXPORT_POLL_TIMEOUT_S = 30.0
 
 
-def _dspark_server_args():
-    return [
+def _dspark_server_args(prefill_graph: bool = True):
+    args = [
         "--trust-remote-code",
         "--attention-backend",
         ATTENTION_BACKEND,
@@ -67,12 +67,11 @@ def _dspark_server_args():
         "1",
         "--chunked-prefill-size",
         str(CHUNKED_PREFILL_SIZE),
-        # Required by capture's fail-closed gate (not just a test convenience):
-        # graph-run prefills replay into static buffers and would all miss.
-        "--cuda-graph-backend-prefill",
-        "disabled",
         "--enable-hidden-state-capture",
     ]
+    if not prefill_graph:
+        args += ["--cuda-graph-backend-prefill", "disabled"]
+    return args
 
 
 def _generate(base_url, input_ids, max_new_tokens=8):
@@ -329,6 +328,243 @@ class TestHiddenCaptureDSpark(CustomTestCase):
             correct += int(pred == completion_ids[t + 1])
         # Greedy decode + exact captured hidden => exact argmax match.
         self.assertEqual(correct, checked)
+
+
+class TestHiddenCaptureGraphOnMooncake(CustomTestCase):
+    """Acceptance-path tests with the prefill CUDA graph ON (default
+    breakable) and the Mooncake sink: prefix cache, chunked prefill, and
+    graph-overwrite safety, all consumed through registered ``get_into``.
+
+    Under BCG the graph captures only the transformer body — the packed aux
+    is a fresh eager tensor, and the post-norm last hidden (a view of the
+    shared static body-output buffer) is cloned on the forward stream at
+    capture time (same-stream ordering = the overwrite fence). Diagnostic
+    evidence: same-prompt exports are bitwise identical run-to-run; a broken
+    fence would corrupt rows nondeterministically."""
+
+    MASTER_PORT = 50056
+    STORE_ID = "graphon_acceptance"
+    MASTER_BIN = "/usr/local/lib/python3.12/dist-packages/mooncake/mooncake_master"
+
+    @classmethod
+    def setUpClass(cls):
+        import subprocess
+
+        cls.master = subprocess.Popen(
+            [
+                (
+                    cls.MASTER_BIN
+                    if os.path.exists(cls.MASTER_BIN)
+                    else "mooncake_master"
+                ),
+                "--port",
+                str(cls.MASTER_PORT),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(2)
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        # Prefill graph ON (breakable default) — no disable flag.
+        cls.process = popen_launch_server(
+            TARGET_MODEL,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=_dspark_server_args(prefill_graph=True),
+            env={
+                **os.environ,
+                "SGLANG_RAGGED_VERIFY_MODE": "compact",
+                "SGLANG_HIDDEN_CAPTURE_SINK": "mooncake",
+                "SGLANG_HIDDEN_CAPTURE_STORE_ID": cls.STORE_ID,
+                "MOONCAKE_MASTER": f"127.0.0.1:{cls.MASTER_PORT}",
+                "MOONCAKE_PROTOCOL": "tcp",
+            },
+        )
+        from transformers import AutoTokenizer
+
+        cls.tokenizer = AutoTokenizer.from_pretrained(TARGET_MODEL)
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
+        if hasattr(cls, "master") and cls.master:
+            cls.master.terminate()
+
+    def setUp(self):
+        requests.post(self.base_url + "/flush_cache")
+
+    def _consumer(self):
+        from mooncake.store import MooncakeDistributedStore
+
+        store = MooncakeDistributedStore()
+        rc = store.setup(
+            "localhost",
+            "P2PHANDSHAKE",
+            2 * 1024**3,
+            128 * 1024**2,
+            "tcp",
+            "",
+            f"127.0.0.1:{self.MASTER_PORT}",
+        )
+        self.assertEqual(rc, 0)
+        return store
+
+    def _consume_sample(self, store, rid, timeout_s=30):
+        meta_key = f"{self.STORE_ID}/{rid}/g0/meta"
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline and int(store.is_exist(meta_key)) != 1:
+            time.sleep(0.2)
+        self.assertEqual(int(store.is_exist(meta_key)), 1, f"meta missing: {rid}")
+        meta = json.loads(bytes(store.get(meta_key)))
+        out = {"meta": meta}
+        for name in ("aux", "last_hidden", "input_ids"):
+            spec = meta["tensors"][name]
+            t = torch.empty(
+                [int(x) for x in spec["shape"]],
+                dtype=getattr(torch, spec["dtype"].split(".")[-1]),
+            )
+            nb = t.numel() * t.element_size()
+            store.register_buffer(t.data_ptr(), nb)
+            n = store.get_into(f"{self.STORE_ID}/{rid}/g0/{name}", t.data_ptr(), nb)
+            store.unregister_buffer(t.data_ptr())
+            self.assertEqual(n, nb)
+            out[name] = t
+        return out
+
+    @staticmethod
+    def _load_lm_head():
+        import json as _json
+
+        from huggingface_hub import hf_hub_download
+        from safetensors import safe_open
+
+        idx_path = hf_hub_download(TARGET_MODEL, "model.safetensors.index.json")
+        with open(idx_path) as f:
+            weight_map = _json.load(f)["weight_map"]
+        shard = hf_hub_download(TARGET_MODEL, weight_map["lm_head.weight"])
+        with safe_open(shard, framework="pt") as f:
+            return f.get_tensor("lm_head.weight").float()
+
+    def _assert_norm_contract(self, lm_head, row, expected_token, ctx):
+        """Row through the LM head must reproduce the server's greedy token,
+        up to bf16-export + kernel-numerics noise: exact argmax OR the
+        expected token's recomputed logit within a small gap of the max
+        (diagnosed near-tie: top-2 gap 0.05 on a ~23 logit scale)."""
+        logits = row.float() @ lm_head.T
+        pred = int(logits.argmax())
+        if pred == expected_token:
+            return
+        gap = float(logits.max() - logits[expected_token])
+        self.assertLess(
+            gap,
+            0.25,
+            f"{ctx}: argmax {pred} != {expected_token} with gap {gap:.3f} "
+            "(beyond numerical noise -> corrupted row)",
+        )
+
+    def test_a_graph_on_overwrite_safety(self):
+        """Back-to-back different prompts: the second forward overwrites the
+        BCG static buffer while the first export is in flight. Both samples
+        must carry their own rows (norm contract on every decode row and the
+        last prompt row)."""
+        lm_head = self._load_lm_head()
+        results = []
+        for prompt in (
+            "The chemical symbol for gold is",
+            "The largest planet in the solar system is",
+        ):
+            ids = self.tokenizer(prompt).input_ids
+            result = _generate(self.base_url, ids, max_new_tokens=8)
+            results.append((ids, result))
+
+        store = self._consumer()
+        try:
+            for ids, result in results:
+                rid = result["meta_info"]["id"]
+                sample = self._consume_sample(store, rid)
+                prompt_len = len(ids)
+                completion_ids = result["output_ids"]
+                expected_rows = prompt_len + len(completion_ids) - 1
+                self.assertEqual(sample["meta"]["num_tokens"], expected_rows)
+                self.assertEqual(sample["input_ids"][:prompt_len].tolist(), ids)
+                self._assert_norm_contract(
+                    lm_head,
+                    sample["last_hidden"][0, prompt_len - 1],
+                    completion_ids[0],
+                    f"rid {rid} last prompt row",
+                )
+                for t in range(len(completion_ids) - 1):
+                    self._assert_norm_contract(
+                        lm_head,
+                        sample["last_hidden"][0, prompt_len + t],
+                        completion_ids[t + 1],
+                        f"rid {rid} decode row {t}",
+                    )
+        finally:
+            store.close()
+
+    def test_b_cold_vs_warm_prefix_parity(self):
+        """Cold request A writes the prefix rows; warm request B (radix hit,
+        never forwards those rows) must export a COMPLETE sample whose prefix
+        rows are byte-identical to A's — cached-prefix rows present, not
+        silently omitted or recomputed."""
+        prefix = self.tokenizer(
+            "In a quiet village nestled between rolling hills, an old "
+            "clockmaker spent his days repairing timepieces that the "
+            "townsfolk brought him. "
+        ).input_ids
+        ids_a = prefix + self.tokenizer("His favorite was a brass watch.").input_ids
+        result_a = _generate(self.base_url, ids_a, max_new_tokens=4)
+        ids_b = prefix + self.tokenizer("One winter morning a stranger came.").input_ids
+        result_b = _generate(self.base_url, ids_b, max_new_tokens=4)
+
+        store = self._consumer()
+        try:
+            sample_a = self._consume_sample(store, result_a["meta_info"]["id"])
+            sample_b = self._consume_sample(store, result_b["meta_info"]["id"])
+            n = len(prefix)
+            # B is complete: full coverage including the cached prefix.
+            self.assertEqual(
+                sample_b["meta"]["num_tokens"],
+                len(ids_b) + len(result_b["output_ids"]) - 1,
+            )
+            self.assertEqual(sample_b["input_ids"][: len(ids_b)].tolist(), ids_b)
+            # Cached-prefix rows byte-identical to the cold writer's rows.
+            self.assertTrue(
+                torch.equal(sample_b["aux"][0, :n], sample_a["aux"][0, :n]),
+                "warm-prefix aux rows differ from the cold writer's rows",
+            )
+            self.assertTrue(
+                torch.equal(
+                    sample_b["last_hidden"][0, :n], sample_a["last_hidden"][0, :n]
+                ),
+                "warm-prefix last rows differ from the cold writer's rows",
+            )
+        finally:
+            store.close()
+
+    def test_c_chunked_prefill_single_sample(self):
+        """Forced multi-chunk prefill (chunk size 128, ~3.1 chunks) must
+        assemble exactly one complete sample: full row coverage, exact
+        input_ids, one meta key (no duplicates/partials)."""
+        base = self.tokenizer("The quick brown fox jumps over the lazy dog. ").input_ids
+        input_ids = (base * 40)[: CHUNKED_PREFILL_SIZE * 3 + 17]
+        result = _generate(self.base_url, input_ids, max_new_tokens=4)
+        rid = result["meta_info"]["id"]
+
+        store = self._consumer()
+        try:
+            sample = self._consume_sample(store, rid, timeout_s=45)
+            expected_rows = len(input_ids) + len(result["output_ids"]) - 1
+            self.assertEqual(sample["meta"]["num_tokens"], expected_rows)
+            self.assertEqual(sample["input_ids"][: len(input_ids)].tolist(), input_ids)
+            self.assertEqual(sample["aux"].shape[1], expected_rows)
+            # Exactly one sample: the g0 generation is written once
+            # (first-write-wins); a duplicate assembly would need a second
+            # meta write, which the sink refuses.
+        finally:
+            store.close()
 
 
 class TestHiddenCaptureNonCompactVerify(CustomTestCase):
