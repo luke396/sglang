@@ -1008,6 +1008,12 @@ class Envs:
     # source and registration cannot run per-sample). Longer samples are
     # whole-sample capture misses.
     SGLANG_HIDDEN_CAPTURE_MAX_EXPORT_TOKENS = EnvInt(16384)
+    # Verify (decode) row capture: device ring geometry. Each slot must hold
+    # one verify step's full window (bs x verify_num_draft_tokens rows) in
+    # HBM plus a pinned twin; a step that doesn't fit is a capture miss for
+    # every request in the batch.
+    SGLANG_HIDDEN_CAPTURE_VERIFY_RING_SLOTS = EnvInt(2)
+    SGLANG_HIDDEN_CAPTURE_VERIFY_RING_TOKENS = EnvInt(2048)
 
     # VLM
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)

@@ -115,7 +115,9 @@ def main():
         assert int(store.is_exist(meta_key)) == 1, "meta key never appeared"
 
         meta = json.loads(bytes(store.get(meta_key)))
-        assert meta["num_tokens"] == len(input_ids), meta
+        # Coverage = prompt + verify-committed decode rows (final sampled
+        # token has no hidden row).
+        assert meta["num_tokens"] >= len(input_ids), meta
         assert meta["rid"] == rid
 
         spec = meta["tensors"]["input_ids"]
@@ -128,7 +130,7 @@ def main():
         n = store.get_into(f"{STORE_ID}/{rid}/g0/input_ids", out.data_ptr(), nb)
         store.unregister_buffer(out.data_ptr())
         assert n == nb
-        assert out.tolist() == input_ids, "input_ids mismatch"
+        assert out[: len(input_ids)].tolist() == input_ids, "prompt input_ids mismatch"
 
         aux_spec = meta["tensors"]["aux"]
         aux = torch.empty(
@@ -144,7 +146,7 @@ def main():
         assert aux.abs().sum() > 0, "aux tensor is all zeros"
 
         fp = json.loads(bytes(store.get(f"{STORE_ID}/_fingerprint")))
-        assert fp["coverage"] == "prefill_only"
+        assert fp["coverage"] == "prefill_and_verify_commit"
         print(
             f"E2E OK: meta + input_ids + aux ({nb / 1e6:.1f} MB) consumed "
             "via zero-copy get_into; fingerprint present"

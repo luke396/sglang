@@ -1355,6 +1355,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     if output.hidden_states is not None
                     else None
                 ),
+                # Hidden-state capture: post-final-norm rows ride the graph's
+                # static output buffer; only non-None when a capturer was
+                # installed before graph capture (see LogitsProcessor.forward).
+                last_hidden_states=(
+                    output.last_hidden_states[: self.raw_num_token]
+                    if output.last_hidden_states is not None
+                    else None
+                ),
                 customized_info=output.customized_info,
             )
         else:

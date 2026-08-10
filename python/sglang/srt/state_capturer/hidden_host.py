@@ -84,6 +84,9 @@ class HiddenCaptureStats:
         self.sample_too_large_miss_ct = 0
         self.export_ok_ct = 0
         self.skipped_forward_ct = 0
+        self.verify_rows_committed_ct = 0
+        self.verify_twin_full_miss_ct = 0
+        self.verify_oversize_miss_ct = 0
 
     def bump(self, name: str, delta: int = 1) -> None:
         with self._lock:
@@ -106,8 +109,99 @@ class _StagingSlot(msgspec.Struct):
     event: Any
     num_rows: int = 0
     ring_seq: int = -1
-    # [(rid, start_row, end_row)] within this slot's [0, num_rows) range.
+    # Prefill slots: [(rid, start_row, end_row)] within [0, num_rows).
     req_ranges: List[Tuple[str, int, int]] = []
+    # Verify slots: request i owns rows [i*stride, (i+1)*stride); only the
+    # first commit_lens[i] of them are committed (selected at finalize).
+    kind: str = "prefill"
+    commit_lens: Optional[torch.Tensor] = None  # pinned [num_reqs] int32
+    rids: List[str] = []
+    stride: int = 0
+    num_reqs: int = 0
+    # Device twin borrowed for this verify enqueue; released at finalize.
+    twin: Optional[_DeviceTwin] = None
+
+
+class _DeviceTwin(msgspec.Struct):
+    """Capture-owned HBM buffers for one verify step's strided window.
+
+    The worker packs the (graph/persistent) verify outputs into a twin on the
+    forward stream — same-stream ordering IS the overwrite fence required by
+    the capture plan's invariant #6: step t+1's replay queues behind the pack,
+    so the persistent source can't be rewritten under the copy, and the
+    forward stream never waits on D2H (which reads the twin, not the source).
+    """
+
+    index: int
+    aux: torch.Tensor  # [twin_tokens, aux_width] device
+    last: torch.Tensor  # [twin_tokens, last_width] device
+    cache_loc: torch.Tensor  # [twin_tokens] int64 device
+    tokens: torch.Tensor  # [twin_tokens] int64 device
+    commit_lens: torch.Tensor  # [max_reqs] int32 device
+    fence_event: Any = None  # recorded on the forward stream after the pack
+
+
+class DeviceTwinPool:
+    """Small pool of verify twins; empty pool => whole-step capture miss."""
+
+    def __init__(
+        self,
+        *,
+        num_twins: int,
+        twin_tokens: int,
+        max_reqs: int,
+        aux_width: int,
+        last_width: int,
+        dtype: torch.dtype,
+        device: str = "cuda",
+        use_cuda_events: bool = True,
+    ) -> None:
+        self.twin_tokens = twin_tokens
+        self.max_reqs = max_reqs
+        self._lock = threading.Lock()
+        self._free: List[_DeviceTwin] = []
+        for i in range(num_twins):
+            self._free.append(
+                _DeviceTwin(
+                    index=i,
+                    aux=torch.empty(
+                        (twin_tokens, aux_width), dtype=dtype, device=device
+                    ),
+                    last=torch.empty(
+                        (twin_tokens, last_width), dtype=dtype, device=device
+                    ),
+                    cache_loc=torch.empty(
+                        (twin_tokens,), dtype=torch.int64, device=device
+                    ),
+                    tokens=torch.empty(
+                        (twin_tokens,), dtype=torch.int64, device=device
+                    ),
+                    commit_lens=torch.empty(
+                        (max_reqs,), dtype=torch.int32, device=device
+                    ),
+                    fence_event=(
+                        torch.cuda.Event() if use_cuda_events else _NullEvent()
+                    ),
+                )
+            )
+        size_mb = (
+            num_twins * twin_tokens * (aux_width + last_width) * dtype.itemsize
+        ) / (1024 * 1024)
+        logger.info(
+            "Hidden capture DeviceTwinPool allocated: %d twins x %d tokens, "
+            "%.0f MB HBM",
+            num_twins,
+            twin_tokens,
+            size_mb,
+        )
+
+    def try_acquire(self) -> Optional[_DeviceTwin]:
+        with self._lock:
+            return self._free.pop() if self._free else None
+
+    def release(self, twin: _DeviceTwin) -> None:
+        with self._lock:
+            self._free.append(twin)
 
 
 class HiddenStagingRing:
@@ -168,6 +262,49 @@ class HiddenStagingRing:
                 return None
             return [self._free.popleft() for _ in range(num_slots)]
 
+    def enqueue_verify_segment(
+        self,
+        slot: _StagingSlot,
+        *,
+        twin: _DeviceTwin,
+        rids: List[str],
+        stride: int,
+        num_reqs: int,
+    ) -> None:
+        """D2H one verify step's strided window from its device twin into
+        pinned memory. Caller's current stream must wait on ``twin.fence_event``
+        first (the twin was packed on the forward stream). Committed-row
+        selection happens at finalize on CPU via the commit lens.
+        """
+        num_rows = num_reqs * stride
+        slot.aux[:num_rows].copy_(twin.aux[:num_rows], non_blocking=True)
+        slot.last[:num_rows].copy_(twin.last[:num_rows], non_blocking=True)
+        slot.cache_loc[:num_rows].copy_(twin.cache_loc[:num_rows], non_blocking=True)
+        slot.tokens[:num_rows].copy_(twin.tokens[:num_rows], non_blocking=True)
+        if slot.commit_lens is None or slot.commit_lens.shape[0] < num_reqs:
+            slot.commit_lens = torch.empty(
+                (max(num_reqs, 256),),
+                dtype=torch.int32,
+                pin_memory=slot.aux.is_pinned(),
+            )
+        slot.commit_lens[:num_reqs].copy_(
+            twin.commit_lens[:num_reqs], non_blocking=True
+        )
+        slot.event.record()
+
+        slot.kind = "verify"
+        slot.num_rows = num_rows
+        slot.req_ranges = []
+        slot.rids = rids
+        slot.stride = stride
+        slot.num_reqs = num_reqs
+        slot.twin = twin
+        with self._lock:
+            slot.ring_seq = self._next_seq
+            self._next_seq += 1
+            self.last_enqueued_seq = slot.ring_seq
+            self._inflight.append(slot)
+
     def enqueue_segment(
         self,
         slot: _StagingSlot,
@@ -220,6 +357,11 @@ class HiddenStagingRing:
         slot.num_rows = 0
         slot.ring_seq = -1
         slot.req_ranges = []
+        slot.kind = "prefill"
+        slot.rids = []
+        slot.stride = 0
+        slot.num_reqs = 0
+        slot.twin = None
         with self._lock:
             self._free.append(slot)
 
@@ -396,12 +538,14 @@ class HiddenFinalizeWorker:
         sidecar: HiddenHostSidecar,
         bookkeeper: HiddenCaptureBookkeeper,
         stats: HiddenCaptureStats,
+        twin_pool: Optional[DeviceTwinPool] = None,
         poll_interval_s: float = 0.001,
     ) -> None:
         self.ring = ring
         self.sidecar = sidecar
         self.bookkeeper = bookkeeper
         self.stats = stats
+        self.twin_pool = twin_pool
         self.last_finalized_seq = -1
         self._poll_interval_s = poll_interval_s
         self._running = True
@@ -427,9 +571,18 @@ class HiddenFinalizeWorker:
             except Exception:
                 # Capture must never take serving down; drop the slot's rows.
                 logger.exception("hidden capture finalize failed; dropping slot")
-                self.bookkeeper.mark_miss([rid for rid, _, _ in slot.req_ranges])
+                missed = (
+                    slot.rids
+                    if slot.kind == "verify"
+                    else [rid for rid, _, _ in slot.req_ranges]
+                )
+                self.bookkeeper.mark_miss(missed)
             finally:
                 seq = slot.ring_seq
+                if slot.twin is not None and self.twin_pool is not None:
+                    # Safe: pop_ready() already confirmed the D2H out of the
+                    # twin completed.
+                    self.twin_pool.release(slot.twin)
                 self.ring.release(slot)
                 self.last_finalized_seq = seq
             if (
@@ -439,6 +592,13 @@ class HiddenFinalizeWorker:
                 self.stats.log("hidden capture stats:")
 
     def finalize_slot(self, slot: _StagingSlot) -> None:
+        if slot.kind == "verify":
+            self._finalize_verify_slot(slot)
+        else:
+            self._finalize_prefill_slot(slot)
+        self.stats.bump("slots_finalized_ct")
+
+    def _finalize_prefill_slot(self, slot: _StagingSlot) -> None:
         num_rows = slot.num_rows
         slots = slot.cache_loc[:num_rows]
         gens = self.sidecar.write_rows(
@@ -453,4 +613,33 @@ class HiddenFinalizeWorker:
             self.bookkeeper.record_rows(
                 rid, slots_list[start:end], gens_list[start:end]
             )
-        self.stats.bump("slots_finalized_ct")
+
+    def _finalize_verify_slot(self, slot: _StagingSlot) -> None:
+        """Committed-prefix selection on CPU: request i's rows live at
+        [i*stride, i*stride + commit_lens[i]); the rest of its stride window
+        is rejected drafts and must not enter the sidecar."""
+        stride = slot.stride
+        commit_lens = slot.commit_lens[: slot.num_reqs].tolist()
+        keep = []
+        for i, commit_len in enumerate(commit_lens):
+            keep.extend(range(i * stride, i * stride + commit_len))
+        if keep:
+            keep_idx = torch.tensor(keep, dtype=torch.long)
+            slots = slot.cache_loc[keep_idx]
+            gens = self.sidecar.write_rows(
+                slots=slots,
+                aux_rows=slot.aux[keep_idx],
+                last_rows=slot.last[keep_idx],
+                tokens=slot.tokens[keep_idx],
+            )
+            slots_list = slots.tolist()
+            gens_list = gens.tolist()
+            row = 0
+            for rid, commit_len in zip(slot.rids, commit_lens):
+                self.bookkeeper.record_rows(
+                    rid,
+                    slots_list[row : row + commit_len],
+                    gens_list[row : row + commit_len],
+                )
+                row += commit_len
+        self.stats.bump("verify_rows_committed_ct", len(keep))

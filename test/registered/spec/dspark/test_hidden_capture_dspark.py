@@ -1,14 +1,14 @@
-"""E2E tests for online hidden-state capture under DSpark (M1: prefill rows).
+"""E2E tests for online hidden-state capture under DSpark.
 
 Validates the exported per-sample ``.ckpt`` files against independent
 references:
 
-- ``input_ids`` must match the request's token ids exactly;
-- ``aux_hidden_state`` rows must match a HuggingFace CPU forward at the
-  draft-configured aux layers (residual stream after target layer k);
-- ``hidden_state`` (post-final-norm) must match HF's final hidden states, and
-  its last row through the LM head must reproduce the server's first greedy
-  token;
+- prompt-region ``aux_hidden_state`` / ``hidden_state`` rows must match a
+  HuggingFace CPU forward (residual stream after target layer k; post-norm);
+- decode-region rows (verify-committed capture) must cover every generated
+  token except the final one, carry the generated token ids, and satisfy the
+  norm contract (row t through the LM head predicts token t+1 exactly under
+  greedy decoding);
 - chunked prefill and warm-prefix reuse must yield complete, consistent
   samples (or a clean whole-sample miss — never partial data);
 - an undersized staging ring must produce misses without breaking serving.
@@ -156,10 +156,17 @@ class TestHiddenCaptureDSpark(CustomTestCase):
         fp = self._fingerprint()
         num_aux = len(fp["aux_layer_ids"])
         hidden = fp["hidden_size"]
-        self.assertEqual(record["input_ids"].tolist(), input_ids)
-        self.assertEqual(record["loss_mask"].tolist(), [1] * T)
-        self.assertEqual(record["aux_hidden_state"].shape, (1, T, num_aux * hidden))
-        self.assertEqual(record["hidden_state"].shape, (1, T, hidden))
+        # Coverage = prompt + verify-committed decode rows; the prompt region
+        # is rows [0, prompt_len) and is what the HF reference below checks.
+        total_rows = record["input_ids"].shape[0]
+        self.assertGreaterEqual(total_rows, T)
+        self.assertEqual(int(record["prompt_len"]), T)
+        self.assertEqual(record["input_ids"][:T].tolist(), input_ids)
+        self.assertEqual(record["loss_mask"].tolist(), [1] * total_rows)
+        self.assertEqual(
+            record["aux_hidden_state"].shape, (1, total_rows, num_aux * hidden)
+        )
+        self.assertEqual(record["hidden_state"].shape, (1, total_rows, hidden))
         self.assertEqual(record["aux_hidden_state"].dtype, torch.bfloat16)
 
         # HF reference forward on CPU (independent of every sglang kernel).
@@ -173,8 +180,9 @@ class TestHiddenCaptureDSpark(CustomTestCase):
             hf_out = hf_model(torch.tensor([input_ids]), output_hidden_states=True)
 
         # aux layer id k = residual stream after target layer k
-        # = HF hidden_states[k + 1].
-        aux = record["aux_hidden_state"][0].view(T, num_aux, hidden)
+        # = HF hidden_states[k + 1]. Prompt region only (decode rows are
+        # covered by tests f/g).
+        aux = record["aux_hidden_state"][0, :T].view(T, num_aux, hidden)
         for j, layer_id in enumerate(fp["aux_layer_ids"]):
             ref = hf_out.hidden_states[layer_id + 1][0]
             cos = _row_cosine(aux[:, j, :], ref)
@@ -185,7 +193,7 @@ class TestHiddenCaptureDSpark(CustomTestCase):
             )
 
         # target-last = post-final-norm = HF hidden_states[-1].
-        last = record["hidden_state"][0]
+        last = record["hidden_state"][0, :T]
         cos = _row_cosine(last, hf_out.hidden_states[-1][0])
         self.assertGreater(float(cos.min()), 0.98)
 
@@ -209,8 +217,9 @@ class TestHiddenCaptureDSpark(CustomTestCase):
         rid = result["meta_info"]["id"]
         record = _wait_for_ckpt(self.capture_dir, rid)
         self.assertIsNotNone(record, "chunked-prefill export missing")
-        self.assertEqual(record["input_ids"].tolist(), input_ids)
-        self.assertEqual(record["aux_hidden_state"].shape[1], len(input_ids))
+        n = len(input_ids)
+        self.assertEqual(record["input_ids"][:n].tolist(), input_ids)
+        self.assertGreaterEqual(record["aux_hidden_state"].shape[1], n)
 
     def test_d_warm_prefix_consistency(self):
         prefix = self.tokenizer(
@@ -234,7 +243,7 @@ class TestHiddenCaptureDSpark(CustomTestCase):
 
         if record_b is None:
             return  # clean whole-sample miss is allowed; wrong data is not
-        self.assertEqual(record_b["input_ids"].tolist(), ids_b)
+        self.assertEqual(record_b["input_ids"][: len(ids_b)].tolist(), ids_b)
         n = len(prefix)
         self.assertTrue(
             torch.equal(
@@ -252,6 +261,74 @@ class TestHiddenCaptureDSpark(CustomTestCase):
         input_ids = self.tokenizer("Count from one to ten: one, two,").input_ids
         result = _generate(self.base_url, input_ids, max_new_tokens=32)
         self.assertIn("three", result["text"])
+
+    def test_f_verify_rows_cover_decode_tokens(self):
+        """Verify-committed capture: the export covers prompt + all decode
+        tokens except the final sampled one, and the decode-region rows carry
+        the actually-generated token ids (the training contract: rows 1:1
+        with forwarded tokens)."""
+        input_ids = self.tokenizer("The first five prime numbers are").input_ids
+        max_new_tokens = 24
+        result = _generate(self.base_url, input_ids, max_new_tokens=max_new_tokens)
+        self.assertEqual(result["meta_info"]["finish_reason"]["type"], "length")
+        rid = result["meta_info"]["id"]
+        record = _wait_for_ckpt(self.capture_dir, rid)
+        self.assertIsNotNone(record, "verify-coverage export missing")
+
+        T = record["input_ids"].shape[0]
+        prompt_len = len(input_ids)
+        self.assertEqual(int(record["prompt_len"]), prompt_len)
+        # Full coverage: prompt + (completion - 1) rows.
+        self.assertEqual(T, prompt_len + max_new_tokens - 1)
+        self.assertEqual(record["aux_hidden_state"].shape[1], T)
+        self.assertEqual(record["hidden_state"].shape[1], T)
+        # Decode-region input_ids are the generated tokens (minus the last).
+        completion_ids = result["output_ids"]
+        self.assertEqual(
+            record["input_ids"][prompt_len:].tolist(),
+            completion_ids[: max_new_tokens - 1],
+        )
+        # Hidden rows in the decode region are real data, not scatter fill.
+        decode_aux = record["aux_hidden_state"][0, prompt_len:].float()
+        self.assertGreater(float(decode_aux.abs().sum()), 0.0)
+        row_norms = decode_aux.norm(dim=-1)
+        self.assertTrue(bool((row_norms > 0).all()), "zero-filled decode row leaked")
+
+    def test_g_verify_last_hidden_semantics(self):
+        """Decode-region hidden_state rows must be post-final-norm: row t
+        through the LM head predicts token t+1 of the actual generation."""
+        input_ids = self.tokenizer("2, 4, 6, 8,").input_ids
+        result = _generate(self.base_url, input_ids, max_new_tokens=16)
+        rid = result["meta_info"]["id"]
+        record = _wait_for_ckpt(self.capture_dir, rid)
+        self.assertIsNotNone(record)
+        prompt_len = len(input_ids)
+        completion_ids = result["output_ids"]
+
+        # lm_head only; avoids loading the full model twice in one suite.
+        import json as _json
+
+        from huggingface_hub import hf_hub_download
+        from safetensors import safe_open
+
+        idx_path = hf_hub_download(TARGET_MODEL, "model.safetensors.index.json")
+        with open(idx_path) as f:
+            weight_map = _json.load(f)["weight_map"]
+        head_name = "lm_head.weight"
+        shard = hf_hub_download(TARGET_MODEL, weight_map[head_name])
+        with safe_open(shard, framework="pt") as f:
+            lm_head = f.get_tensor(head_name).float()
+
+        # Row prompt_len + t predicts completion token t+1.
+        correct = 0
+        checked = 0
+        for t in range(0, len(completion_ids) - 1):
+            row = record["hidden_state"][0, prompt_len + t].float()
+            pred = int((row @ lm_head.T).argmax())
+            checked += 1
+            correct += int(pred == completion_ids[t + 1])
+        # Greedy decode + exact captured hidden => exact argmax match.
+        self.assertEqual(correct, checked)
 
 
 class TestHiddenCaptureMissSemantics(CustomTestCase):
@@ -347,9 +424,8 @@ class TestHiddenCaptureDPReplicas(CustomTestCase):
         for rid, prompt in zip(rids, prompts):
             record = _wait_for_ckpt(self.capture_dir, rid)
             self.assertIsNotNone(record, f"missing export for {rid}")
-            self.assertEqual(
-                record["input_ids"].tolist(), self.tokenizer(prompt).input_ids
-            )
+            expected = self.tokenizer(prompt).input_ids
+            self.assertEqual(record["input_ids"][: len(expected)].tolist(), expected)
             exported += 1
         self.assertEqual(exported, len(prompts))
         # Single coherent fingerprint despite two replica writers.

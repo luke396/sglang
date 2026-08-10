@@ -269,6 +269,107 @@ class TestBookkeeper(CustomTestCase):
         self.assertEqual(bk.pop("r_orphan"), {})
 
 
+class TestVerifyCommittedRows(CustomTestCase):
+    """Verify-window finalize: only rows [i*stride, i*stride+commit_lens[i])
+    per request enter the sidecar. Rejected drafts entering the sidecar would
+    poison warm-prefix reuse (their kv slots are freed and reused while the
+    stale row still carries a plausible token id)."""
+
+    def _make_verify_slot(self, ring, commit_lens, stride, seed=0):
+        from sglang.srt.state_capturer.hidden_host import _DeviceTwin, _NullEvent
+
+        num_reqs = len(commit_lens)
+        num_rows = num_reqs * stride
+        aux, last = _rows(num_rows, seed=seed)
+        twin = _DeviceTwin(
+            index=0,
+            aux=aux,
+            last=last,
+            cache_loc=torch.arange(num_rows, dtype=torch.int64),
+            tokens=torch.arange(100, 100 + num_rows, dtype=torch.int64),
+            commit_lens=torch.tensor(commit_lens, dtype=torch.int32),
+            fence_event=_NullEvent(),
+        )
+        (slot,) = ring.try_acquire(1)
+        ring.enqueue_verify_segment(
+            slot,
+            twin=twin,
+            rids=[f"r{i}" for i in range(num_reqs)],
+            stride=stride,
+            num_reqs=num_reqs,
+        )
+        return ring.pop_ready(), aux, last
+
+    def test_only_committed_prefix_enters_sidecar(self):
+        ring = _make_ring(num_slots=1, slot_tokens=16)
+        sidecar = _make_sidecar()
+        bookkeeper = HiddenCaptureBookkeeper()
+        stats = HiddenCaptureStats()
+        finalize = HiddenFinalizeWorker(
+            ring=ring, sidecar=sidecar, bookkeeper=bookkeeper, stats=stats
+        )
+        stride = 4
+        # r0 commits 2 of 4 rows, r1 commits all 4.
+        slot, aux, last = self._make_verify_slot(ring, [2, 4], stride)
+        finalize.finalize_slot(slot)
+
+        # Committed rows present with correct payloads.
+        committed = [0, 1, 4, 5, 6, 7]  # r0: rows 0-1; r1: rows 4-7
+        for row in committed:
+            out = sidecar.read_rows_validated(
+                slots=torch.tensor([row], dtype=torch.long),
+                expected_tokens=torch.tensor([100 + row], dtype=torch.int64),
+                own_slot_gens={},
+            )
+            self.assertIsNotNone(out, f"committed row {row} missing")
+            self.assertTrue(torch.equal(out[0][0], aux[row]))
+        # Rejected rows (r0's rows 2-3) never written: gen stays 0.
+        for row in (2, 3):
+            self.assertEqual(int(sidecar.slot_gen[row]), 0)
+        self.assertEqual(stats.verify_rows_committed_ct, 6)
+
+        # Bookkeeper attribution is per request.
+        self.assertEqual(set(bookkeeper.pop("r0")), {0, 1})
+        self.assertEqual(set(bookkeeper.pop("r1")), {4, 5, 6, 7})
+
+    def test_twin_released_after_finalize(self):
+        from sglang.srt.state_capturer.hidden_host import DeviceTwinPool
+
+        pool = DeviceTwinPool(
+            num_twins=1,
+            twin_tokens=16,
+            max_reqs=4,
+            aux_width=AUX_WIDTH,
+            last_width=LAST_WIDTH,
+            dtype=DTYPE,
+            device="cpu",
+            use_cuda_events=False,
+        )
+        ring = _make_ring(num_slots=1, slot_tokens=16)
+        sidecar = _make_sidecar()
+        finalize = HiddenFinalizeWorker(
+            ring=ring,
+            sidecar=sidecar,
+            bookkeeper=HiddenCaptureBookkeeper(),
+            stats=HiddenCaptureStats(),
+            twin_pool=pool,
+        )
+        twin = pool.try_acquire()
+        self.assertIsNone(pool.try_acquire())  # pool exhausted
+        twin.cache_loc[:2] = torch.tensor([10, 11], dtype=torch.int64)
+        twin.tokens[:2] = torch.tensor([5, 6], dtype=torch.int64)
+        twin.commit_lens[:1] = torch.tensor([1], dtype=torch.int32)
+        (slot,) = ring.try_acquire(1)
+        ring.enqueue_verify_segment(slot, twin=twin, rids=["r0"], stride=2, num_reqs=1)
+        # Drive one loop iteration inline (the daemon path).
+        ready = ring.pop_ready()
+        finalize.finalize_slot(ready)
+        if ready.twin is not None:
+            pool.release(ready.twin)
+        ring.release(ready)
+        self.assertIsNotNone(pool.try_acquire())  # twin back in the pool
+
+
 class TestEndToEndPipeline(CustomTestCase):
     """stage -> finalize -> export against a real temp-dir file sink."""
 
@@ -328,7 +429,14 @@ class TestEndToEndPipeline(CustomTestCase):
             record = torch.load(os.path.join(tmpdir, "r1.ckpt"), weights_only=True)
             self.assertEqual(
                 set(record),
-                {"input_ids", "loss_mask", "aux_hidden_state", "hidden_state", "rid"},
+                {
+                    "input_ids",
+                    "loss_mask",
+                    "aux_hidden_state",
+                    "hidden_state",
+                    "rid",
+                    "prompt_len",
+                },
             )
             self.assertEqual(record["rid"], "r1")
             self.assertEqual(record["input_ids"].tolist(), tokens)

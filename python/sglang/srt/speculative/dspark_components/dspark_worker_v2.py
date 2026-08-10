@@ -65,6 +65,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     prepare_mamba_track_for_verify,
 )
+from sglang.srt.state_capturer.hidden_states import get_global_hidden_capturer
 from sglang.srt.utils import get_available_gpu_memory, is_cuda
 
 logger = logging.getLogger(__name__)
@@ -721,10 +722,34 @@ class DSparkWorkerV2(BaseSpecWorker):
                 bs=bs,
                 run_compact=run_compact,
             )
-        # M1 hidden-state capture skips verify rows (model_runner hook returns
-        # None for TARGET_VERIFY via the graph/row-attribution gates); when M2
-        # adds committed-row capture it must hook before this None.
+        # Hidden-state capture (training-data export): pack this verify
+        # window's committed rows into a capture-owned device twin BEFORE the
+        # references below are dropped. Runs on the forward stream, which is
+        # the overwrite fence for graph/persistent hidden buffers (the next
+        # replay queues behind the pack).
+        hidden_capture_output = None
+        if (hidden_capturer := get_global_hidden_capturer()) is not None:
+            hidden_capture_output = hidden_capturer.capture_verify_window(
+                rids=[req.rid for req in batch.reqs[:bs]],
+                aux_strided=logits_output.hidden_states,
+                verify_cache_loc=verify_window.verify_cache_loc,
+                verify_tokens=verify_ids_2d.reshape(-1),
+                commit_lens=accept.commit_lens,
+                bs=bs,
+                stride=int(self.verify_num_draft_tokens),
+                # Compact verify leaves the post-norm hidden in ragged form;
+                # the capturer scatters it into the twin with the same layout
+                # the aux scatter used.
+                last_strided=(
+                    logits_output.last_hidden_states if not run_compact else None
+                ),
+                last_compact=(
+                    logits_output.last_hidden_states if run_compact else None
+                ),
+                verify_lens=(layout.verify_lens if layout is not None else None),
+            )
         logits_output.hidden_states = None
+        logits_output.last_hidden_states = None
 
         self._observers.observe_verify_step(
             forward_ct=int(batch.forward_iter),
@@ -765,6 +790,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
+            hidden_capture_output=hidden_capture_output,
         )
 
     def _commit_target_mamba_states_after_verify(

@@ -6,14 +6,21 @@ host-side capture pipeline (see ``hidden_host.py`` / ``hidden_sink.py``):
 - ``on_forward_end``   (model runner, forward thread): grab GPU references to
   the packed aux hidden states ``[T, K*H]`` and the post-final-norm last
   hidden states ``[T, H]`` plus row->request attribution. No copies.
-- ``HiddenCaptureOutput.stage`` (scheduler, copy stream): async D2H into the
-  pinned staging ring, mirroring the result-copy path's timing.
+- ``capture_verify_window`` (DSpark worker, forward stream, post-acceptance):
+  pack one verify step's strided window into a capture-owned device twin.
+  Same-stream ordering is the CUDA-graph overwrite fence (invariant #6 of the
+  capture plan): the next replay queues behind the pack.
+- ``HiddenCaptureOutput.stage`` / ``HiddenVerifyCaptureOutput.stage``
+  (scheduler, copy stream): async D2H into the pinned staging ring on a
+  dedicated capture stream.
 - ``collect_at_finish`` (scheduler, before ``release_kv_cache``): sampling
-  decision, kv-slot snapshot, export job enqueue. Never blocks.
+  decision, kv-slot snapshot over prompt + committed decode rows, export job
+  enqueue.
 
-M1 scope is prefill rows only (cold/chunked/warm-prefix); verify committed
-rows, Mooncake sink, and DP-attention multi-writer are M2+ (the fail-closed
-matrix in ``create`` reflects this).
+Coverage is every forwarded token: prompt rows (prefill capture) plus
+verify-committed decode rows (the final sampled token has no hidden row).
+Mooncake sink and DP-attention multi-writer status: see the fail-closed
+matrix in ``create``.
 """
 
 from __future__ import annotations
@@ -22,7 +29,7 @@ import contextlib
 import hashlib
 import logging
 import re
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import msgspec
 import torch
@@ -34,6 +41,7 @@ from sglang.srt.model_executor.cuda_graph_config import Backend as CudaGraphBack
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.state_capturer.hidden_host import (
+    DeviceTwinPool,
     HiddenCaptureBookkeeper,
     HiddenCaptureStats,
     HiddenFinalizeWorker,
@@ -91,6 +99,24 @@ class HiddenCaptureOutput(msgspec.Struct):
 
     def stage(self) -> None:
         self.capturer.stage(self)
+
+
+class HiddenVerifyCaptureOutput(msgspec.Struct):
+    """One verify step's window, already packed into a device twin (fenced).
+
+    Unlike ``HiddenCaptureOutput`` this holds no references into graph or
+    persistent buffers — the twin is capture-owned, so the next replay can't
+    overwrite it. ``stage()`` D2Hs twin -> pinned ring off-stream.
+    """
+
+    twin: Any
+    rids: List[str]
+    stride: int
+    num_reqs: int
+    capturer: HiddenStatesCapturer
+
+    def stage(self) -> None:
+        self.capturer.stage_verify(self)
 
 
 class HiddenStatesCapturer:
@@ -236,11 +262,26 @@ class HiddenStatesCapturer:
             last_width=self.last_width,
             dtype=self.dtype,
         )
+        # Verify capture: device twins are the overwrite fence for graph/
+        # persistent buffers (packed on the forward stream; see _DeviceTwin).
+        self.twin_pool = (
+            DeviceTwinPool(
+                num_twins=envs.SGLANG_HIDDEN_CAPTURE_VERIFY_RING_SLOTS.get(),
+                twin_tokens=envs.SGLANG_HIDDEN_CAPTURE_VERIFY_RING_TOKENS.get(),
+                max_reqs=512,
+                aux_width=self.aux_width,
+                last_width=self.last_width,
+                dtype=self.dtype,
+            )
+            if torch.cuda.is_available()
+            else None
+        )
         self.finalize_worker = HiddenFinalizeWorker(
             ring=self.ring,
             sidecar=self.sidecar,
             bookkeeper=self.bookkeeper,
             stats=self.stats,
+            twin_pool=self.twin_pool,
         )
         self.sink = self._build_sink(sink_kind, sink_dir)
         self.sink.write_fingerprint(
@@ -253,10 +294,11 @@ class HiddenStatesCapturer:
                 "num_aux_layers": num_aux_layers,
                 "norm_contract": "post_final_norm_pre_lm_head",
                 "aux_layout": "packed_last_dim",  # [T, K*H], serving layout
-                # M1 rows cover the prompt region only (no verify/decode rows),
-                # and loss_mask is a placeholder — recompute offline before
+                # Rows cover the prompt region plus verify-committed decode
+                # tokens (the final sampled token has no hidden row).
+                # loss_mask is a placeholder — recompute offline before
                 # feeding a training recipe that masks on role boundaries.
-                "coverage": "prefill_only",
+                "coverage": "prefill_and_verify_commit",
                 "loss_mask": "all_ones_placeholder",
             }
         )
@@ -352,6 +394,115 @@ class HiddenStatesCapturer:
             capturer=self,
         )
 
+    # ------------------------------------------------------------------ verify
+
+    def capture_verify_window(
+        self,
+        *,
+        rids: List[str],
+        aux_strided: torch.Tensor,  # [bs*stride, K*H] (may be graph-persistent)
+        verify_cache_loc: torch.Tensor,  # [bs*stride] kv slots
+        verify_tokens: torch.Tensor,  # [bs*stride] token ids forwarded
+        commit_lens: torch.Tensor,  # [bs] accepted-prefix lens (incl. anchor)
+        bs: int,
+        stride: int,
+        last_strided: Optional[torch.Tensor] = None,  # [bs*stride, H]
+        last_compact: Optional[torch.Tensor] = None,  # [total_verify_tokens, H]
+        verify_lens: Optional[torch.Tensor] = None,  # [bs], for compact scatter
+    ) -> Optional[HiddenVerifyCaptureOutput]:
+        """Verify-step capture hook (DSpark worker, forward stream, after
+        acceptance and before the worker drops its hidden reference).
+
+        The sources may be CUDA-graph static or warmup-persistent buffers that
+        step t+1's replay overwrites in place. The fence is same-stream
+        ordering: this method packs the window into a capture-owned device
+        twin ON THE CURRENT (forward) STREAM, so the next step's kernels queue
+        behind the pack — the plan's invariant #6 without stalling forward on
+        any D2H. The twin is then D2H'd off-stream by stage().
+
+        The post-norm last hidden arrives strided on the dense verify path or
+        compact (ragged) on the compact path; the compact form is scattered
+        straight into the twin with the same kernel the epilogue uses for aux.
+        """
+        if self.twin_pool is None:
+            return None
+        num_rows = bs * stride
+        if num_rows > self.twin_pool.twin_tokens or bs > self.twin_pool.max_reqs:
+            self.stats.bump("verify_oversize_miss_ct")
+            self.bookkeeper.mark_miss(rids)
+            return None
+        if last_strided is None and last_compact is None:
+            # Post-norm hidden unavailable (e.g. a graph captured before the
+            # capturer was installed): fail closed with attribution.
+            self.stats.bump("skipped_forward_ct")
+            self.bookkeeper.mark_miss(rids)
+            return None
+        twin = self.twin_pool.try_acquire()
+        if twin is None:
+            self.stats.bump("verify_twin_full_miss_ct")
+            self.bookkeeper.mark_miss(rids)
+            return None
+
+        # Pack on the caller's (forward) stream: this is the fence.
+        twin.aux[:num_rows].copy_(aux_strided[:num_rows], non_blocking=True)
+        if last_strided is not None:
+            twin.last[:num_rows].copy_(last_strided[:num_rows], non_blocking=True)
+        else:
+            from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
+                scatter_compact_to_strided_into,
+            )
+
+            scatter_compact_to_strided_into(
+                compact=last_compact.contiguous(),
+                verify_lens=verify_lens,
+                out=twin.last[:num_rows],
+                stride=stride,
+                fill_value=0.0,
+            )
+        twin.cache_loc[:num_rows].copy_(
+            verify_cache_loc[:num_rows].to(torch.int64), non_blocking=True
+        )
+        twin.tokens[:num_rows].copy_(
+            verify_tokens[:num_rows].to(torch.int64), non_blocking=True
+        )
+        twin.commit_lens[:bs].copy_(commit_lens.to(torch.int32), non_blocking=True)
+        twin.fence_event.record()
+
+        return HiddenVerifyCaptureOutput(
+            twin=twin, rids=list(rids), stride=stride, num_reqs=bs, capturer=self
+        )
+
+    def stage_verify(self, output: HiddenVerifyCaptureOutput) -> None:
+        """D2H a packed verify twin into the pinned ring (copy-stream context)."""
+        slots = self.ring.try_acquire(1)
+        if slots is None:
+            self.stats.bump("stage_full_miss_ct")
+            self.bookkeeper.mark_miss(output.rids)
+            self.twin_pool.release(output.twin)
+            return
+        (slot,) = slots
+        if output.num_reqs * output.stride > self.ring.slot_tokens:
+            self.stats.bump("verify_oversize_miss_ct")
+            self.bookkeeper.mark_miss(output.rids)
+            self.twin_pool.release(output.twin)
+            self.ring.release(slot)
+            return
+
+        if self.capture_stream is not None:
+            self.capture_stream.wait_event(output.twin.fence_event)
+            stream_ctx = torch.cuda.stream(self.capture_stream)
+        else:
+            stream_ctx = contextlib.nullcontext()
+        with stream_ctx:
+            self.ring.enqueue_verify_segment(
+                slot,
+                twin=output.twin,
+                rids=output.rids,
+                stride=output.stride,
+                num_reqs=output.num_reqs,
+            )
+        self.stats.bump("rows_staged_ct", output.num_reqs * output.stride)
+
     # ---------------------------------------------------------------- staging
 
     def stage(self, output: HiddenCaptureOutput) -> None:
@@ -425,6 +576,10 @@ class HiddenStatesCapturer:
         validation, and file write happen on the export thread. The kv-slot
         snapshot is one small synchronous D2H (same pattern as the
         routed-experts finish hook).
+
+        Coverage is every forwarded token: prompt rows (prefill capture) plus
+        verify-committed decode rows. The final sampled token was never
+        forwarded, so rows span ``[0, seqlen - 1)``.
         """
         rid = req.rid
         if rid.startswith(HEALTH_CHECK_RID_PREFIX):
@@ -435,18 +590,22 @@ class HiddenStatesCapturer:
             return
 
         prompt_len = len(req.origin_input_ids)
+        seqlen = prompt_len + len(req.output_ids_through_stop)
+        num_rows = max(prompt_len, seqlen - 1)
         slots = (
-            req_to_token_pool.req_to_token[req.req_pool_idx][:prompt_len]
+            req_to_token_pool.req_to_token[req.req_pool_idx][:num_rows]
             .cpu()
             .clone()
             .to(torch.long)
         )
+        tokens = list(req.origin_input_ids) + list(req.output_ids_through_stop)
         job = HiddenExportJob(
             rid=rid,
             sample_id=self._sample_id_for(rid),
-            tokens=torch.tensor(req.origin_input_ids, dtype=torch.long),
+            tokens=torch.tensor(tokens[:num_rows], dtype=torch.long),
             slots=slots,
             ring_seq_barrier=self.ring.last_enqueued_seq,
+            prompt_len=prompt_len,
         )
         self.export_worker.submit(job)
 

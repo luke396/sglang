@@ -51,9 +51,12 @@ _ORPHAN_SWEEP_INTERVAL_S = 60.0
 class HiddenExportJob(msgspec.Struct):
     rid: str
     sample_id: str
-    tokens: torch.Tensor  # [T] long: prefill-region token ids
+    tokens: torch.Tensor  # [T] long: forwarded token ids (prompt + committed)
     slots: torch.Tensor  # [T] long: kv token-slot per token
     ring_seq_barrier: int
+    # Rows [0, prompt_len) are prompt; the rest are verify-committed decode
+    # rows. Recorded for downstream loss-mask reconstruction.
+    prompt_len: int = 0
 
 
 class HiddenFileSink:
@@ -197,6 +200,7 @@ class HiddenExportWorker:
             "aux_hidden_state": aux_rows.unsqueeze(0),
             "hidden_state": last_rows.unsqueeze(0),
             "rid": job.rid,
+            "prompt_len": job.prompt_len,
         }
         try:
             exported = self.sink.put(job.sample_id, record)
