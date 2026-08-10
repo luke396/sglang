@@ -41,8 +41,6 @@ def _server_args(capture: bool, dp: int = 1):
         "0.7",
         "--page-size",
         "1",
-        "--cuda-graph-backend-prefill",
-        "disabled",
     ]
     if dp > 1:
         args += ["--dp", str(dp)]
