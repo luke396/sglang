@@ -331,6 +331,76 @@ class TestHiddenCaptureDSpark(CustomTestCase):
         self.assertEqual(correct, checked)
 
 
+class TestHiddenCaptureNonCompactVerify(CustomTestCase):
+    """v4 invariant #3 (compact vs non-compact half): the committed-row
+    selector must produce identical training data regardless of the verify
+    layout. Runs the exact-norm-contract and coverage checks under
+    SGLANG_RAGGED_VERIFY_MODE=static (dense strided verify path)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.capture_dir = tempfile.mkdtemp(prefix="hidden_capture_static_")
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            TARGET_MODEL,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=_dspark_server_args(),
+            env={
+                **os.environ,
+                "SGLANG_RAGGED_VERIFY_MODE": "static",
+                "SGLANG_HIDDEN_CAPTURE_DIR": cls.capture_dir,
+            },
+        )
+        from transformers import AutoTokenizer
+
+        cls.tokenizer = AutoTokenizer.from_pretrained(TARGET_MODEL)
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
+
+    def test_noncompact_coverage_and_norm_contract(self):
+        input_ids = self.tokenizer("The first five prime numbers are").input_ids
+        max_new_tokens = 24
+        result = _generate(self.base_url, input_ids, max_new_tokens=max_new_tokens)
+        self.assertEqual(result["meta_info"]["finish_reason"]["type"], "length")
+        rid = result["meta_info"]["id"]
+        record = _wait_for_ckpt(self.capture_dir, rid)
+        self.assertIsNotNone(record, "non-compact export missing")
+
+        prompt_len = len(input_ids)
+        T = record["input_ids"].shape[0]
+        self.assertEqual(T, prompt_len + max_new_tokens - 1)
+        completion_ids = result["output_ids"]
+        self.assertEqual(
+            record["input_ids"][prompt_len:].tolist(),
+            completion_ids[: max_new_tokens - 1],
+        )
+
+        # Exact norm contract on decode rows (same assertion as the compact
+        # suite): row t through the LM head == greedy token t+1.
+        import json as _json
+
+        from huggingface_hub import hf_hub_download
+        from safetensors import safe_open
+
+        idx_path = hf_hub_download(TARGET_MODEL, "model.safetensors.index.json")
+        with open(idx_path) as f:
+            weight_map = _json.load(f)["weight_map"]
+        shard = hf_hub_download(TARGET_MODEL, weight_map["lm_head.weight"])
+        with safe_open(shard, framework="pt") as f:
+            lm_head = f.get_tensor("lm_head.weight").float()
+        for t in range(len(completion_ids) - 1):
+            row = record["hidden_state"][0, prompt_len + t].float()
+            self.assertEqual(
+                int((row @ lm_head.T).argmax()),
+                completion_ids[t + 1],
+                f"norm contract violated at decode row {t} (static mode)",
+            )
+
+
 class TestHiddenCaptureMissSemantics(CustomTestCase):
     """Undersized staging ring: every prefill misses, serving is unaffected."""
 

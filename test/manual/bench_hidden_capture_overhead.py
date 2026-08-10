@@ -51,9 +51,16 @@ def _server_args(capture: bool):
 
 def _run(name: str, capture: bool, opts) -> dict:
     capture_dir = None
+    mooncake = capture and opts.sink == "mooncake"
     if capture:
-        capture_dir = tempfile.mkdtemp(prefix="hidden_capture_bench_")
-        os.environ["SGLANG_HIDDEN_CAPTURE_DIR"] = capture_dir
+        os.environ["SGLANG_HIDDEN_CAPTURE_SINK"] = opts.sink
+        if mooncake:
+            os.environ["MOONCAKE_MASTER"] = f"127.0.0.1:{opts.mooncake_port}"
+            os.environ["MOONCAKE_PROTOCOL"] = "tcp"
+            os.environ["SGLANG_HIDDEN_CAPTURE_STORE_ID"] = "bench_capture"
+        else:
+            capture_dir = tempfile.mkdtemp(prefix="hidden_capture_bench_")
+            os.environ["SGLANG_HIDDEN_CAPTURE_DIR"] = capture_dir
     os.environ["SGLANG_RAGGED_VERIFY_MODE"] = "compact"
 
     res = run_bench_serving(
@@ -82,7 +89,41 @@ def _run(name: str, capture: bool, opts) -> dict:
         out["export_rate"] = len(ckpts) / max(1, res["completed"])
         # ~50 MB per 1k-token sample; a few rounds fill /tmp. Count, then drop.
         shutil.rmtree(capture_dir, ignore_errors=True)
+    elif mooncake:
+        out["exported_samples"] = _count_mooncake_samples(opts.mooncake_port)
+        out["export_rate"] = out["exported_samples"] / max(1, res["completed"])
     return out
+
+
+def _count_mooncake_samples(port: int) -> int:
+    """Count exported meta keys (best effort: the master evicts by lease, so
+    this undercounts under sustained load; still a sanity signal)."""
+    from mooncake.store import MooncakeDistributedStore
+
+    store = MooncakeDistributedStore()
+    rc = store.setup(
+        "localhost",
+        "P2PHANDSHAKE",
+        1 * 1024**3,
+        64 * 1024**2,
+        "tcp",
+        "",
+        f"127.0.0.1:{port}",
+    )
+    if rc != 0:
+        return -1
+    try:
+        # No prefix-scan API on this client build; count via removal-by-regex
+        # dry alternative is unavailable, so probe is_exist on nothing and
+        # return -1 to signal "not countable" unless remove_by_regex exists.
+        if hasattr(store, "remove_by_regex"):
+            # remove_by_regex returns the number of keys removed; counting by
+            # removing meta keys AFTER the bench is acceptable (bench data is
+            # disposable) and gives an exact produced-count lower bound.
+            return int(store.remove_by_regex("bench_capture/.*/g0/meta"))
+        return -1
+    finally:
+        store.close()
 
 
 def main():
@@ -92,8 +133,36 @@ def main():
     parser.add_argument("--input-len", type=int, default=1024)
     parser.add_argument("--output-len", type=int, default=128)
     parser.add_argument("--rounds", type=int, default=1)
+    parser.add_argument("--sink", choices=["file", "mooncake"], default="file")
+    parser.add_argument("--mooncake-port", type=int, default=50053)
     opts = parser.parse_args()
     assert not is_in_ci(), "manual benchmark; do not run in CI"
+
+    master = None
+    if opts.sink == "mooncake":
+        master_bin = "/usr/local/lib/python3.12/dist-packages/mooncake/mooncake_master"
+        import subprocess
+
+        master = subprocess.Popen(
+            [
+                master_bin if os.path.exists(master_bin) else "mooncake_master",
+                "--port",
+                str(opts.mooncake_port),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        import time
+
+        time.sleep(2)
+    try:
+        _bench(opts)
+    finally:
+        if master is not None:
+            master.terminate()
+
+
+def _bench(opts):
 
     runs = {"A0": [], "A1": []}
     # Alternate A0/A1 within each round so slow environment drift (thermals,
