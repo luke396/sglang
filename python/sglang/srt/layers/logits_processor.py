@@ -51,7 +51,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel, get_resources
 from sglang.srt.utils.common import (
     is_cpu,
     is_npu,
@@ -101,6 +101,11 @@ class LogitsProcessorOutput:
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
+    # Post-final-norm, pre-LM-head hidden states [T, H]. Only populated for
+    # hidden-state capture (training-data export): with aux layers configured,
+    # `hidden_states` holds the packed aux instead, and the final-norm output
+    # is otherwise dropped right after the LM head.
+    last_hidden_states: Optional[torch.Tensor] = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
@@ -389,6 +394,16 @@ class LogitsProcessor(nn.Module):
             sample_indices,
             logits_metadata,
         )
+        # Hidden-state capture (training-data export) needs the post-final-norm
+        # rows alongside the packed aux, which occupies `hidden_states_to_store`
+        # in FULL mode. Keep a reference (no copy) only when a capturer is on.
+        last_hidden_states_to_store = None
+        if (
+            get_resources().hidden_capturer is not None
+            and logits_metadata.capture_hidden_mode.is_full()
+            and aux_hidden_states is not None
+        ):
+            last_hidden_states_to_store = hidden_states
         del hidden_states
 
         if not logits_metadata.extend_return_logprob:
@@ -402,6 +417,7 @@ class LogitsProcessor(nn.Module):
             return LogitsProcessorOutput(
                 next_token_logits=sampled_logits,
                 hidden_states=hidden_states_to_store,
+                last_hidden_states=last_hidden_states_to_store,
                 mm_input_embeds=logits_metadata.mm_input_embeds,
             )
 
@@ -419,6 +435,7 @@ class LogitsProcessor(nn.Module):
         logits_output = LogitsProcessorOutput(
             next_token_logits=sampled_logits,
             hidden_states=hidden_states_to_store,
+            last_hidden_states=last_hidden_states_to_store,
             mm_input_embeds=logits_metadata.mm_input_embeds,
         )
         logprobs_result.write_input_to(logits_output)

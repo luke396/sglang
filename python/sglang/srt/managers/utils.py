@@ -101,6 +101,12 @@ class GenerationBatchResult:
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None
 
+    # Hidden-state capture (training-data export): pending async D2H into the
+    # capturer's own pinned staging ring; staged on the copy stream alongside
+    # the result copies but gated by per-slot events, not this batch's
+    # copy_done. Typed Any to avoid importing the capture stack here.
+    hidden_capture_output: Optional[Any] = None
+
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
 
@@ -171,6 +177,15 @@ class GenerationBatchResult:
                 holder.map_device_tensors(_async_d2h)
 
         self.copy_done.record()
+
+        # Hidden capture stages into its own fixed pinned ring on the same copy
+        # stream, but strictly AFTER copy_done: its (large) copies are gated by
+        # the ring's per-slot events, and including them in copy_done would make
+        # the scheduler's result processing wait on capture D2H, pushing capture
+        # cost into serving tail latency.
+        if self.hidden_capture_output is not None:
+            self.hidden_capture_output.stage()
+            self.hidden_capture_output = None
 
     @classmethod
     def from_pp_proxy(

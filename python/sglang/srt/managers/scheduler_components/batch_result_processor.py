@@ -41,6 +41,7 @@ from sglang.srt.runtime_context import (
     max_speculative_num_draft_tokens,
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.state_capturer.hidden_states import get_global_hidden_capturer
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
@@ -169,6 +170,15 @@ class SchedulerBatchResultProcessor:
             req_to_token_pool=self.req_to_token_pool,
         )
 
+    def _maybe_collect_hidden_capture(self, req: Req):
+        """Hidden-state capture finish hook. Must run before release_kv_cache
+        (the kv-slot snapshot inside relies on the request still owning its
+        slots); only snapshots and enqueues, never blocks the scheduler."""
+        capturer = get_global_hidden_capturer()
+        if capturer is None:
+            return
+        capturer.collect_at_finish(req, self.req_to_token_pool)
+
     def _maybe_collect_customized_info(
         self,
         i: int,
@@ -274,6 +284,7 @@ class SchedulerBatchResultProcessor:
                     if req.finished():
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
+                        self._maybe_collect_hidden_capture(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
@@ -1059,6 +1070,7 @@ class SchedulerBatchResultProcessor:
                 req.multimodal_inputs.release_features()
             self._maybe_collect_routed_experts(req)
             self._maybe_collect_indexer_topk(req)
+            self._maybe_collect_hidden_capture(req)
 
             if get_disagg().disaggregation_decode_enable_offload_kvcache:
                 # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes

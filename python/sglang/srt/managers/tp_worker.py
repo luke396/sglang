@@ -604,6 +604,7 @@ class TpModelWorker(BaseTpWorker):
                 expert_distribution_metrics=out.expert_distribution_metrics,
                 routed_experts_output=out.routed_experts_output,
                 indexer_topk_output=out.indexer_topk_output,
+                hidden_capture_output=out.hidden_capture_output,
             )
 
             if is_verify:

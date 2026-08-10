@@ -193,6 +193,12 @@ from sglang.srt.server_args import (  # noqa: F401  (re-export)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.state_capturer.base import TopkCaptureOutput
+from sglang.srt.state_capturer.hidden_states import (
+    HiddenCaptureOutput,
+    HiddenStatesCapturer,
+    get_global_hidden_capturer,
+    set_global_hidden_capturer,
+)
 from sglang.srt.state_capturer.indexer_topk import (
     create_indexer_capturer,
     get_global_indexer_capturer,
@@ -262,6 +268,7 @@ class ModelRunnerOutput:
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None
+    hidden_capture_output: Optional[HiddenCaptureOutput] = None
 
 
 def resolve_draft_attention_backend(
@@ -841,6 +848,7 @@ class ModelRunner:
 
         self.init_routed_experts_capturer()
         self.init_indexer_capturer()
+        self.init_hidden_states_capturer()
 
         self.graph_shared_output = None
 
@@ -1009,6 +1017,21 @@ class ModelRunner:
                 model_config=self.model_config,
                 num_tokens=self.max_total_num_tokens + self.page_size,
                 max_running_requests=self.max_running_requests,
+                device=self.device,
+            )
+        )
+
+    def init_hidden_states_capturer(self):
+        if self.is_draft_worker:
+            # Capture is target-only; see init_routed_experts_capturer.
+            return
+
+        set_global_hidden_capturer(
+            HiddenStatesCapturer.create(
+                server_args=self.server_args,
+                model_config=self.model_config,
+                spec_aux_config=self.spec_aux_config,
+                num_tokens=self.max_total_num_tokens + self.page_size,
                 device=self.device,
             )
         )
@@ -1530,6 +1553,17 @@ class ModelRunner:
                 can_run_graph=output.can_run_graph,
                 cuda_graph_batch=getattr(self.decode_cuda_graph_runner, "bs", None),
                 no_copy_to_cpu=no_copy_to_cpu,
+            )
+
+        if (
+            not self.is_draft_worker
+            and (hidden_capturer := get_global_hidden_capturer()) is not None
+            and isinstance(output.logits_output, LogitsProcessorOutput)
+        ):
+            output.hidden_capture_output = hidden_capturer.on_forward_end(
+                forward_batch=forward_batch,
+                logits_output=output.logits_output,
+                can_run_graph=output.can_run_graph,
             )
 
         if self.eplb_manager is not None:

@@ -977,6 +977,21 @@ class Envs:
     # (see sanitize_nan_logits).
     SGLANG_SANITIZE_NAN_LOGITS = EnvBool(False)
 
+    # Hidden state capture (--enable-hidden-state-capture)
+    # Directory for the per-sample training-data file sink. Required: capture
+    # is disabled at startup when unset.
+    SGLANG_HIDDEN_CAPTURE_DIR = EnvStr(None)
+    # Fraction of finished requests exported (decided at request finish, not
+    # at admission; all forwarded rows are staged to host regardless).
+    SGLANG_HIDDEN_CAPTURE_SAMPLE_RATE = EnvFloat(1.0)
+    # Pinned staging ring geometry: slot count x max rows per slot. A slot
+    # must fit one forward's extend rows (>= chunked_prefill_size) or the
+    # affected requests are marked capture-miss.
+    SGLANG_HIDDEN_CAPTURE_STAGING_SLOTS = EnvInt(4)
+    SGLANG_HIDDEN_CAPTURE_STAGING_SLOT_TOKENS = EnvInt(8192)
+    # Export job queue capacity; full queue => capture-miss (never backpressure).
+    SGLANG_HIDDEN_CAPTURE_EXPORT_QUEUE_SIZE = EnvInt(256)
+
     # VLM
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
     SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)

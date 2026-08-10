@@ -3380,6 +3380,13 @@ class ServerArgs:
         "Enable returning routed experts of each layer with responses.",
         NS("exec.features"),
     ] = False
+    enable_hidden_state_capture: A[
+        bool,
+        "Enable online capture of target aux/last hidden states to a host "
+        "sidecar for draft-model training data export. Requires "
+        "SGLANG_HIDDEN_CAPTURE_DIR to be set.",
+        NS("exec.features"),
+    ] = False
     enable_return_indexer_topk: A[
         bool,
         "Enable returning indexer topk indices of layers with indexer with responses.",

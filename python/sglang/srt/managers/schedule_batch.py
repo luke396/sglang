@@ -1923,6 +1923,14 @@ def release_req(
     num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
     evict_from_tree_cache(tree_cache, num_tokens)
 
+    # Hidden-state capture: the retracted request re-prefills into new kv
+    # slots later; stale finalize records must not validate as its own rows.
+    # Lazy import: this module is imported by the capture stack's TYPE_CHECKING.
+    from sglang.srt.state_capturer.hidden_states import get_global_hidden_capturer
+
+    if (hidden_capturer := get_global_hidden_capturer()) is not None:
+        hidden_capturer.invalidate(req.rid)
+
     req.reset_for_retract()
 
 

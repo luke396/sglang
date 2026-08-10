@@ -473,6 +473,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             final_pos=final_pos,
         )
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
+        # Hidden-state capture (state_capturer/hidden_states.py) already took
+        # its own references in model_runner's forward hook; this None only
+        # drops this holder's reference. Keep the hook ordering if refactoring.
         logits_output.hidden_states = None
 
         batch_output.next_draft_input = make_next_draft_input(
@@ -718,6 +721,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 bs=bs,
                 run_compact=run_compact,
             )
+        # M1 hidden-state capture skips verify rows (model_runner hook returns
+        # None for TARGET_VERIFY via the graph/row-attribution gates); when M2
+        # adds committed-row capture it must hook before this None.
         logits_output.hidden_states = None
 
         self._observers.observe_verify_step(
