@@ -67,7 +67,10 @@ def _dspark_server_args():
         "1",
         "--chunked-prefill-size",
         str(CHUNKED_PREFILL_SIZE),
-        "--disable-piecewise-cuda-graph",
+        # Required by capture's fail-closed gate (not just a test convenience):
+        # graph-run prefills replay into static buffers and would all miss.
+        "--cuda-graph-backend-prefill",
+        "disabled",
         "--enable-hidden-state-capture",
     ]
 

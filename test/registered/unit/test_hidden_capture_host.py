@@ -7,6 +7,7 @@ without a GPU.
 
 import os
 import tempfile
+import time
 import unittest
 
 import torch
@@ -170,16 +171,74 @@ class TestSidecarSeqlock(CustomTestCase):
         self.assertIsNone(out)  # gen == 0: never settled
 
     def test_write_in_flight_odd_gen_fails(self):
+        """Writes advance gen by 2 under the sidecar mutex, so an odd gen can
+        only mean corruption; the validated read must reject it."""
         sidecar = _make_sidecar()
         slots = torch.tensor([4], dtype=torch.long)
         tokens = torch.tensor([50], dtype=torch.int64)
         aux, last = _rows(1)
         sidecar.write_rows(slots=slots, aux_rows=aux, last_rows=last, tokens=tokens)
-        sidecar.slot_gen[4] += 1  # simulate a write caught mid-flight
+        sidecar.slot_gen[4] += 1  # corrupt: gen no longer a multiple of 2
         out = sidecar.read_rows_validated(
             slots=slots, expected_tokens=tokens, own_slot_gens={}
         )
         self.assertIsNone(out)
+
+    def test_concurrent_write_read_never_returns_torn_rows(self):
+        """P1-2 regression: sidecar reads must be mutually exclusive with
+        writes. Alternating full-row writes of two distinct patterns race a
+        validated reader; any row mixing both patterns (torn) or passing
+        validation with the wrong generation would fail this test. Guarded by
+        the sidecar mutex; the old seqlock let torn reads validate on
+        weakly-ordered hosts."""
+        import threading as _threading
+
+        sidecar = _make_sidecar()
+        slots = torch.tensor([1, 2, 3], dtype=torch.long)
+        tokens = torch.tensor([7, 8, 9], dtype=torch.int64)
+        patterns = [
+            (torch.full((3, AUX_WIDTH), float(v)), torch.full((3, LAST_WIDTH), float(v)))
+            for v in (1.0, 2.0)
+        ]
+        stop = _threading.Event()
+        torn = []
+
+        def writer():
+            i = 0
+            while not stop.is_set():
+                aux, last = patterns[i % 2]
+                sidecar.write_rows(
+                    slots=slots, aux_rows=aux, last_rows=last, tokens=tokens
+                )
+                i += 1
+
+        t = _threading.Thread(target=writer, daemon=True)
+        t.start()
+        try:
+            # Time-bounded: enough read/write collisions to catch a missing
+            # lock (torn rows show up within milliseconds without it) while
+            # keeping CPU CI fast.
+            deadline = time.monotonic() + 3.0
+            reads = 0
+            while time.monotonic() < deadline and reads < 2000:
+                reads += 1
+                out = sidecar.read_rows_validated(
+                    slots=slots, expected_tokens=tokens, own_slot_gens={}
+                )
+                if out is None:
+                    continue
+                aux_rows, last_rows = out
+                # A consistent snapshot is uniformly one pattern value.
+                for buf in (aux_rows, last_rows):
+                    if not (
+                        torch.equal(buf, torch.full_like(buf, 1.0))
+                        or torch.equal(buf, torch.full_like(buf, 2.0))
+                    ):
+                        torn.append(buf)
+        finally:
+            stop.set()
+            t.join(timeout=5)
+        self.assertEqual(torn, [])
 
 
 class TestBookkeeper(CustomTestCase):

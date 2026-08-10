@@ -12,11 +12,15 @@ Concurrency contract
 --------------------
 Three threads touch this module: the scheduler thread (staging enqueue, finish
 snapshots), one finalize thread (the *sole writer* of the sidecar payload /
-generation / token arrays), and one export thread (reader). CPython's GIL plus
-the single-writer discipline keep the int64 generation loads/stores untorn;
-the per-slot seqlock (odd while a row write is in flight, even and
-monotonically increasing once settled) covers the non-atomic payload copy
-window.
+generation / token arrays), and one export thread (reader). Sidecar access is
+serialized by a mutex held across ``write_rows`` / ``read_rows_validated``
+(both run on background threads; the hold time is the row memcpy, so serving
+is unaffected). A mutex — not a seqlock — is load-bearing here: torch CPU
+kernels release the GIL, and on weakly-ordered hosts (ARM: GH200/GB200) a
+seqlock's unfenced payload stores could become visible after the "settled"
+generation store, letting a reader return wrong-but-validated data. The
+generation counters remain for *identity* (ABA) validation, not for torn-read
+protection.
 
 Identity model: sidecar rows are keyed by KV token-slot index (same numbering
 as the KV cache). Requests hold their slots until ``release_kv_cache`` (called
@@ -219,11 +223,15 @@ class HiddenStagingRing:
 
 
 class HiddenHostSidecar:
-    """Pageable per-token-slot payload arrays plus the seqlock/identity maps.
+    """Pageable per-token-slot payload arrays plus the identity maps.
 
     Payload buffers are ``torch.empty`` (validity is gated by ``slot_gen`` /
     ``token_id_map``, so pre-zeroing terabytes is wasted work). Only the
-    finalize thread writes any of these arrays.
+    finalize thread writes; writes and validated reads are serialized by
+    ``_lock`` (see the module docstring for why a mutex, not a seqlock).
+    ``slot_gen`` still increments by 2 per settled write — the even/odd shape
+    is kept so generations recorded before this locking change stay valid —
+    but its role is identity (ABA) validation only.
     """
 
     def __init__(
@@ -234,6 +242,7 @@ class HiddenHostSidecar:
         last_width: int,
         dtype: torch.dtype,
     ) -> None:
+        self._lock = threading.Lock()
         self.aux_buf = torch.empty((num_slots, aux_width), dtype=dtype)
         self.last_buf = torch.empty((num_slots, last_width), dtype=dtype)
         self.token_id_map = torch.full((num_slots,), -1, dtype=torch.int32)
@@ -260,15 +269,18 @@ class HiddenHostSidecar:
         last_rows: torch.Tensor,
         tokens: torch.Tensor,
     ) -> torch.Tensor:
-        """Seqlock-write rows (finalize thread only). Returns the settled gens."""
-        gens = self.slot_gen[slots]
-        self.slot_gen[slots] = gens + 1  # odd: write in flight
-        self.aux_buf[slots] = aux_rows
-        self.last_buf[slots] = last_rows
-        self.token_id_map[slots] = tokens.to(torch.int32)
-        new_gens = gens + 2
-        self.slot_gen[slots] = new_gens  # even: settled
-        return new_gens
+        """Write rows under the sidecar lock (finalize thread only).
+
+        Returns the settled generations for identity bookkeeping.
+        """
+        with self._lock:
+            gens = self.slot_gen[slots]
+            new_gens = gens + 2
+            self.aux_buf[slots] = aux_rows
+            self.last_buf[slots] = last_rows
+            self.token_id_map[slots] = tokens.to(torch.int32)
+            self.slot_gen[slots] = new_gens
+            return new_gens
 
     def read_rows_validated(
         self,
@@ -277,27 +289,24 @@ class HiddenHostSidecar:
         expected_tokens: torch.Tensor,
         own_slot_gens: Dict[int, int],
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """Seqlock-read ``slots``; None on any identity/consistency failure.
+        """Read ``slots`` under the sidecar lock; None on any identity failure.
 
         Own rows (present in ``own_slot_gens``) must match the exact settled
         generation recorded at finalize time. Warm-prefix rows must carry the
-        expected token id at an even, nonzero generation. Both must be stable
-        across the payload copy (gen re-read).
+        expected token id at a nonzero generation.
         """
-        gens_before = self.slot_gen[slots].clone()
-        aux_rows = self.aux_buf[slots].clone()
-        last_rows = self.last_buf[slots].clone()
-        stored_tokens = self.token_id_map[slots].clone()
-        gens_after = self.slot_gen[slots].clone()
+        with self._lock:
+            gens = self.slot_gen[slots].clone()
+            aux_rows = self.aux_buf[slots].clone()
+            last_rows = self.last_buf[slots].clone()
+            stored_tokens = self.token_id_map[slots].clone()
 
-        if not torch.equal(gens_before, gens_after):
-            return None
-        settled = (gens_before > 0) & (gens_before % 2 == 0)
-        if not bool(settled.all()):
+        if not bool(((gens > 0) & (gens % 2 == 0)).all()):
+            # gen 0 = never written; odd = corrupt (writes advance by 2).
             return None
 
         slots_list = slots.tolist()
-        gens_list = gens_before.tolist()
+        gens_list = gens.tolist()
         own_ok = True
         prefix_mask = torch.ones(len(slots_list), dtype=torch.bool)
         for i, (slot, gen) in enumerate(zip(slots_list, gens_list)):

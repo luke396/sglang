@@ -29,6 +29,7 @@ import torch
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.cuda_graph_config import Backend as CudaGraphBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.state_capturer.hidden_host import (
@@ -137,6 +138,14 @@ class HiddenStatesCapturer:
             (
                 server_args.enable_mixed_chunk,
                 "mixed prefill/decode batches are unsupported",
+            ),
+            (
+                server_args.cuda_graph_config.prefill.backend
+                != CudaGraphBackend.DISABLED,
+                "prefill CUDA graph replays overwrite static output buffers; "
+                "every graph-run prefill would be a capture miss (zero yield). "
+                "Launch with --disable-prefill-cuda-graph "
+                "(or --cuda-graph-backend-prefill=disabled)",
             ),
         ]
         for failed, reason in gates:

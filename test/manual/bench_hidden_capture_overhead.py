@@ -41,7 +41,8 @@ def _server_args(capture: bool):
         "0.7",
         "--page-size",
         "1",
-        "--disable-piecewise-cuda-graph",
+        "--cuda-graph-backend-prefill",
+        "disabled",
     ]
     if capture:
         args.append("--enable-hidden-state-capture")
