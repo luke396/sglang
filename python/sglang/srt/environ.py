@@ -996,6 +996,18 @@ class Envs:
     # max_total_num_tokens x row bytes); exceeding it disables capture at
     # startup rather than silently committing tens of GB per scheduler.
     SGLANG_HIDDEN_CAPTURE_MAX_HOST_GB = EnvFloat(64.0)
+    # Export sink: "file" (per-sample .ckpt under SGLANG_HIDDEN_CAPTURE_DIR)
+    # or "mooncake" (self-describing keys in a Mooncake store; requires
+    # MOONCAKE_MASTER, uses the MOONCAKE_* connection settings above).
+    SGLANG_HIDDEN_CAPTURE_SINK = EnvStr("file")
+    # Mooncake sink: namespace prefix of every exported key
+    # ({store_id}/{sample_id}/g0/{name}) and the trainer's discovery scope.
+    SGLANG_HIDDEN_CAPTURE_STORE_ID = EnvStr("sglang_hidden_capture")
+    # Mooncake sink: sizes the one pre-registered staging buffer
+    # (max_export_tokens x row bytes; RDMA put_from requires a registered
+    # source and registration cannot run per-sample). Longer samples are
+    # whole-sample capture misses.
+    SGLANG_HIDDEN_CAPTURE_MAX_EXPORT_TOKENS = EnvInt(16384)
 
     # VLM
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)

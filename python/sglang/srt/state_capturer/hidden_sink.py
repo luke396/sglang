@@ -1,18 +1,22 @@
-"""Export thread and file sink for hidden-state capture (M1: local files).
+"""Export thread and sinks for hidden-state capture.
 
 Consumes jobs enqueued at request finish, waits for the finalize barrier,
-validates row identity against the host sidecar, and writes one
-SpecForge-``OfflineEagle3Dataset``-compatible ``.ckpt`` file per sample::
+validates row identity against the host sidecar, and hands one
+SpecForge-``OfflineEagle3Dataset``-compatible record per sample to the
+configured sink::
 
     {
         "input_ids":        LongTensor [T],
-        "loss_mask":        LongTensor [T],
-        "aux_hidden_state": bf16 [1, T, K*H],   # packed aux, serving layout
-        "hidden_state":     bf16 [1, T, H],     # post-final-norm, pre-LM-head
+        "loss_mask":        LongTensor [T],   # all-ones placeholder
+        "aux_hidden_state": bf16 [1, T, K*H], # packed aux, serving layout
+        "hidden_state":     bf16 [1, T, H],   # post-final-norm, pre-LM-head
+        "rid":              str,              # original request id
     }
 
-The write path is a ``Sink`` seam: M2 swaps the file sink for a Mooncake sink
-without touching the export worker.
+Sinks share ``put(sample_id, record) -> bool`` / ``write_fingerprint(dict)``:
+``HiddenFileSink`` (default) writes per-sample ``.ckpt`` files;
+``MooncakeHiddenSink`` (``SGLANG_HIDDEN_CAPTURE_SINK=mooncake``, in
+``hidden_mooncake.py``) publishes self-describing keys into a Mooncake store.
 """
 
 from __future__ import annotations
@@ -34,6 +38,7 @@ from sglang.srt.state_capturer.hidden_host import (
     HiddenFinalizeWorker,
     HiddenHostSidecar,
 )
+from sglang.srt.state_capturer.hidden_mooncake import SampleTooLargeError
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +102,7 @@ class HiddenExportWorker:
         bookkeeper: HiddenCaptureBookkeeper,
         finalize_worker: HiddenFinalizeWorker,
         stats: HiddenCaptureStats,
-        sink: HiddenFileSink,
+        sink: Any,
         queue_size: int,
         barrier_timeout_s: float = _BARRIER_TIMEOUT_S,
     ) -> None:
@@ -193,7 +198,12 @@ class HiddenExportWorker:
             "hidden_state": last_rows.unsqueeze(0),
             "rid": job.rid,
         }
-        if self.sink.put(job.sample_id, record):
+        try:
+            exported = self.sink.put(job.sample_id, record)
+        except SampleTooLargeError:
+            self.stats.bump("sample_too_large_miss_ct")
+            return
+        if exported:
             self.stats.bump("export_ok_ct")
         else:
             self.stats.bump("duplicate_sample_miss_ct")

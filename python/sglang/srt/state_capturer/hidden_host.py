@@ -81,6 +81,7 @@ class HiddenCaptureStats:
         self.export_queue_full_miss_ct = 0
         self.export_timeout_miss_ct = 0
         self.duplicate_sample_miss_ct = 0
+        self.sample_too_large_miss_ct = 0
         self.export_ok_ct = 0
         self.skipped_forward_ct = 0
 

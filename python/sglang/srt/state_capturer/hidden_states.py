@@ -108,9 +108,16 @@ class HiddenStatesCapturer:
         if not server_args.enable_hidden_state_capture:
             return None
 
+        sink_kind = envs.SGLANG_HIDDEN_CAPTURE_SINK.get()
         sink_dir = envs.SGLANG_HIDDEN_CAPTURE_DIR.get()
-        if not sink_dir:
-            _disabled("SGLANG_HIDDEN_CAPTURE_DIR is not set")
+        if sink_kind == "file" and not sink_dir:
+            _disabled("SGLANG_HIDDEN_CAPTURE_DIR is not set (file sink)")
+            return None
+        if sink_kind == "mooncake" and not envs.MOONCAKE_MASTER.get():
+            _disabled("MOONCAKE_MASTER is not set (mooncake sink)")
+            return None
+        if sink_kind not in ("file", "mooncake"):
+            _disabled(f"unknown SGLANG_HIDDEN_CAPTURE_SINK={sink_kind!r}")
             return None
 
         aux_layer_ids = _resolve_aux_layer_ids(spec_aux_config)
@@ -184,6 +191,7 @@ class HiddenStatesCapturer:
             model_config=model_config,
             num_aux_layers=len(aux_layer_ids),
             num_tokens=num_tokens,
+            sink_kind=sink_kind,
             sink_dir=sink_dir,
             aux_layer_ids=list(aux_layer_ids),
             model_path=server_args.model_path,
@@ -196,7 +204,8 @@ class HiddenStatesCapturer:
         model_config: ModelConfig,
         num_aux_layers: int,
         num_tokens: int,
-        sink_dir: str,
+        sink_kind: str,
+        sink_dir: Optional[str],
         aux_layer_ids: List[int],
         model_path: str,
         model_revision: Optional[str],
@@ -233,7 +242,7 @@ class HiddenStatesCapturer:
             bookkeeper=self.bookkeeper,
             stats=self.stats,
         )
-        self.sink = HiddenFileSink(sink_dir)
+        self.sink = self._build_sink(sink_kind, sink_dir)
         self.sink.write_fingerprint(
             {
                 "model_path": model_path,
@@ -262,12 +271,26 @@ class HiddenStatesCapturer:
         self.finalize_worker.start()
         self.export_worker.start()
         logger.info(
-            "hidden state capture enabled: sink_dir=%s, aux_layer_ids=%s, "
+            "hidden state capture enabled: sink=%s (dir=%s), aux_layer_ids=%s, "
             "sample_rate=%.3f",
+            sink_kind,
             sink_dir,
             aux_layer_ids,
             self.sample_rate,
         )
+
+    def _build_sink(self, sink_kind: str, sink_dir: Optional[str]):
+        if sink_kind == "mooncake":
+            from sglang.srt.state_capturer.hidden_mooncake import MooncakeHiddenSink
+
+            # +8 bytes/row: input_ids ride the same registered staging buffer.
+            row_bytes = (self.aux_width + self.last_width) * self.dtype.itemsize + 8
+            return MooncakeHiddenSink(
+                store_id=envs.SGLANG_HIDDEN_CAPTURE_STORE_ID.get(),
+                row_bytes=row_bytes,
+                max_export_tokens=envs.SGLANG_HIDDEN_CAPTURE_MAX_EXPORT_TOKENS.get(),
+            )
+        return HiddenFileSink(sink_dir)
 
     # ---------------------------------------------------------------- forward
 
