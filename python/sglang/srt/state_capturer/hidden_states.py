@@ -18,6 +18,7 @@ matrix in ``create`` reflects this).
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -178,6 +179,11 @@ class HiddenStatesCapturer:
 
         self.stats = HiddenCaptureStats()
         self.bookkeeper = HiddenCaptureBookkeeper()
+        # Dedicated stream for capture D2H. The scheduler's copy stream is
+        # FIFO: queueing capture's large copies there would make the NEXT
+        # step's (tiny) result copies — and thus its copy_done — wait behind
+        # them, leaking capture cost into serving tail latency.
+        self.capture_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
         self.ring = HiddenStagingRing(
             num_slots=envs.SGLANG_HIDDEN_CAPTURE_STAGING_SLOTS.get(),
             slot_tokens=envs.SGLANG_HIDDEN_CAPTURE_STAGING_SLOT_TOKENS.get(),
@@ -288,6 +294,11 @@ class HiddenStatesCapturer:
 
         All-or-nothing per forward: if the ring can't hold every row, every
         affected request becomes a capture-miss (never backpressure).
+
+        The large copies are issued on the capturer's dedicated stream, which
+        waits on the caller's stream (the result-copy stream, itself already
+        past forward). The scheduler's copy stream stays free for the next
+        step's small result copies; ring events gate the finalize thread.
         """
         num_rows = output.aux_hidden_states.shape[0]
         if num_rows == 0:
@@ -300,22 +311,28 @@ class HiddenStatesCapturer:
             self.bookkeeper.mark_miss([rid for rid, _, _ in output.req_ranges])
             return
 
-        for seg, slot in enumerate(slots):
-            seg_start = seg * slot_tokens
-            seg_end = min(seg_start + slot_tokens, num_rows)
-            seg_ranges = [
-                (rid, max(r0, seg_start) - seg_start, min(r1, seg_end) - seg_start)
-                for rid, r0, r1 in output.req_ranges
-                if r0 < seg_end and r1 > seg_start
-            ]
-            self.ring.enqueue_segment(
-                slot,
-                aux_rows=output.aux_hidden_states[seg_start:seg_end],
-                last_rows=output.last_hidden_states[seg_start:seg_end],
-                cache_locs=output.out_cache_loc[seg_start:seg_end],
-                tokens=output.input_tokens[seg_start:seg_end],
-                req_ranges=seg_ranges,
-            )
+        if self.capture_stream is not None:
+            self.capture_stream.wait_stream(torch.cuda.current_stream())
+            stream_ctx = torch.cuda.stream(self.capture_stream)
+        else:
+            stream_ctx = contextlib.nullcontext()
+        with stream_ctx:
+            for seg, slot in enumerate(slots):
+                seg_start = seg * slot_tokens
+                seg_end = min(seg_start + slot_tokens, num_rows)
+                seg_ranges = [
+                    (rid, max(r0, seg_start) - seg_start, min(r1, seg_end) - seg_start)
+                    for rid, r0, r1 in output.req_ranges
+                    if r0 < seg_end and r1 > seg_start
+                ]
+                self.ring.enqueue_segment(
+                    slot,
+                    aux_rows=output.aux_hidden_states[seg_start:seg_end],
+                    last_rows=output.last_hidden_states[seg_start:seg_end],
+                    cache_locs=output.out_cache_loc[seg_start:seg_end],
+                    tokens=output.input_tokens[seg_start:seg_end],
+                    req_ranges=seg_ranges,
+                )
         self.stats.bump("rows_staged_ct", num_rows)
 
     # ----------------------------------------------------------------- finish

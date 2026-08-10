@@ -17,6 +17,7 @@ Usage:
 import argparse
 import json
 import os
+import shutil
 import tempfile
 
 from sglang.test.test_utils import is_in_ci, run_bench_serving
@@ -78,7 +79,8 @@ def _run(name: str, capture: bool, opts) -> dict:
         ckpts = [f for f in os.listdir(capture_dir) if f.endswith(".ckpt")]
         out["exported_samples"] = len(ckpts)
         out["export_rate"] = len(ckpts) / max(1, res["completed"])
-        out["capture_dir"] = capture_dir
+        # ~50 MB per 1k-token sample; a few rounds fill /tmp. Count, then drop.
+        shutil.rmtree(capture_dir, ignore_errors=True)
     return out
 
 
