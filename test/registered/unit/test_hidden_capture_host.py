@@ -197,7 +197,10 @@ class TestSidecarSeqlock(CustomTestCase):
         slots = torch.tensor([1, 2, 3], dtype=torch.long)
         tokens = torch.tensor([7, 8, 9], dtype=torch.int64)
         patterns = [
-            (torch.full((3, AUX_WIDTH), float(v)), torch.full((3, LAST_WIDTH), float(v)))
+            (
+                torch.full((3, AUX_WIDTH), float(v)),
+                torch.full((3, LAST_WIDTH), float(v)),
+            )
             for v in (1.0, 2.0)
         ]
         stop = _threading.Event()
@@ -325,8 +328,9 @@ class TestEndToEndPipeline(CustomTestCase):
             record = torch.load(os.path.join(tmpdir, "r1.ckpt"), weights_only=True)
             self.assertEqual(
                 set(record),
-                {"input_ids", "loss_mask", "aux_hidden_state", "hidden_state"},
+                {"input_ids", "loss_mask", "aux_hidden_state", "hidden_state", "rid"},
             )
+            self.assertEqual(record["rid"], "r1")
             self.assertEqual(record["input_ids"].tolist(), tokens)
             self.assertEqual(record["loss_mask"].tolist(), [1, 1, 1])
             self.assertEqual(record["aux_hidden_state"].shape, (1, 3, AUX_WIDTH))
@@ -465,6 +469,35 @@ class TestSamplingDeterminism(CustomTestCase):
         self.assertTrue(
             all(HiddenStatesCapturer._sampled(capturer, r) for r in rids[:10])
         )
+
+
+class TestSampleIdSafety(CustomTestCase):
+    """P2-1 regression: rid is caller-suppliable and flows into the sink path;
+    a traversal rid must not escape the sink dir, and a duplicate must not
+    silently overwrite the first export."""
+
+    def test_traversal_rid_is_hashed(self):
+        from sglang.srt.state_capturer.hidden_states import HiddenStatesCapturer
+
+        for rid in ("../../etc/passwd", "a/b.ckpt", "x" * 200, "rid with space"):
+            sid = HiddenStatesCapturer._sample_id_for(rid)
+            self.assertNotIn("/", sid)
+            self.assertNotIn("..", sid)
+            self.assertLessEqual(len(sid), 128)
+        # Safe uuid-shaped rids pass through unchanged (readable filenames).
+        self.assertEqual(
+            HiddenStatesCapturer._sample_id_for("abc-123_DEF"), "abc-123_DEF"
+        )
+
+    def test_duplicate_sample_id_keeps_first_export(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sink = HiddenFileSink(tmpdir)
+            first = {"input_ids": torch.tensor([1])}
+            second = {"input_ids": torch.tensor([2])}
+            self.assertTrue(sink.put("dup", first))
+            self.assertFalse(sink.put("dup", second))
+            kept = torch.load(os.path.join(tmpdir, "dup.ckpt"), weights_only=True)
+            self.assertEqual(kept["input_ids"].tolist(), [1])
 
 
 if __name__ == "__main__":

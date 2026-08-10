@@ -984,13 +984,18 @@ class Envs:
     # Fraction of finished requests exported (decided at request finish, not
     # at admission; all forwarded rows are staged to host regardless).
     SGLANG_HIDDEN_CAPTURE_SAMPLE_RATE = EnvFloat(1.0)
-    # Pinned staging ring geometry: slot count x max rows per slot. A slot
-    # must fit one forward's extend rows (>= chunked_prefill_size) or the
-    # affected requests are marked capture-miss.
+    # Pinned staging ring geometry: slot count x max rows per slot. A forward
+    # spanning S = ceil(rows / SLOT_TOKENS) segments stages only if S free
+    # slots are available; S > SLOTS can never stage (guaranteed miss), so
+    # keep SLOTS x SLOT_TOKENS >= the largest expected extend batch.
     SGLANG_HIDDEN_CAPTURE_STAGING_SLOTS = EnvInt(4)
     SGLANG_HIDDEN_CAPTURE_STAGING_SLOT_TOKENS = EnvInt(8192)
     # Export job queue capacity; full queue => capture-miss (never backpressure).
     SGLANG_HIDDEN_CAPTURE_EXPORT_QUEUE_SIZE = EnvInt(256)
+    # Upper bound on the host sidecar allocation (which scales with
+    # max_total_num_tokens x row bytes); exceeding it disables capture at
+    # startup rather than silently committing tens of GB per scheduler.
+    SGLANG_HIDDEN_CAPTURE_MAX_HOST_GB = EnvFloat(64.0)
 
     # VLM
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)

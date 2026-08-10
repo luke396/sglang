@@ -21,6 +21,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import logging
+import re
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import msgspec
@@ -55,6 +56,10 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+# rids matching this are used verbatim as sample ids (uuid4().hex shape);
+# anything else (caller-supplied) is hashed to a safe unique token.
+_SAFE_RID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
 
 def _disabled(reason: str) -> None:
@@ -159,6 +164,22 @@ class HiddenStatesCapturer:
         if get_parallel().attn_tp_rank != 0:
             return None
 
+        # Host memory gate: the sidecar scales with the KV pool. Estimate
+        # before allocating so an oversized config disables capture instead
+        # of silently committing tens of GB per scheduler (x N under DP).
+        hidden_size = model_config.hf_text_config.hidden_size
+        row_bytes = (len(aux_layer_ids) + 1) * hidden_size * model_config.dtype.itemsize
+        sidecar_gb = num_tokens * row_bytes / 1024**3
+        max_gb = envs.SGLANG_HIDDEN_CAPTURE_MAX_HOST_GB.get()
+        if sidecar_gb > max_gb:
+            _disabled(
+                f"host sidecar would need {sidecar_gb:.1f} GB "
+                f"(max_total_num_tokens={num_tokens} x {row_bytes} B/row) > "
+                f"SGLANG_HIDDEN_CAPTURE_MAX_HOST_GB={max_gb}. Raise the limit "
+                "or reduce the KV pool"
+            )
+            return None
+
         return HiddenStatesCapturer(
             model_config=model_config,
             num_aux_layers=len(aux_layer_ids),
@@ -223,6 +244,11 @@ class HiddenStatesCapturer:
                 "num_aux_layers": num_aux_layers,
                 "norm_contract": "post_final_norm_pre_lm_head",
                 "aux_layout": "packed_last_dim",  # [T, K*H], serving layout
+                # M1 rows cover the prompt region only (no verify/decode rows),
+                # and loss_mask is a placeholder — recompute offline before
+                # feeding a training recipe that masks on role boundaries.
+                "coverage": "prefill_only",
+                "loss_mask": "all_ones_placeholder",
             }
         )
         self.export_worker = HiddenExportWorker(
@@ -266,6 +292,13 @@ class HiddenStatesCapturer:
         rids = forward_batch.rids
         extend_lens = forward_batch.extend_seq_lens_cpu
         if rids is None or extend_lens is None:
+            return None
+        if forward_batch.forward_mode.is_split_prefill():
+            # forward_batch_split_prefill builds its GenerationBatchResult
+            # without the capture holder, so rows would silently never stage.
+            # Fail closed with attribution instead.
+            self.stats.bump("skipped_forward_ct")
+            self.bookkeeper.mark_miss(rids)
             return None
         if can_run_graph:
             # CUDA-graph replays overwrite static output buffers; staging from
@@ -352,11 +385,23 @@ class HiddenStatesCapturer:
         digest = hashlib.md5(rid.encode()).digest()
         return int.from_bytes(digest[:8], "little") / 2**64 < self.sample_rate
 
+    @staticmethod
+    def _sample_id_for(rid: str) -> str:
+        """Filesystem/key-safe sample id. rid is caller-supplied (io_struct
+        only generates a uuid when absent), so it can carry path separators or
+        collide across requests; hash unless it's already a safe unique token.
+        The original rid is preserved inside the exported record."""
+        if _SAFE_RID_RE.fullmatch(rid):
+            return rid
+        return hashlib.sha1(rid.encode()).hexdigest()
+
     def collect_at_finish(self, req: Req, req_to_token_pool: ReqToTokenPool) -> None:
         """Finish hook (scheduler thread, before ``release_kv_cache``).
 
-        Only snapshots CPU-side state and enqueues the export job; the row
-        copies, validation, and file write all happen on the export thread.
+        Snapshots CPU-side state and enqueues the export job; the row copies,
+        validation, and file write happen on the export thread. The kv-slot
+        snapshot is one small synchronous D2H (same pattern as the
+        routed-experts finish hook).
         """
         rid = req.rid
         if rid.startswith(HEALTH_CHECK_RID_PREFIX):
@@ -375,7 +420,7 @@ class HiddenStatesCapturer:
         )
         job = HiddenExportJob(
             rid=rid,
-            sample_id=rid,
+            sample_id=self._sample_id_for(rid),
             tokens=torch.tensor(req.origin_input_ids, dtype=torch.long),
             slots=slots,
             ring_seq_barrier=self.ring.last_enqueued_seq,

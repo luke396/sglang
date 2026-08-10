@@ -58,11 +58,20 @@ class HiddenFileSink:
         self.sink_dir = sink_dir
         os.makedirs(sink_dir, exist_ok=True)
 
-    def put(self, sample_id: str, record: Dict[str, torch.Tensor]) -> None:
+    def put(self, sample_id: str, record: Dict[str, torch.Tensor]) -> bool:
+        """Write one sample; False if the id was already exported.
+
+        First write wins: rid is caller-suppliable, so a duplicate means two
+        distinct requests mapped to one sample id — overwriting would silently
+        drop the first sample.
+        """
         final_path = os.path.join(self.sink_dir, f"{sample_id}.ckpt")
+        if os.path.exists(final_path):
+            return False
         tmp_path = final_path + ".tmp"
         torch.save(record, tmp_path)
         os.replace(tmp_path, final_path)
+        return True
 
     def write_fingerprint(self, fingerprint: Dict[str, Any]) -> None:
         final_path = os.path.join(self.sink_dir, "_fingerprint.json")
@@ -176,9 +185,21 @@ class HiddenExportWorker:
         num_tokens = job.tokens.shape[0]
         record = {
             "input_ids": job.tokens.to(torch.long),
+            # Placeholder: bypass capture cannot see chat-template role
+            # boundaries; recompute the real mask offline before training
+            # (also flagged in _fingerprint.json).
             "loss_mask": torch.ones(num_tokens, dtype=torch.long),
             "aux_hidden_state": aux_rows.unsqueeze(0),
             "hidden_state": last_rows.unsqueeze(0),
+            "rid": job.rid,
         }
-        self.sink.put(job.sample_id, record)
-        self.stats.bump("export_ok_ct")
+        if self.sink.put(job.sample_id, record):
+            self.stats.bump("export_ok_ct")
+        else:
+            self.stats.bump("duplicate_sample_miss_ct")
+            logger.warning(
+                "hidden capture: duplicate sample id %s (rid %s); keeping the "
+                "first export",
+                job.sample_id,
+                job.rid,
+            )
