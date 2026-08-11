@@ -1008,10 +1008,13 @@ class Envs:
     # source and registration cannot run per-sample). Longer samples are
     # whole-sample capture misses.
     SGLANG_HIDDEN_CAPTURE_MAX_EXPORT_TOKENS = EnvInt(16384)
-    # Verify (decode) row capture: device ring geometry. Each slot must hold
-    # one verify step's full window (bs x verify_num_draft_tokens rows) in
-    # HBM plus a pinned twin; a step that doesn't fit is a capture miss for
-    # every request in the batch.
+    # Verify (decode) row capture: device twin-pool geometry overrides. By
+    # default both adapt at startup: slot size = the actual verify window
+    # (max_running_requests x speculative_num_draft_tokens, rounded up to
+    # 256) and slot count = a fixed HBM token budget / slot size (min 2) —
+    # deep pools for small deployments, window-fitting slots for large-batch
+    # ones. Set explicitly to pin either dimension; a verify step larger
+    # than a slot is a capture miss for every request in the batch.
     SGLANG_HIDDEN_CAPTURE_VERIFY_RING_SLOTS = EnvInt(2)
     SGLANG_HIDDEN_CAPTURE_VERIFY_RING_TOKENS = EnvInt(2048)
 

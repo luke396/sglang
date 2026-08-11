@@ -353,6 +353,27 @@ class HiddenStagingRing:
                 return None
             return self._inflight.popleft()
 
+    def reap_ready_twins(self, twin_pool: DeviceTwinPool) -> int:
+        """Release device twins whose D2H into pinned memory has completed.
+
+        A twin's data is dead the moment its slot's copy event fires; waiting
+        for the slot to reach the finalize queue head (and for finalize's
+        sidecar memcpy — hundreds of MB for prefill slots) holds twins for
+        tens of ms longer than needed and starves verify capture. The capture
+        stream is FIFO so this scan usually stops at the first pending event.
+        """
+        reaped = 0
+        with self._lock:
+            for slot in self._inflight:
+                if slot.twin is None:
+                    continue
+                if not slot.event.query():
+                    break  # FIFO stream: later slots can't be done either
+                twin_pool.release(slot.twin)
+                slot.twin = None
+                reaped += 1
+        return reaped
+
     def release(self, slot: _StagingSlot) -> None:
         slot.num_rows = 0
         slot.ring_seq = -1
@@ -562,6 +583,11 @@ class HiddenFinalizeWorker:
 
     def _run(self) -> None:
         while self._running:
+            # Recycle twins as soon as their D2H completes, independent of
+            # this thread's (much slower) sidecar-memcpy progress; the
+            # forward thread also reaps opportunistically on pool miss.
+            if self.twin_pool is not None:
+                self.ring.reap_ready_twins(self.twin_pool)
             slot = self.ring.pop_ready()
             if slot is None:
                 time.sleep(self._poll_interval_s)

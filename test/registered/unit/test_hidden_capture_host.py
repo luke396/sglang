@@ -369,6 +369,42 @@ class TestVerifyCommittedRows(CustomTestCase):
         ring.release(ready)
         self.assertIsNotNone(pool.try_acquire())  # twin back in the pool
 
+    def test_twin_reaped_before_finalize(self):
+        """Coverage regression (matrix probe: 2x2048 -> 8x512 lifted baseline
+        coverage 0.52 -> 0.87 with twin_miss 63 -> 0): a twin is dead the
+        moment its slot's D2H event fires; reap_ready_twins must release it
+        while the slot still sits in the finalize queue — waiting for the
+        finalize memcpy starves fast decode steps of twins."""
+        from sglang.srt.state_capturer.hidden_host import DeviceTwinPool
+
+        pool = DeviceTwinPool(
+            num_twins=1,
+            twin_tokens=16,
+            max_reqs=4,
+            aux_width=AUX_WIDTH,
+            last_width=LAST_WIDTH,
+            dtype=DTYPE,
+            device="cpu",
+            use_cuda_events=False,
+        )
+        ring = _make_ring(num_slots=1, slot_tokens=16)
+        twin = pool.try_acquire()
+        twin.cache_loc[:2] = torch.tensor([10, 11], dtype=torch.int64)
+        twin.tokens[:2] = torch.tensor([5, 6], dtype=torch.int64)
+        twin.commit_lens[:1] = torch.tensor([1], dtype=torch.int32)
+        (slot,) = ring.try_acquire(1)
+        ring.enqueue_verify_segment(slot, twin=twin, rids=["r0"], stride=2, num_reqs=1)
+        self.assertIsNone(pool.try_acquire())
+
+        # D2H done (_NullEvent queries True); slot NOT yet finalized.
+        self.assertEqual(ring.reap_ready_twins(pool), 1)
+        self.assertIsNotNone(pool.try_acquire())  # recycled early
+        # The slot is still in flight with its data intact; finalize must not
+        # double-release (twin field was cleared by the reap).
+        ready = ring.pop_ready()
+        self.assertIsNotNone(ready)
+        self.assertIsNone(ready.twin)
+
 
 class TestEndToEndPipeline(CustomTestCase):
     """stage -> finalize -> export against a real temp-dir file sink."""

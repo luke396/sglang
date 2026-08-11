@@ -68,6 +68,24 @@ logger = logging.getLogger(__name__)
 # anything else (caller-supplied) is hashed to a safe unique token.
 _SAFE_RID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
+# HBM token-slot budget for the verify twin pool when the geometry is not
+# pinned via env vars: slots = budget / verify_window_tokens (min 2). At
+# 4096 total slots and Qwen3-8B widths (K=5 aux + last, bf16) this is the
+# same ~200MB the old fixed 2x2048 default used.
+_VERIFY_TWIN_BUDGET_TOKENS = 4096
+
+
+def _resolve_verify_window_tokens(
+    *, server_args: ServerArgs, max_running_requests: int
+) -> int:
+    """Upper bound on one verify step's rows: bs x verify width, rounded up
+    to 256 so near-boundary bs growth doesn't force misses. DSpark's verify
+    width (anchor + gamma drafts) equals speculative_num_draft_tokens
+    (dspark_config: gamma = num_draft_tokens - 1, width = gamma + 1)."""
+    verify_width = server_args.speculative_num_draft_tokens or 1
+    window = max(1, max_running_requests) * verify_width
+    return (window + 255) // 256 * 256
+
 
 def _disabled(reason: str) -> None:
     logger.warning("hidden state capture disabled: %s", reason)
@@ -128,6 +146,7 @@ class HiddenStatesCapturer:
         model_config: ModelConfig,
         spec_aux_config: SpecAuxHiddenStateConfig,
         num_tokens: int,
+        max_running_requests: int,
         device: str,
     ) -> Optional[HiddenStatesCapturer]:
         if not server_args.enable_hidden_state_capture:
@@ -208,6 +227,9 @@ class HiddenStatesCapturer:
             model_config=model_config,
             num_aux_layers=len(aux_layer_ids),
             num_tokens=num_tokens,
+            verify_window_tokens=_resolve_verify_window_tokens(
+                server_args=server_args, max_running_requests=max_running_requests
+            ),
             sink_kind=sink_kind,
             sink_dir=sink_dir,
             aux_layer_ids=list(aux_layer_ids),
@@ -221,6 +243,7 @@ class HiddenStatesCapturer:
         model_config: ModelConfig,
         num_aux_layers: int,
         num_tokens: int,
+        verify_window_tokens: int,
         sink_kind: str,
         sink_dir: Optional[str],
         aux_layer_ids: List[int],
@@ -255,10 +278,27 @@ class HiddenStatesCapturer:
         )
         # Verify capture: device twins are the overwrite fence for graph/
         # persistent buffers (packed on the forward stream; see _DeviceTwin).
+        # Geometry adapts to the actual verify window (bs x draft tokens):
+        # slots = HBM budget / window, so small deployments get deep pools
+        # (fast decode steps need many in-flight twins) and large-batch ones
+        # still fit their window. Explicit env vars override both.
+        twin_tokens = (
+            envs.SGLANG_HIDDEN_CAPTURE_VERIFY_RING_TOKENS.get()
+            if envs.SGLANG_HIDDEN_CAPTURE_VERIFY_RING_TOKENS.is_set()
+            else verify_window_tokens
+        )
+        num_twins = (
+            envs.SGLANG_HIDDEN_CAPTURE_VERIFY_RING_SLOTS.get()
+            if envs.SGLANG_HIDDEN_CAPTURE_VERIFY_RING_SLOTS.is_set()
+            else max(
+                2,
+                _VERIFY_TWIN_BUDGET_TOKENS // max(1, twin_tokens),
+            )
+        )
         self.twin_pool = (
             DeviceTwinPool(
-                num_twins=envs.SGLANG_HIDDEN_CAPTURE_VERIFY_RING_SLOTS.get(),
-                twin_tokens=envs.SGLANG_HIDDEN_CAPTURE_VERIFY_RING_TOKENS.get(),
+                num_twins=num_twins,
+                twin_tokens=twin_tokens,
                 max_reqs=512,
                 aux_width=self.aux_width,
                 last_width=self.last_width,
@@ -433,7 +473,14 @@ class HiddenStatesCapturer:
             self.stats.bump("skipped_forward_ct")
             self.bookkeeper.mark_miss(rids)
             return None
+        # Twins whose D2H already finished are recyclable right now — reap
+        # them on this thread instead of waiting for the finalize thread to
+        # chew through the queue (its sidecar memcpy holds twins for tens of
+        # ms and starves fast decode steps).
         twin = self.twin_pool.try_acquire()
+        if twin is None:
+            self.ring.reap_ready_twins(self.twin_pool)
+            twin = self.twin_pool.try_acquire()
         if twin is None:
             self.stats.bump("verify_twin_full_miss_ct")
             self.bookkeeper.mark_miss(rids)

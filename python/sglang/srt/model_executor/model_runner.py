@@ -1032,6 +1032,7 @@ class ModelRunner:
                 model_config=self.model_config,
                 spec_aux_config=self.spec_aux_config,
                 num_tokens=self.max_total_num_tokens + self.page_size,
+                max_running_requests=self.max_running_requests,
                 device=self.device,
             )
         )
