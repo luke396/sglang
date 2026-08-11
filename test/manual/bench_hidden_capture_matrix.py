@@ -214,6 +214,11 @@ def run_cell(cell, repeat_idx):
                 "SGLANG_HIDDEN_CAPTURE_STORE_ID": STORE_ID,
                 "MOONCAKE_MASTER": f"127.0.0.1:{MASTER_PORT}",
                 "MOONCAKE_PROTOCOL": "tcp",
+                # Size the bench store above one run's full sample volume
+                # (~60MB/sample x up to 600 requests); otherwise the store's
+                # eviction watermark rejects puts mid-run and coverage
+                # measures the BENCH store, not the capture pipeline.
+                "MOONCAKE_GLOBAL_SEGMENT_SIZE": "48gb",
             }
         )
     log_file = tempfile.NamedTemporaryFile(

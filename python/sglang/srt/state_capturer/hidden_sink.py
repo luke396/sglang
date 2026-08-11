@@ -148,6 +148,11 @@ class HiddenExportWorker:
             try:
                 self.export_one(job)
             except Exception:
+                # Sink write failed (e.g. mooncake store out of space) after
+                # identity validation passed -- a real dropped sample, not a
+                # pipeline miss. Count it so coverage loss is attributable
+                # without diffing export_ok_ct against completed requests.
+                self.stats.bump("sink_put_failed_miss_ct")
                 logger.exception("hidden capture export failed for rid %s", job.rid)
             self._maybe_sweep_orphans()
 
