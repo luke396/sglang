@@ -74,6 +74,11 @@ _SAFE_RID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
 # same ~200MB the old fixed 2x2048 default used.
 _VERIFY_TWIN_BUDGET_TOKENS = 4096
 
+# Pinned-host token-slot budget for the staging ring when its geometry is not
+# pinned via env vars: slots = budget / slot_tokens (min 2). 32768 total slots
+# matches the old fixed 4x8192 default (~1.6GB pinned at Qwen3-8B widths).
+_STAGING_RING_BUDGET_TOKENS = 32768
+
 
 def _resolve_verify_window_tokens(
     *, server_args: ServerArgs, max_running_requests: int
@@ -85,6 +90,28 @@ def _resolve_verify_window_tokens(
     verify_width = server_args.speculative_num_draft_tokens or 1
     window = max(1, max_running_requests) * verify_width
     return (window + 255) // 256 * 256
+
+
+def _resolve_staging_slot_tokens(
+    *, server_args: ServerArgs, verify_window_tokens: int
+) -> int:
+    """Upper bound on one forward's staged rows, rounded up to 256.
+
+    Prefill: the PrefillAdder caps a batch's extend rows at
+    chunked_prefill_size (rem_chunk_tokens is a batch-level budget); with
+    chunking disabled (-1) the bound becomes max_prefill_tokens. A slot sized
+    to that bound never needs the multi-segment path in the common case (the
+    split remains as a safety net; real bound can exceed max_prefill_tokens
+    for models with a longer context, per its help text).
+    Verify windows share this ring, so the slot must fit them too.
+    """
+    chunk = server_args.chunked_prefill_size
+    if chunk is None or chunk <= 0:
+        prefill_bound = server_args.max_prefill_tokens
+    else:
+        prefill_bound = chunk
+    bound = max(prefill_bound, verify_window_tokens, 256)
+    return (bound + 255) // 256 * 256
 
 
 def _disabled(reason: str) -> None:
@@ -223,12 +250,16 @@ class HiddenStatesCapturer:
             )
             return None
 
+        verify_window_tokens = _resolve_verify_window_tokens(
+            server_args=server_args, max_running_requests=max_running_requests
+        )
         return HiddenStatesCapturer(
             model_config=model_config,
             num_aux_layers=len(aux_layer_ids),
             num_tokens=num_tokens,
-            verify_window_tokens=_resolve_verify_window_tokens(
-                server_args=server_args, max_running_requests=max_running_requests
+            verify_window_tokens=verify_window_tokens,
+            staging_slot_tokens=_resolve_staging_slot_tokens(
+                server_args=server_args, verify_window_tokens=verify_window_tokens
             ),
             sink_kind=sink_kind,
             sink_dir=sink_dir,
@@ -244,6 +275,7 @@ class HiddenStatesCapturer:
         num_aux_layers: int,
         num_tokens: int,
         verify_window_tokens: int,
+        staging_slot_tokens: int,
         sink_kind: str,
         sink_dir: Optional[str],
         aux_layer_ids: List[int],
@@ -263,9 +295,26 @@ class HiddenStatesCapturer:
         # step's (tiny) result copies — and thus its copy_done — wait behind
         # them, leaking capture cost into serving tail latency.
         self.capture_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        # Staging ring geometry adapts like the twin pool's: slot size = one
+        # forward's staged-row bound (chunked_prefill_size, or
+        # max_prefill_tokens when chunking is disabled; floored to the verify
+        # window, which shares this ring), slot count = pinned budget / slot
+        # size. A chunk-128 deployment thus gets 64 slots of 512 instead of
+        # 4x8192 (98% dead capacity, concurrency capped at 4); the 8192-chunk
+        # default reproduces the old 4x8192. Env vars pin either dimension.
+        ring_slot_tokens = (
+            envs.SGLANG_HIDDEN_CAPTURE_STAGING_SLOT_TOKENS.get()
+            if envs.SGLANG_HIDDEN_CAPTURE_STAGING_SLOT_TOKENS.is_set()
+            else staging_slot_tokens
+        )
+        ring_slots = (
+            envs.SGLANG_HIDDEN_CAPTURE_STAGING_SLOTS.get()
+            if envs.SGLANG_HIDDEN_CAPTURE_STAGING_SLOTS.is_set()
+            else max(2, _STAGING_RING_BUDGET_TOKENS // max(1, ring_slot_tokens))
+        )
         self.ring = HiddenStagingRing(
-            num_slots=envs.SGLANG_HIDDEN_CAPTURE_STAGING_SLOTS.get(),
-            slot_tokens=envs.SGLANG_HIDDEN_CAPTURE_STAGING_SLOT_TOKENS.get(),
+            num_slots=ring_slots,
+            slot_tokens=ring_slot_tokens,
             aux_width=self.aux_width,
             last_width=self.last_width,
             dtype=self.dtype,

@@ -984,10 +984,14 @@ class Envs:
     # Fraction of finished requests exported (decided at request finish, not
     # at admission; all forwarded rows are staged to host regardless).
     SGLANG_HIDDEN_CAPTURE_SAMPLE_RATE = EnvFloat(1.0)
-    # Pinned staging ring geometry: slot count x max rows per slot. A forward
-    # spanning S = ceil(rows / SLOT_TOKENS) segments stages only if S free
-    # slots are available; S > SLOTS can never stage (guaranteed miss), so
-    # keep SLOTS x SLOT_TOKENS >= the largest expected extend batch.
+    # Pinned staging ring geometry overrides. By default both adapt at
+    # startup: slot size = one forward's staged-row bound
+    # (chunked_prefill_size, or max_prefill_tokens when chunking is disabled,
+    # floored to the verify window and rounded to 256) and slot count = a
+    # fixed pinned-host token budget / slot size (min 2). Set explicitly to
+    # pin either dimension. A forward spanning S = ceil(rows / SLOT_TOKENS)
+    # segments stages only if S free slots are available; S > SLOTS can never
+    # stage (guaranteed miss).
     SGLANG_HIDDEN_CAPTURE_STAGING_SLOTS = EnvInt(4)
     SGLANG_HIDDEN_CAPTURE_STAGING_SLOT_TOKENS = EnvInt(8192)
     # Export job queue capacity; full queue => capture-miss (never backpressure).
