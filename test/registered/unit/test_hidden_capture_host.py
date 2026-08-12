@@ -644,5 +644,65 @@ class TestSampleIdSafety(CustomTestCase):
             self.assertEqual(kept["input_ids"].tolist(), [1])
 
 
+class TestSnapshotKvSlots(CustomTestCase):
+    """Regression for the capture-on p99 TPOT tail: the finish hook's kv-slot
+    snapshot must go through the pinned+dedicated-stream path (a plain .cpu()
+    is a synchronous pageable D2H that serializes behind capture's own staging
+    transfers on the copy engine, stalling the scheduler thread for ms)."""
+
+    @staticmethod
+    def _make_host(num_tokens=64):
+        from sglang.srt.state_capturer.hidden_states import HiddenStatesCapturer
+
+        class _Host:
+            _snapshot_kv_slots = HiddenStatesCapturer._snapshot_kv_slots
+
+        host = _Host()
+        cuda = torch.cuda.is_available()
+        host.snapshot_stream = torch.cuda.Stream() if cuda else None
+        host._snapshot_buf = (
+            torch.empty((num_tokens,), dtype=torch.int64, pin_memory=True)
+            if cuda
+            else None
+        )
+        host._snapshot_event = torch.cuda.Event() if cuda else None
+        return host
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_gpu_snapshot_values_and_buffer_reuse(self):
+        host = self._make_host()
+        # int32 source mirrors req_to_token; the pinned buf is int64.
+        first = host._snapshot_kv_slots(
+            torch.arange(10, dtype=torch.int32, device="cuda")
+        )
+        second = host._snapshot_kv_slots(
+            torch.arange(100, 108, dtype=torch.int32, device="cuda")
+        )
+        # clone() semantics: the first result must survive buffer reuse.
+        self.assertEqual(first.tolist(), list(range(10)))
+        self.assertEqual(second.tolist(), list(range(100, 108)))
+        self.assertEqual(first.dtype, torch.int64)
+        self.assertFalse(first.is_cuda)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_gpu_snapshot_correct_while_copy_engine_busy(self):
+        """The bug scenario: large in-flight D2H traffic on another stream
+        (capture staging) while the hook snapshots. Asserts correctness; the
+        latency property (not queuing behind the big copies) is covered by
+        the bench bisection in PR#3."""
+        host = self._make_host()
+        big_src = torch.full((64 * 1024 * 1024,), 3, dtype=torch.uint8, device="cuda")
+        big_dst = torch.empty_like(big_src, device="cpu", pin_memory=True)
+        busy_stream = torch.cuda.Stream()
+        with torch.cuda.stream(busy_stream):
+            for _ in range(4):
+                big_dst.copy_(big_src, non_blocking=True)
+        out = host._snapshot_kv_slots(
+            torch.arange(32, dtype=torch.int32, device="cuda")
+        )
+        self.assertEqual(out.tolist(), list(range(32)))
+        torch.cuda.synchronize()
+
+
 if __name__ == "__main__":
     unittest.main()
