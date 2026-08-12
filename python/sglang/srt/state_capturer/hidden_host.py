@@ -83,6 +83,9 @@ class HiddenCaptureStats:
         self.duplicate_sample_miss_ct = 0
         self.sample_too_large_miss_ct = 0
         self.sink_put_failed_miss_ct = 0
+        # Sample exported but its manifest entry failed: discoverable by
+        # nothing, reclaimed by lease TTL (mooncake sink only).
+        self.manifest_orphan_miss_ct = 0
         self.export_ok_ct = 0
         self.skipped_forward_ct = 0
         self.verify_rows_committed_ct = 0

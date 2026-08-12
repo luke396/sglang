@@ -5,6 +5,10 @@ Mooncake. A real DSpark server exports via the mooncake sink; this script
 plays the trainer — ``MooncakeFeatureStore``-style registered ``get_into``
 reads — and validates the artifact against independent references:
 
+- discovery is manifest-tail only (the SpecLoop ingest contract): the
+  consumer knows nothing but the store prefix, tails ``_seq/{w}/{n}`` for
+  writer streams and sequence numbers, and finds every exported sample_id
+  with no rid or response channel involved;
 - meta is self-describing (shape/dtype/rid/num_tokens) and sufficient to
   allocate every receive buffer without any response channel;
 - ``input_ids`` readback == prompt + generated tokens (final sampled token
@@ -87,6 +91,36 @@ def _consume_tensor(store, key: str, spec: dict) -> torch.Tensor:
     return out
 
 
+def _tail_manifest(store, until_id: str, deadline_s: float = 30.0) -> list[str]:
+    """The SpecLoop ingester's discovery loop: knowing only the store prefix,
+    tail ``_seq/{writer}/{n}`` — writers found by probing ``_seq/{w}/0`` with
+    w increasing until a miss, entries by n increasing with gap tolerance
+    (a missing n with n+1 present is an evicted/burnt hole: count, skip).
+    Polls until ``until_id`` shows up (exports are asynchronous, and the
+    server's own warmup request exports too, so the stream is live)."""
+    deadline = time.monotonic() + deadline_s
+    while True:
+        sample_ids: list[str] = []
+        writer = 0
+        while int(store.is_exist(f"{STORE_ID}/_seq/{writer}/0")) == 1:
+            n, holes = 0, 0
+            while True:
+                key = f"{STORE_ID}/_seq/{writer}/{n}"
+                if int(store.is_exist(key)) == 1:
+                    sample_ids.append(bytes(store.get(key)).decode())
+                    n += 1
+                    holes = 0
+                elif holes < 8:  # gap detection: probe past the hole
+                    n += 1
+                    holes += 1
+                else:
+                    break
+            writer += 1
+        if until_id in sample_ids or time.monotonic() > deadline:
+            return sample_ids
+        time.sleep(0.2)
+
+
 def _load_lm_head() -> torch.Tensor:
     from huggingface_hub import hf_hub_download
     from safetensors import safe_open
@@ -160,11 +194,18 @@ def main():
         )
         assert rc == 0
 
-        meta_key = f"{STORE_ID}/{rid}/g0/meta"
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline and int(store.is_exist(meta_key)) != 1:
-            time.sleep(0.2)
-        assert int(store.is_exist(meta_key)) == 1, "meta key never appeared"
+        # ---- discovery: manifest tail, zero rid knowledge ----
+        # The stream also carries the server's warmup-request export; the
+        # measured request must be discoverable among them. rid is a uuid
+        # (key-safe), so sample_id passes through unhashed.
+        discovered = _tail_manifest(store, until_id=rid)
+        assert rid in discovered, f"manifest tail never discovered {rid}: {discovered}"
+        sample_id = rid
+
+        meta_key = f"{STORE_ID}/{sample_id}/g0/meta"
+        assert (
+            int(store.is_exist(meta_key)) == 1
+        ), "manifest entry visible before its meta: ordering contract broken"
         meta = json.loads(bytes(store.get(meta_key)))
         assert meta["rid"] == rid
         assert meta["loss_mask"] == "all_ones_placeholder"
@@ -174,15 +215,19 @@ def main():
         assert meta["num_tokens"] == expected_rows, (meta["num_tokens"], expected_rows)
 
         ids = _consume_tensor(
-            store, f"{STORE_ID}/{rid}/g0/input_ids", meta["tensors"]["input_ids"]
+            store, f"{STORE_ID}/{sample_id}/g0/input_ids", meta["tensors"]["input_ids"]
         )
         assert (
             ids.tolist() == (input_ids + completion_ids)[:expected_rows]
         ), "consumed input_ids != prompt + generated tokens"
 
-        aux = _consume_tensor(store, f"{STORE_ID}/{rid}/g0/aux", meta["tensors"]["aux"])
+        aux = _consume_tensor(
+            store, f"{STORE_ID}/{sample_id}/g0/aux", meta["tensors"]["aux"]
+        )
         last = _consume_tensor(
-            store, f"{STORE_ID}/{rid}/g0/last_hidden", meta["tensors"]["last_hidden"]
+            store,
+            f"{STORE_ID}/{sample_id}/g0/last_hidden",
+            meta["tensors"]["last_hidden"],
         )
         assert not torch.isnan(aux.float()).any()
         assert aux.shape[1] == expected_rows and last.shape[1] == expected_rows

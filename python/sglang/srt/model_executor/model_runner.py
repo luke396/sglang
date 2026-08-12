@@ -1034,6 +1034,7 @@ class ModelRunner:
                 num_tokens=self.max_total_num_tokens + self.page_size,
                 max_running_requests=self.max_running_requests,
                 device=self.device,
+                dp_rank=self.ps.dp_rank,
             )
         )
 

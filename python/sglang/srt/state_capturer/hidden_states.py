@@ -175,6 +175,7 @@ class HiddenStatesCapturer:
         num_tokens: int,
         max_running_requests: int,
         device: str,
+        dp_rank: Optional[int] = None,
     ) -> Optional[HiddenStatesCapturer]:
         if not server_args.enable_hidden_state_capture:
             return None
@@ -263,6 +264,7 @@ class HiddenStatesCapturer:
             ),
             sink_kind=sink_kind,
             sink_dir=sink_dir,
+            dp_rank=dp_rank if dp_rank is not None else 0,
             aux_layer_ids=list(aux_layer_ids),
             model_path=server_args.model_path,
             model_revision=server_args.revision,
@@ -278,6 +280,7 @@ class HiddenStatesCapturer:
         staging_slot_tokens: int,
         sink_kind: str,
         sink_dir: Optional[str],
+        dp_rank: int,
         aux_layer_ids: List[int],
         model_path: str,
         model_revision: Optional[str],
@@ -378,7 +381,7 @@ class HiddenStatesCapturer:
             stats=self.stats,
             twin_pool=self.twin_pool,
         )
-        self.sink = self._build_sink(sink_kind, sink_dir)
+        self.sink = self._build_sink(sink_kind, sink_dir, dp_rank)
         self.sink.write_fingerprint(
             {
                 "model_path": model_path,
@@ -416,7 +419,7 @@ class HiddenStatesCapturer:
             self.sample_rate,
         )
 
-    def _build_sink(self, sink_kind: str, sink_dir: Optional[str]):
+    def _build_sink(self, sink_kind: str, sink_dir: Optional[str], dp_rank: int):
         if sink_kind == "mooncake":
             from sglang.srt.state_capturer.hidden_mooncake import MooncakeHiddenSink
 
@@ -426,6 +429,8 @@ class HiddenStatesCapturer:
                 store_id=envs.SGLANG_HIDDEN_CAPTURE_STORE_ID.get(),
                 row_bytes=row_bytes,
                 max_export_tokens=envs.SGLANG_HIDDEN_CAPTURE_MAX_EXPORT_TOKENS.get(),
+                dp_rank=dp_rank,
+                stats=self.stats,
             )
         return HiddenFileSink(sink_dir)
 
