@@ -1006,6 +1006,10 @@ class Envs:
     SGLANG_HIDDEN_CAPTURE_SINK = EnvStr("file")
     # Mooncake sink: namespace prefix of every exported key
     # ({store_id}/{sample_id}/g0/{name}) and the trainer's discovery scope.
+    # The sink also appends a per-sample manifest entry
+    # ({store_id}/_seq/{dp_rank}/{n} = sample_id, hard-pinned) that consumers
+    # tail to discover samples; a controller should assign a unique store id
+    # per server instance so streams never collide across fleets.
     SGLANG_HIDDEN_CAPTURE_STORE_ID = EnvStr("sglang_hidden_capture")
     # Mooncake sink: sizes the one pre-registered staging buffer
     # (max_export_tokens x row bytes; RDMA put_from requires a registered
