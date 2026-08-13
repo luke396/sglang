@@ -11,6 +11,23 @@ and worst-combination cells on Qwen3-8B DSpark:
   dp       : 1 / 2
   load     : low / mid / high fixed rates, plus unbounded (saturation)
 
+THE STANDARD MATRIX (project convention — use these, don't improvise):
+
+  --cells regression   per-change gate: run for EVERY perf-relevant capture
+                       change. baseline x2 (anchor, continuity with all
+                       historical rows) + chunked_128 (staging-geometry /
+                       coverage guard) + load_high (tail-latency-under-load
+                       guard, 24 rps open-loop) + saturation_dp1
+                       (max-throughput-cost guard, unbounded rate). All dp1,
+                       single GPU, ~40-50 min.
+  --cells all          milestone/merge gate: full characterization
+                       (main + worst + supplement), multi-hour, needs 2 GPUs
+                       for the dp2 cells.
+
+Concurrency semantics: fixed-rate cells are open-loop Poisson — in-flight
+count is emergent (rate x e2e), NOT pinned; saturation cells enqueue all
+prompts at once, so concurrency rides the server admission limit.
+
 Measurement hygiene:
 - fixed seed and prompt shapes; 16-request warmup per run;
 - the Mooncake capture store is CLEARED after warmup and before the measured
@@ -393,11 +410,30 @@ def worst_cells():
     return cells
 
 
+def regression_cells():
+    """The per-change gate (see module docstring): anchor + the three cells
+    that each guard a distinct capture failure mode. All dp1 / one GPU."""
+    cells = []
+    _pair(cells, "baseline", BASE, repeats=2)
+    _pair(cells, "chunked_128", BASE, chunk=128)
+    _pair(cells, "load_high", BASE, rate=24.0, num_prompts=300)
+    _pair(
+        cells,
+        "saturation_dp1",
+        BASE,
+        rate=float("inf"),
+        num_prompts=300,
+    )
+    return cells
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", required=True)
     parser.add_argument(
-        "--cells", choices=["main", "worst", "supplement", "all"], default="all"
+        "--cells",
+        choices=["main", "worst", "supplement", "all", "regression"],
+        default="all",
     )
     parser.add_argument("--only", default=None, help="substring filter on cell name")
     opts = parser.parse_args()
@@ -414,6 +450,8 @@ def main():
     time.sleep(2)
     try:
         todo = []
+        if opts.cells == "regression":
+            todo = regression_cells()
         if opts.cells in ("main", "all"):
             todo += main_effect_cells()
         if opts.cells in ("worst", "all"):
