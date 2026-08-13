@@ -80,22 +80,28 @@ class HttpServerEngineAdapter(EngineBase):
         named_tensors: List[Tuple[str, torch.Tensor]],
         load_format: Optional[str] = None,
         flush_cache: bool = False,
+        draft_only: bool = False,
     ):
         """
-        Update model weights from tensor data. The HTTP server will only post meta data, and the real weights will be copied directly from GPUs.
-        Note: The model should be on GPUs rather than CPU for this functionality to work properly.
-        If you encounter issues, ensure your model is loaded on GPU devices rather than CPU.
+        Update model weights from tensor data. The HTTP request carries only
+        metadata; CPU tensors use filename-backed shared memory so a separately
+        launched server does not need to share the producer's authkey.
         """
 
         return self._make_request(
             "update_weights_from_tensor",
             {
                 "serialized_named_tensors": [
-                    MultiprocessingSerializer.serialize(named_tensors, output_str=True)
+                    MultiprocessingSerializer.serialize(
+                        named_tensors,
+                        output_str=True,
+                        cpu_sharing_strategy="file_system",
+                    )
                     for _ in range(self.server_args.tp_size)
                 ],
                 "load_format": load_format,
                 "flush_cache": flush_cache,
+                "draft_only": draft_only,
             },
         )
 

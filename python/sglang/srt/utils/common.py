@@ -2739,20 +2739,41 @@ def permute_weight(x: torch.Tensor) -> torch.Tensor:
 
 
 class MultiprocessingSerializer:
+    _sharing_strategy_lock = threading.RLock()
+
     @staticmethod
-    def serialize(obj, output_str: bool = False):
+    def serialize(
+        obj,
+        output_str: bool = False,
+        *,
+        cpu_sharing_strategy: Optional[str] = None,
+    ):
         """
         Serialize a Python object using ForkingPickler.
 
         Args:
             obj: The object to serialize.
             output_str (bool): If True, return a base64-encoded string instead of raw bytes.
+            cpu_sharing_strategy: Optional torch multiprocessing strategy for
+                CPU tensors. Use ``"file_system"`` when the consumer is an
+                independently launched process that does not inherit the
+                producer's multiprocessing authkey.
 
         Returns:
             bytes or str: The serialized object.
         """
-        buf = io.BytesIO()
-        ForkingPickler(buf).dump(obj)
+        with MultiprocessingSerializer._sharing_strategy_lock:
+            previous_strategy = None
+            if cpu_sharing_strategy is not None:
+                previous_strategy = torch.multiprocessing.get_sharing_strategy()
+                torch.multiprocessing.set_sharing_strategy(cpu_sharing_strategy)
+            try:
+                buf = io.BytesIO()
+                ForkingPickler(buf).dump(obj)
+            finally:
+                if previous_strategy is not None:
+                    torch.multiprocessing.set_sharing_strategy(previous_strategy)
+
         buf.seek(0)
         output = buf.read()
 
