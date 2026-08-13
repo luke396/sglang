@@ -1001,6 +1001,9 @@ class Envs:
     SGLANG_HIDDEN_CAPTURE_VERIFY_STAGING_SLOTS = EnvInt(32)
     # Export job queue capacity; full queue => capture-miss (never backpressure).
     SGLANG_HIDDEN_CAPTURE_EXPORT_QUEUE_SIZE = EnvInt(256)
+    # Graceful scheduler shutdown budget for draining D2H/finalize/export and
+    # joining capture workers before registered Mooncake buffers are released.
+    SGLANG_HIDDEN_CAPTURE_SHUTDOWN_TIMEOUT_S = EnvFloat(30.0)
     # Upper bound on the host sidecar allocation (which scales with
     # max_total_num_tokens x row bytes); exceeding it disables capture at
     # startup rather than silently committing tens of GB per scheduler.
@@ -1009,18 +1012,33 @@ class Envs:
     # or "mooncake" (self-describing keys in a Mooncake store; requires
     # MOONCAKE_MASTER, uses the MOONCAKE_* connection settings above).
     SGLANG_HIDDEN_CAPTURE_SINK = EnvStr("file")
-    # Mooncake sink: namespace prefix of every exported key
-    # ({store_id}/{sample_id}/g0/{name}) and the trainer's discovery scope.
+    # Mooncake sink: namespace prefix for segment/sample objects and the
+    # trainer's discovery scope.
     # The sink also appends a per-sample manifest entry
     # ({store_id}/_seq/{dp_rank}/{n} = sample_id, hard-pinned) that consumers
     # tail to discover samples; a controller should assign a unique store id
     # per server instance so streams never collide across fleets.
     SGLANG_HIDDEN_CAPTURE_STORE_ID = EnvStr("sglang_hidden_capture")
-    # Mooncake sink: sizes the one pre-registered staging buffer
-    # (max_export_tokens x row bytes; RDMA put_from requires a registered
-    # source and registration cannot run per-sample). Longer samples are
-    # whole-sample capture misses.
+    # Mooncake sink: maximum rows in one sample. In prefix mode this sizes the
+    # registered input-id arena; segment hidden arenas are bounded separately
+    # by PREFIX_MAX_SEGMENT_ROWS. Registration never runs per sample. Longer
+    # samples are whole-sample capture misses.
     SGLANG_HIDDEN_CAPTURE_MAX_EXPORT_TOKENS = EnvInt(16384)
+    # Mooncake prefix V1. It is the default Mooncake capture format; the flag
+    # remains available for controlled whole-sample A/B runs. The performance
+    # defaults are provisional and will be tuned from real-workload profiles.
+    # Segments are immutable and whole-object referenced, with at most
+    # MAX_SEGMENT_ROWS rows each.
+    SGLANG_HIDDEN_CAPTURE_PREFIX_ENABLED = EnvBool(True)
+    SGLANG_HIDDEN_CAPTURE_PREFIX_MAX_SEGMENT_ROWS = EnvInt(256)
+    # Two bounded registered lanes overlap sidecar gather with one synchronous
+    # Mooncake writer. Keep configurable for the post-implementation A/B.
+    SGLANG_HIDDEN_CAPTURE_PREFIX_LANES = EnvInt(2)
+    # Characterization ablations. Production defaults retain the V6 direct
+    # gather and synchronous batch-put paths; false selects the correctness-
+    # equivalent legacy copy / per-object put_from path for paired evidence.
+    SGLANG_HIDDEN_CAPTURE_DIRECT_GATHER = EnvBool(True)
+    SGLANG_HIDDEN_CAPTURE_BATCH_PUT = EnvBool(True)
     # Verify (decode) row capture: device twin-pool geometry overrides. By
     # default both adapt at startup: slot size = the actual verify window
     # (max_running_requests x speculative_num_draft_tokens, rounded up to
@@ -1030,6 +1048,10 @@ class Envs:
     # than a slot is a capture miss for every request in the batch.
     SGLANG_HIDDEN_CAPTURE_VERIFY_RING_SLOTS = EnvInt(2)
     SGLANG_HIDDEN_CAPTURE_VERIFY_RING_TOKENS = EnvInt(2048)
+    # Pack only accepted verify rows into the capture-owned twin, then use a
+    # pinned header + background launch to D2H the actual row count. This is
+    # the provisional V6 default; set false for full-window H200 A/B/fallback.
+    SGLANG_HIDDEN_CAPTURE_VERIFY_COMPACT_D2H = EnvBool(True)
 
     # VLM
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)

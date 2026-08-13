@@ -9,8 +9,8 @@ reads — and validates the artifact against independent references:
   consumer knows nothing but the store prefix, tails ``_seq/{w}/{n}`` for
   writer streams and sequence numbers, and finds every exported sample_id
   with no rid or response channel involved;
-- meta is self-describing (shape/dtype/rid/num_tokens) and sufficient to
-  allocate every receive buffer without any response channel;
+- sample views plus immutable-segment metadata are self-describing and
+  sufficient to allocate every receive buffer without any response channel;
 - ``input_ids`` readback == prompt + generated tokens (final sampled token
   excluded, which has no hidden row);
 - decode-region ``last_hidden`` rows satisfy the exact norm contract: row t
@@ -36,19 +36,31 @@ import time
 
 import requests
 import torch
+from hidden_capture_v6_reader import read_v6_sample
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 TARGET_MODEL = "Qwen/Qwen3-8B"
 DRAFT_MODEL = "deepseek-ai/dspark_qwen3_8b_block7"
 MASTER_PORT = 50054
 STORE_ID = "consumer_check"
-MASTER_BIN = "/usr/local/lib/python3.12/dist-packages/mooncake/mooncake_master"
+
+
+def _default_mooncake_master():
+    try:
+        import mooncake
+
+        return os.path.join(os.path.dirname(mooncake.__file__), "mooncake_master")
+    except Exception:
+        return "mooncake_master"
+
+
+MASTER_BIN = os.environ.get("MOONCAKE_MASTER_BIN") or _default_mooncake_master()
 
 PROMPT = "The three primary colors are red, blue, and"
 MAX_NEW_TOKENS = 12
@@ -75,20 +87,6 @@ def _server_args():
         "disabled",
         "--enable-hidden-state-capture",
     ]
-
-
-def _consume_tensor(store, key: str, spec: dict) -> torch.Tensor:
-    """The trainer's actual read primitive: registered zero-copy get_into."""
-    out = torch.empty(
-        [int(x) for x in spec["shape"]],
-        dtype=getattr(torch, spec["dtype"].split(".")[-1]),
-    )
-    nb = out.numel() * out.element_size()
-    store.register_buffer(out.data_ptr(), nb)
-    n = store.get_into(key, out.data_ptr(), nb)
-    store.unregister_buffer(out.data_ptr())
-    assert n == nb, (key, n, nb)
-    return out
 
 
 def _tail_manifest(store, until_id: str, deadline_s: float = 30.0) -> list[str]:
@@ -139,6 +137,8 @@ def main():
             MASTER_BIN if os.path.exists(MASTER_BIN) else "mooncake_master",
             "--port",
             str(MASTER_PORT),
+            "--metrics_port",
+            "9009",
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -149,21 +149,23 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(TARGET_MODEL)
     input_ids = tokenizer(PROMPT).input_ids
 
-    server = popen_launch_server(
-        TARGET_MODEL,
-        DEFAULT_URL_FOR_TEST,
-        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=_server_args(),
-        env={
-            **os.environ,
-            "SGLANG_RAGGED_VERIFY_MODE": "compact",
-            "SGLANG_HIDDEN_CAPTURE_SINK": "mooncake",
-            "SGLANG_HIDDEN_CAPTURE_STORE_ID": STORE_ID,
-            "MOONCAKE_MASTER": f"127.0.0.1:{MASTER_PORT}",
-            "MOONCAKE_PROTOCOL": "tcp",
-        },
-    )
+    server = None
+    store = None
     try:
+        server = popen_launch_server(
+            TARGET_MODEL,
+            DEFAULT_URL_FOR_TEST,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=_server_args(),
+            env={
+                **os.environ,
+                "SGLANG_RAGGED_VERIFY_MODE": "compact",
+                "SGLANG_HIDDEN_CAPTURE_SINK": "mooncake",
+                "SGLANG_HIDDEN_CAPTURE_STORE_ID": STORE_ID,
+                "MOONCAKE_MASTER": f"127.0.0.1:{MASTER_PORT}",
+                "MOONCAKE_PROTOCOL": "tcp",
+            },
+        )
         resp = requests.post(
             DEFAULT_URL_FOR_TEST + "/generate",
             json={
@@ -202,41 +204,33 @@ def main():
         assert rid in discovered, f"manifest tail never discovered {rid}: {discovered}"
         sample_id = rid
 
-        meta_key = f"{STORE_ID}/{sample_id}/g0/meta"
+        meta_key = f"{STORE_ID}/_samples/{sample_id}/meta"
         assert (
             int(store.is_exist(meta_key)) == 1
         ), "manifest entry visible before its meta: ordering contract broken"
-        meta = json.loads(bytes(store.get(meta_key)))
+        sample = read_v6_sample(store, store_id=STORE_ID, sample_id=sample_id)
+        meta = sample["meta"]
         assert meta["rid"] == rid
-        assert meta["loss_mask"] == "all_ones_placeholder"
 
         # Coverage: prompt + all generated tokens except the final one.
         expected_rows = len(input_ids) + MAX_NEW_TOKENS - 1
-        assert meta["num_tokens"] == expected_rows, (meta["num_tokens"], expected_rows)
+        assert meta["num_rows"] == expected_rows, (meta["num_rows"], expected_rows)
 
-        ids = _consume_tensor(
-            store, f"{STORE_ID}/{sample_id}/g0/input_ids", meta["tensors"]["input_ids"]
-        )
+        ids = sample["input_ids"]
         assert (
             ids.tolist() == (input_ids + completion_ids)[:expected_rows]
         ), "consumed input_ids != prompt + generated tokens"
 
-        aux = _consume_tensor(
-            store, f"{STORE_ID}/{sample_id}/g0/aux", meta["tensors"]["aux"]
-        )
-        last = _consume_tensor(
-            store,
-            f"{STORE_ID}/{sample_id}/g0/last_hidden",
-            meta["tensors"]["last_hidden"],
-        )
+        aux = sample["aux"]
+        last = sample["last_hidden"]
         assert not torch.isnan(aux.float()).any()
-        assert aux.shape[1] == expected_rows and last.shape[1] == expected_rows
+        assert aux.shape[0] == expected_rows and last.shape[0] == expected_rows
 
         # Exact norm contract on consumed decode rows: row t -> greedy t+1.
         lm_head = _load_lm_head()
         prompt_len = len(input_ids)
         for t in range(len(completion_ids) - 1):
-            row = last[0, prompt_len + t].float()
+            row = last[prompt_len + t].float()
             pred = int((row @ lm_head.T).argmax())
             assert pred == completion_ids[t + 1], (
                 f"norm contract violated at consumed decode row {t}: "
@@ -246,15 +240,24 @@ def main():
         fp = json.loads(bytes(store.get(f"{STORE_ID}/_fingerprint")))
         assert fp["coverage"] == "prefill_and_verify_commit"
         assert fp["norm_contract"] == "post_final_norm_pre_lm_head"
-        store.close()
         print(
-            f"Mooncake consumer check ALL OK: {expected_rows} rows consumed via "
-            f"registered get_into; input_ids exact; norm contract exact on "
+            f"Mooncake V6 consumer check ALL OK: {expected_rows} rows rebuilt via "
+            f"registered batch_get_into; input_ids exact; norm contract exact on "
             f"{len(completion_ids) - 1} decode rows"
         )
     finally:
-        kill_process_tree(server.pid)
+        if server is not None:
+            terminate_and_kill_process_tree(
+                server, terminate_timeout=60, wait_timeout=60
+            )
+        if store is not None:
+            store.close()
         master.terminate()
+        try:
+            master.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            master.kill()
+            master.wait(timeout=30)
 
 
 if __name__ == "__main__":

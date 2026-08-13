@@ -116,8 +116,12 @@ class HiddenExportWorker:
         self.sink = sink
         self._queue: queue.Queue[HiddenExportJob] = queue.Queue(maxsize=queue_size)
         self._barrier_timeout_s = barrier_timeout_s
-        self._running = True
+        self._admission_lock = threading.Lock()
+        self._accepting = True
+        self._stop_requested = threading.Event()
+        self._drain_on_stop = True
         self._thread: Optional[threading.Thread] = None
+        self._active = 0
         self._last_sweep_s = time.monotonic()
 
     def start(self) -> None:
@@ -126,26 +130,53 @@ class HiddenExportWorker:
         )
         self._thread.start()
 
-    def stop(self) -> None:
-        self._running = False
+    def stop_admission(self) -> None:
+        with self._admission_lock:
+            self._accepting = False
+
+    def stop(self, *, drain: bool = True) -> None:
+        self.stop_admission()
+        self._drain_on_stop = drain
+        self._stop_requested.set()
+
+    def join(self, timeout_s: Optional[float] = None) -> bool:
+        if self._thread is None:
+            return True
+        self._thread.join(timeout=timeout_s)
+        return not self._thread.is_alive()
+
+    @property
+    def pending_count(self) -> int:
+        return self._queue.qsize()
 
     def submit(self, job: HiddenExportJob) -> bool:
-        try:
-            self._queue.put_nowait(job)
+        with self._admission_lock:
+            if not self._accepting:
+                self.stats.bump("shutdown_admission_miss_ct")
+                self.bookkeeper.pop(job.rid)
+                return False
+            try:
+                self._queue.put_nowait(job)
+            except queue.Full:
+                self.stats.bump("export_queue_full_miss_ct")
+                self.bookkeeper.pop(job.rid)
+                return False
+            self.stats.observe_max("export_queue_high_water_ct", self._queue.qsize())
             return True
-        except queue.Full:
-            self.stats.bump("export_queue_full_miss_ct")
-            self.bookkeeper.pop(job.rid)
-            return False
 
     def _run(self) -> None:
-        while self._running:
+        while True:
+            if self._stop_requested.is_set() and (
+                not self._drain_on_stop or self._queue.empty()
+            ):
+                break
             try:
                 job = self._queue.get(timeout=0.1)
             except queue.Empty:
                 self._maybe_sweep_orphans()
                 continue
             try:
+                self._active = 1
                 self.export_one(job)
             except Exception:
                 # Sink write failed (e.g. mooncake store out of space) after
@@ -154,6 +185,9 @@ class HiddenExportWorker:
                 # without diffing export_ok_ct against completed requests.
                 self.stats.bump("sink_put_failed_miss_ct")
                 logger.exception("hidden capture export failed for rid %s", job.rid)
+            finally:
+                self._active = 0
+                self._queue.task_done()
             self._maybe_sweep_orphans()
 
     def _maybe_sweep_orphans(self) -> None:
@@ -173,7 +207,12 @@ class HiddenExportWorker:
         return True
 
     def export_one(self, job: HiddenExportJob) -> None:
-        if not self._wait_barrier(job.ring_seq_barrier):
+        barrier_started_ns = time.monotonic_ns()
+        barrier_ready = self._wait_barrier(job.ring_seq_barrier)
+        self.stats.bump(
+            "export_barrier_wait_ns_ct", time.monotonic_ns() - barrier_started_ns
+        )
+        if not barrier_ready:
             self.stats.bump("export_timeout_miss_ct")
             self.bookkeeper.pop(job.rid)
             return
@@ -184,11 +223,43 @@ class HiddenExportWorker:
             # Staging already dropped rows for this request; whole-sample miss.
             return
 
-        rows = self.sidecar.read_rows_validated(
-            slots=job.slots,
-            expected_tokens=job.tokens,
-            own_slot_gens=own_slot_gens,
-        )
+        if getattr(self.sink, "prefix_enabled", False):
+            try:
+                sink_started_ns = time.monotonic_ns()
+                try:
+                    exported = self.sink.put_prefix_sample(
+                        sample_id=job.sample_id,
+                        rid=job.rid,
+                        tokens=job.tokens,
+                        slots=job.slots,
+                        prompt_len=job.prompt_len,
+                        own_slot_gens=own_slot_gens,
+                        sidecar=self.sidecar,
+                    )
+                finally:
+                    self.stats.bump(
+                        "sink_put_busy_ns_ct",
+                        time.monotonic_ns() - sink_started_ns,
+                    )
+            except SampleTooLargeError:
+                self.stats.bump("sample_too_large_miss_ct")
+                return
+            if exported is None:
+                return
+            self._record_export_result(job, exported)
+            return
+
+        gather_started_ns = time.monotonic_ns()
+        try:
+            rows = self.sidecar.read_rows_validated(
+                slots=job.slots,
+                expected_tokens=job.tokens,
+                own_slot_gens=own_slot_gens,
+            )
+        finally:
+            self.stats.bump(
+                "export_gather_busy_ns_ct", time.monotonic_ns() - gather_started_ns
+            )
         if rows is None:
             self.stats.bump("prefix_invalid_miss_ct")
             logger.debug("hidden capture: identity validation failed, rid=%s", job.rid)
@@ -208,10 +279,19 @@ class HiddenExportWorker:
             "prompt_len": job.prompt_len,
         }
         try:
-            exported = self.sink.put(job.sample_id, record)
+            sink_started_ns = time.monotonic_ns()
+            try:
+                exported = self.sink.put(job.sample_id, record)
+            finally:
+                self.stats.bump(
+                    "sink_put_busy_ns_ct", time.monotonic_ns() - sink_started_ns
+                )
         except SampleTooLargeError:
             self.stats.bump("sample_too_large_miss_ct")
             return
+        self._record_export_result(job, exported)
+
+    def _record_export_result(self, job: HiddenExportJob, exported: bool) -> None:
         if exported:
             self.stats.bump("export_ok_ct")
         else:
