@@ -12,11 +12,14 @@ from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_time_usage,
 )
 from sglang.srt.runtime_context import get_exec, get_schedule
+from sglang.srt.utils.common import MultiprocessingSerializer
+from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import (
         UpdateWeightFromDiskReqInput,
         UpdateWeightsFromIPCReqInput,
+        UpdateWeightsFromTensorReqInput,
     )
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -291,7 +294,10 @@ class BaseSpecWorker(ABC):
             self.draft_worker.init_cuda_graphs()
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
-        for runner in self.draft_worker.draft_runners:
+        draft_runners = self._draft_model_runners()
+        if not draft_runners:
+            return False, "No speculative draft model runner is available."
+        for runner in draft_runners:
             success, message = runner.weight_updater.update_weights_from_disk(
                 recv_req.model_path,
                 recv_req.load_format,
@@ -299,6 +305,28 @@ class BaseSpecWorker(ABC):
             )
             if not success:
                 return success, message
+        return True, "Succeeded to update model weights."
+
+    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
+        if not recv_req.draft_only:
+            return self.target_worker.update_weights_from_tensor(recv_req)
+
+        draft_runners = self._draft_model_runners()
+        if not draft_runners:
+            return False, "No speculative draft model runner is available."
+
+        monkey_patch_torch_reductions()
+        named_tensors = MultiprocessingSerializer.deserialize(
+            recv_req.serialized_named_tensors[self.ps.tp_rank]
+        )
+        for runner in draft_runners:
+            success, message = runner.weight_updater.update_weights_from_tensor(
+                named_tensors=named_tensors,
+                load_format=recv_req.load_format,
+            )
+            if not success:
+                return success, message
+
         return True, "Succeeded to update model weights."
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):

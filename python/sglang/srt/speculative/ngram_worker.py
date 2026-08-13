@@ -154,6 +154,11 @@ class NGRAMWorker(BaseSpecWorker):
         # mixin dispatches via `self.draft_worker or self.tp_worker`, so
         # without this method any caller of `update_weights_from_tensor`
         # under `--speculative-algorithm NGRAM` raises AttributeError.
+        if recv_req.draft_only:
+            return (
+                False,
+                "draft_only weight update requires a model-backed speculative draft.",
+            )
         return self.target_worker.update_weights_from_tensor(recv_req)
 
     def add_external_corpus(self, corpus_id: str, token_chunks: list[list[int]]) -> int:

@@ -1520,6 +1520,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if not success:
             return success, message
 
+        if recv_req.draft_only:
+            return True, "Succeeded to update model weights."
+
         success, message = (
             self.target_worker.model_runner.weight_updater.update_weights_from_tensor(
                 named_tensors=named_tensors,

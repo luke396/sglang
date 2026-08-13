@@ -1674,6 +1674,9 @@ class UpdateWeightFromDiskReqInput(BaseReq, kw_only=True):
     token_step: int = 0
     # Whether to flush the cache after updating weights
     flush_cache: bool = True
+    # Whether to update only the speculative draft model. In this mode the
+    # target model, its model path, and its KV/radix cache are left untouched.
+    draft_only: bool = False
     # Tensor metadata from the JSON request body, so it is already msgpack-native.
     manifest: Optional[Dict[str, Any]] = None
 
@@ -1727,6 +1730,9 @@ class UpdateWeightsFromTensorReqInput(BaseReq, kw_only=True):
     weight_version: Optional[str] = None
     # Optional: Determine whether to disable updating the draft model
     disable_draft_model: Optional[bool] = None
+    # Whether to update only the speculative draft model. Mutually exclusive
+    # with disable_draft_model.
+    draft_only: bool = False
     # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
 

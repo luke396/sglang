@@ -110,12 +110,25 @@ class SchedulerWeightUpdaterManager:
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
         with self._observe_weight_load("disk"):
-            success, message = self.tp_worker.update_weights_from_disk(recv_req)
-            tp_success = success
-            if success and self.draft_worker is not None:
-                success, message = self.draft_worker.update_weights_from_disk(recv_req)
-            if tp_success:
-                self.flush_cache_after_weight_update(recv_req)
+            if recv_req.draft_only:
+                if self.draft_worker is None:
+                    success = False
+                    message = (
+                        "draft_only weight update requires a speculative draft model."
+                    )
+                else:
+                    success, message = self.draft_worker.update_weights_from_disk(
+                        recv_req
+                    )
+            else:
+                success, message = self.tp_worker.update_weights_from_disk(recv_req)
+                tp_success = success
+                if success and self.draft_worker is not None:
+                    success, message = self.draft_worker.update_weights_from_disk(
+                        recv_req
+                    )
+                if tp_success:
+                    self.flush_cache_after_weight_update(recv_req)
             if not success:
                 logger.error(message)
             return UpdateWeightFromDiskReqOutput(
@@ -153,14 +166,24 @@ class SchedulerWeightUpdaterManager:
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors."""
         with self._observe_weight_load("tensor"):
-            if recv_req.disable_draft_model:
+            if recv_req.draft_only and recv_req.disable_draft_model:
+                success = False
+                message = "draft_only and disable_draft_model are mutually exclusive."
+                worker = None
+            elif recv_req.draft_only and self.draft_worker is None:
+                success = False
+                message = "draft_only weight update requires a speculative draft model."
+                worker = None
+            elif recv_req.disable_draft_model:
                 worker = self.tp_worker
             else:
                 worker = self.draft_worker or self.tp_worker
-            success, message = worker.update_weights_from_tensor(recv_req)
-            if success:
+
+            if worker is not None:
+                success, message = worker.update_weights_from_tensor(recv_req)
+            if success and not recv_req.draft_only:
                 self.flush_cache_after_weight_update(recv_req)
-            else:
+            elif not success:
                 logger.error(message)
             torch.distributed.barrier(group=self.tp_cpu_group)
             return UpdateWeightsFromTensorReqOutput(success=success, message=message)
