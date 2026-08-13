@@ -40,8 +40,9 @@ Measurement hygiene:
   ``pre_measure_keys_removed`` is a STORE-KEY count (meta + tensor keys, and
   may include tensor-key residue from the previous cell whose meta counting
   left them behind), NOT a number of warmup samples;
-- export coverage is observed at a FIXED 20-second post-run drain horizon
-  (this client build has no non-destructive count, so no stability polling);
+- export coverage is drained to quiescence: destructive meta counts are
+  cumulative, so we poll every 10s until a window removes nothing (max
+  300s) — a fixed horizon undercounted high-throughput cells;
 - GPU memory is sampled DURING the run by a background thread (1 Hz,
   nvidia-smi, restricted to CUDA_VISIBLE_DEVICES when set); reported as
   max-over-time of per-GPU max and of the sum;
@@ -95,7 +96,8 @@ BASE_SERVER_PORT = 21500
 STORE_ID = "matrix_capture"
 MASTER_BIN = "/usr/local/lib/python3.12/dist-packages/mooncake/mooncake_master"
 SEED = 42
-DRAIN_HORIZON_S = 20.0
+DRAIN_POLL_S = 10.0
+DRAIN_MAX_S = 300.0
 
 # Set per-shard in main(); defaults for shard 0.
 MASTER_PORT = BASE_MASTER_PORT
@@ -209,15 +211,27 @@ def _count_meta(store):
 
 
 def _drained_export_count(store):
-    """Meta-key count at a FIXED 20-second post-run drain horizon.
+    """Meta-key count drained to quiescence.
 
-    This client build has no non-destructive count/scan, so there is no
-    stability polling — just a fixed wait, then one destructive count
-    (remove_by_regex returns the number of keys removed, which for the meta
-    pattern equals exported samples; it leaves tensor keys behind for the
-    next cell's pre-measure clear to sweep)."""
-    time.sleep(DRAIN_HORIZON_S)
-    return _count_meta(store)
+    This client build has no non-destructive count/scan, so the count is
+    destructive (remove_by_regex returns the number removed) — but removal
+    is cumulative, so polling until a window removes nothing gives the
+    settled total. A FIXED horizon undercounted at high throughput: a
+    warm_high run exports ~70GB and the tail lands well after 20s (observed
+    209 drained vs 240 exported per the server's own export_ok counter).
+    """
+    total = 0
+    quiet = 0
+    deadline = time.monotonic() + DRAIN_MAX_S
+    while time.monotonic() < deadline and quiet < 2:
+        time.sleep(DRAIN_POLL_S)
+        n = _count_meta(store)
+        if n <= 0:
+            quiet += 1
+        else:
+            quiet = 0
+            total += n
+    return total
 
 
 def _parse_capture_counters(log_path):
@@ -342,7 +356,7 @@ def run_cell(cell, repeat_idx):
             # of warmup samples.
             row["pre_measure_keys_removed"] = warmup_exports
             row["exported_samples_at_drain"] = exported
-            row["drain_horizon_s"] = DRAIN_HORIZON_S
+            row["drain_max_s"] = DRAIN_MAX_S
             row["export_coverage_frac"] = (
                 exported / max(1, res["completed"]) if exported >= 0 else None
             )
@@ -449,6 +463,11 @@ def main():
             MASTER_BIN if os.path.exists(MASTER_BIN) else "mooncake_master",
             "--port",
             str(MASTER_PORT),
+            # The master also binds a metrics HTTP server on a FIXED default
+            # port (9003); without this, parallel shards' masters collide
+            # there and every loser dies -> store setup -1 on that shard.
+            "--metrics_port",
+            str(9100 + opts.shard),
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
