@@ -694,6 +694,15 @@ class HiddenStatesCapturer:
         n = device_slots.shape[0]
         if self.snapshot_stream is None or not device_slots.is_cuda:
             return device_slots.cpu().clone().to(torch.long)
+        # Order after the producer: req_to_token rows are written on the
+        # scheduler's stream; without this fence the snapshot stream's copy
+        # has no ordering against those writes (reproduced as a deterministic
+        # stale read in the unit test). The wait is an event dependency on
+        # the producer stream, not a synchronize, so the p99 fix's property
+        # (never queue behind the copy engine's big transfers) holds.
+        self.snapshot_stream.wait_stream(
+            torch.cuda.current_stream(device_slots.device)
+        )
         with torch.cuda.stream(self.snapshot_stream):
             self._snapshot_buf[:n].copy_(device_slots, non_blocking=True)
             device_slots.record_stream(self.snapshot_stream)
