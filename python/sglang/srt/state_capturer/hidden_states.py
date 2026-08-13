@@ -46,6 +46,7 @@ from sglang.srt.state_capturer.hidden_host import (
     HiddenFinalizeWorker,
     HiddenHostSidecar,
     HiddenStagingRing,
+    _StagingSeqCounter,
 )
 from sglang.srt.state_capturer.hidden_sink import (
     HiddenExportJob,
@@ -79,6 +80,15 @@ _VERIFY_TWIN_BUDGET_TOKENS = 4096
 # matches the old fixed 4x8192 default (~1.6GB pinned at Qwen3-8B widths).
 _STAGING_RING_BUDGET_TOKENS = 32768
 
+# Pinned-host token-slot budget for the verify staging ring (slot size = the
+# verify window). Verify shares no slots with prefill: a prefill slot's
+# finalize memcpy is hundreds of MB (tens of ms), and while it drains, decode
+# steps keep producing verify windows — in a shared ring a transient full
+# state dropped an ENTIRE verify batch (measured: 2 stage_full events lost
+# 75/300 samples at saturation). 16384 tokens = 32 slots at a 512-token
+# window (~0.8GB pinned), depth enough to absorb any prefill-finalize stall.
+_VERIFY_STAGING_BUDGET_TOKENS = 16384
+
 
 def _resolve_verify_window_tokens(
     *, server_args: ServerArgs, max_running_requests: int
@@ -92,25 +102,23 @@ def _resolve_verify_window_tokens(
     return (window + 255) // 256 * 256
 
 
-def _resolve_staging_slot_tokens(
-    *, server_args: ServerArgs, verify_window_tokens: int
-) -> int:
-    """Upper bound on one forward's staged rows, rounded up to 256.
+def _resolve_staging_slot_tokens(*, server_args: ServerArgs) -> int:
+    """Upper bound on one prefill forward's staged rows, rounded up to 256.
 
-    Prefill: the PrefillAdder caps a batch's extend rows at
-    chunked_prefill_size (rem_chunk_tokens is a batch-level budget); with
-    chunking disabled (-1) the bound becomes max_prefill_tokens. A slot sized
-    to that bound never needs the multi-segment path in the common case (the
-    split remains as a safety net; real bound can exceed max_prefill_tokens
-    for models with a longer context, per its help text).
-    Verify windows share this ring, so the slot must fit them too.
+    The PrefillAdder caps a batch's extend rows at chunked_prefill_size
+    (rem_chunk_tokens is a batch-level budget); with chunking disabled (-1)
+    the bound becomes max_prefill_tokens. A slot sized to that bound never
+    needs the multi-segment path in the common case (the split remains as a
+    safety net; real bound can exceed max_prefill_tokens for models with a
+    longer context, per its help text). Verify windows stage through their
+    own ring and don't constrain this size.
     """
     chunk = server_args.chunked_prefill_size
     if chunk is None or chunk <= 0:
         prefill_bound = server_args.max_prefill_tokens
     else:
         prefill_bound = chunk
-    bound = max(prefill_bound, verify_window_tokens, 256)
+    bound = max(prefill_bound, 256)
     return (bound + 255) // 256 * 256
 
 
@@ -259,9 +267,7 @@ class HiddenStatesCapturer:
             num_aux_layers=len(aux_layer_ids),
             num_tokens=num_tokens,
             verify_window_tokens=verify_window_tokens,
-            staging_slot_tokens=_resolve_staging_slot_tokens(
-                server_args=server_args, verify_window_tokens=verify_window_tokens
-            ),
+            staging_slot_tokens=_resolve_staging_slot_tokens(server_args=server_args),
             sink_kind=sink_kind,
             sink_dir=sink_dir,
             dp_rank=dp_rank if dp_rank is not None else 0,
@@ -330,12 +336,17 @@ class HiddenStatesCapturer:
             if envs.SGLANG_HIDDEN_CAPTURE_STAGING_SLOTS.is_set()
             else max(2, _STAGING_RING_BUDGET_TOKENS // max(1, ring_slot_tokens))
         )
+        # Prefill and verify rings share one enqueue-sequence counter (and
+        # one capture stream), so the export barrier stays a single number
+        # and the finalize thread can merge the rings in enqueue order.
+        self.staging_seq = _StagingSeqCounter()
         self.ring = HiddenStagingRing(
             num_slots=ring_slots,
             slot_tokens=ring_slot_tokens,
             aux_width=self.aux_width,
             last_width=self.last_width,
             dtype=self.dtype,
+            seq_counter=self.staging_seq,
         )
         self.sidecar = HiddenHostSidecar(
             num_slots=num_tokens,
@@ -374,8 +385,28 @@ class HiddenStatesCapturer:
             if torch.cuda.is_available()
             else None
         )
+        # Verify windows stage through their own ring, sized to the window.
+        # Sharing the prefill ring gave verify an effective depth of 4 slots
+        # each 95% empty (a 384-row window burned an 8192-token slot), and a
+        # prefill finalize (hundreds-of-MB memcpy) stalls draining long
+        # enough for decode steps to fill that: at saturation 2 transient
+        # full events dropped 75/300 samples, a whole decode batch per event.
+        verify_staging_slots = (
+            envs.SGLANG_HIDDEN_CAPTURE_VERIFY_STAGING_SLOTS.get()
+            if envs.SGLANG_HIDDEN_CAPTURE_VERIFY_STAGING_SLOTS.is_set()
+            else max(2, _VERIFY_STAGING_BUDGET_TOKENS // max(1, twin_tokens))
+        )
+        self.verify_ring = HiddenStagingRing(
+            num_slots=verify_staging_slots,
+            slot_tokens=twin_tokens,
+            aux_width=self.aux_width,
+            last_width=self.last_width,
+            dtype=self.dtype,
+            seq_counter=self.staging_seq,
+        )
         self.finalize_worker = HiddenFinalizeWorker(
             ring=self.ring,
+            verify_ring=self.verify_ring,
             sidecar=self.sidecar,
             bookkeeper=self.bookkeeper,
             stats=self.stats,
@@ -548,7 +579,7 @@ class HiddenStatesCapturer:
         # ms and starves fast decode steps).
         twin = self.twin_pool.try_acquire()
         if twin is None:
-            self.ring.reap_ready_twins(self.twin_pool)
+            self.verify_ring.reap_ready_twins(self.twin_pool)
             twin = self.twin_pool.try_acquire()
         if twin is None:
             self.stats.bump("verify_twin_full_miss_ct")
@@ -585,19 +616,22 @@ class HiddenStatesCapturer:
         )
 
     def stage_verify(self, output: HiddenVerifyCaptureOutput) -> None:
-        """D2H a packed verify twin into the pinned ring (copy-stream context)."""
-        slots = self.ring.try_acquire(1)
+        """D2H a packed verify twin into the pinned verify ring (copy-stream
+        context). Verify has its own ring: see the verify_ring construction
+        comment for why sharing the prefill ring dropped whole decode batches
+        at saturation."""
+        slots = self.verify_ring.try_acquire(1)
         if slots is None:
             self.stats.bump("stage_full_miss_ct")
             self.bookkeeper.mark_miss(output.rids)
             self.twin_pool.release(output.twin)
             return
         (slot,) = slots
-        if output.num_reqs * output.stride > self.ring.slot_tokens:
+        if output.num_reqs * output.stride > self.verify_ring.slot_tokens:
             self.stats.bump("verify_oversize_miss_ct")
             self.bookkeeper.mark_miss(output.rids)
             self.twin_pool.release(output.twin)
-            self.ring.release(slot)
+            self.verify_ring.release(slot)
             return
 
         if self.capture_stream is not None:
@@ -606,7 +640,7 @@ class HiddenStatesCapturer:
         else:
             stream_ctx = contextlib.nullcontext()
         with stream_ctx:
-            self.ring.enqueue_verify_segment(
+            self.verify_ring.enqueue_verify_segment(
                 slot,
                 twin=output.twin,
                 rids=output.rids,
@@ -696,13 +730,10 @@ class HiddenStatesCapturer:
             return device_slots.cpu().clone().to(torch.long)
         # Order after the producer: req_to_token rows are written on the
         # scheduler's stream; without this fence the snapshot stream's copy
-        # has no ordering against those writes (reproduced as a deterministic
-        # stale read in the unit test). The wait is an event dependency on
-        # the producer stream, not a synchronize, so the p99 fix's property
-        # (never queue behind the copy engine's big transfers) holds.
-        self.snapshot_stream.wait_stream(
-            torch.cuda.current_stream(device_slots.device)
-        )
+        # can read the slots (or overwrite the pinned buf) before/after the
+        # wrong step. Reproduced as a deterministic stale read in the unit
+        # test; the wait is on an event of the producer stream, not a sync.
+        self.snapshot_stream.wait_stream(torch.cuda.current_stream(device_slots.device))
         with torch.cuda.stream(self.snapshot_stream):
             self._snapshot_buf[:n].copy_(device_slots, non_blocking=True)
             device_slots.record_stream(self.snapshot_stream)

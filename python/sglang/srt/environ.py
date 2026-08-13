@@ -994,6 +994,11 @@ class Envs:
     # stage (guaranteed miss).
     SGLANG_HIDDEN_CAPTURE_STAGING_SLOTS = EnvInt(4)
     SGLANG_HIDDEN_CAPTURE_STAGING_SLOT_TOKENS = EnvInt(8192)
+    # Verify staging ring depth override (slot size is always the verify
+    # window). Verify stages through its own pinned ring so a prefill
+    # finalize stall can never drop a whole decode batch; default depth =
+    # 16384-token budget / verify window (min 2).
+    SGLANG_HIDDEN_CAPTURE_VERIFY_STAGING_SLOTS = EnvInt(32)
     # Export job queue capacity; full queue => capture-miss (never backpressure).
     SGLANG_HIDDEN_CAPTURE_EXPORT_QUEUE_SIZE = EnvInt(256)
     # Upper bound on the host sidecar allocation (which scales with

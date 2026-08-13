@@ -108,6 +108,102 @@ class TestStagingRing(CustomTestCase):
         self.assertEqual(seqs, [0, 1, 2])
 
 
+class TestSplitRingFinalizeOrder(CustomTestCase):
+    """Prefill and verify stage through separate rings (a shared ring let a
+    prefill-finalize stall drop whole verify batches: 2 stage_full events =
+    75/300 samples lost at saturation). The export barrier stays a single
+    number only if the finalize thread settles slots in GLOBAL enqueue order
+    across both rings — finalizing seq 2 before seq 1 would let the barrier
+    advance past an unsettled slot and the export read torn sidecar rows."""
+
+    @staticmethod
+    def _make_pair():
+        from sglang.srt.state_capturer.hidden_host import _StagingSeqCounter
+
+        seq = _StagingSeqCounter()
+        prefill_ring = HiddenStagingRing(
+            num_slots=2,
+            slot_tokens=8,
+            aux_width=AUX_WIDTH,
+            last_width=LAST_WIDTH,
+            dtype=DTYPE,
+            pin_memory=False,
+            use_cuda_events=False,
+            seq_counter=seq,
+        )
+        verify_ring = HiddenStagingRing(
+            num_slots=2,
+            slot_tokens=8,
+            aux_width=AUX_WIDTH,
+            last_width=LAST_WIDTH,
+            dtype=DTYPE,
+            pin_memory=False,
+            use_cuda_events=False,
+            seq_counter=seq,
+        )
+        return prefill_ring, verify_ring
+
+    def _enqueue_prefill(self, ring, rid, num_rows=2, seed=0):
+        (slot,) = ring.try_acquire(1)
+        aux, last = _rows(num_rows, seed=seed)
+        ring.enqueue_segment(
+            slot,
+            aux_rows=aux,
+            last_rows=last,
+            cache_locs=torch.arange(num_rows, dtype=torch.int64),
+            tokens=torch.zeros(num_rows, dtype=torch.int64),
+            req_ranges=[(rid, 0, num_rows)],
+        )
+
+    def _enqueue_verify(self, ring, rid, seed=0):
+        from sglang.srt.state_capturer.hidden_host import _DeviceTwin, _NullEvent
+
+        aux, last = _rows(2, seed=seed)
+        twin = _DeviceTwin(
+            index=0,
+            aux=aux,
+            last=last,
+            cache_loc=torch.arange(2, dtype=torch.int64),
+            tokens=torch.arange(2, dtype=torch.int64),
+            commit_lens=torch.tensor([2], dtype=torch.int32),
+            fence_event=_NullEvent(),
+        )
+        (slot,) = ring.try_acquire(1)
+        ring.enqueue_verify_segment(slot, twin=twin, rids=[rid], stride=2, num_reqs=1)
+
+    def test_finalize_merges_rings_in_global_seq_order(self):
+        prefill_ring, verify_ring = self._make_pair()
+        finalize = HiddenFinalizeWorker(
+            ring=prefill_ring,
+            verify_ring=verify_ring,
+            sidecar=_make_sidecar(),
+            bookkeeper=HiddenCaptureBookkeeper(),
+            stats=HiddenCaptureStats(),
+        )
+        # Interleave: prefill(0), verify(1), prefill(2), verify(3).
+        self._enqueue_prefill(prefill_ring, "p0", seed=0)
+        self._enqueue_verify(verify_ring, "v1", seed=1)
+        self._enqueue_prefill(prefill_ring, "p2", seed=2)
+        self._enqueue_verify(verify_ring, "v3", seed=3)
+
+        order = []
+        while (popped := finalize._pop_next_ready()) is not None:
+            slot, source = popped
+            order.append(slot.ring_seq)
+            source.release(slot)
+        self.assertEqual(order, [0, 1, 2, 3])
+
+    def test_verify_ring_unaffected_by_full_prefill_ring(self):
+        """The regression this split exists for: with the prefill ring
+        exhausted (finalize stalled on a big memcpy), verify staging must
+        still find slots instead of dropping the whole decode batch."""
+        prefill_ring, verify_ring = self._make_pair()
+        self._enqueue_prefill(prefill_ring, "p0")
+        self._enqueue_prefill(prefill_ring, "p1")
+        self.assertIsNone(prefill_ring.try_acquire(1))  # prefill exhausted
+        self.assertIsNotNone(verify_ring.try_acquire(1))  # verify unaffected
+
+
 class TestSidecarSeqlock(CustomTestCase):
     def test_write_then_validated_read(self):
         sidecar = _make_sidecar()

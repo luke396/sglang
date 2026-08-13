@@ -208,6 +208,30 @@ class DeviceTwinPool:
             self._free.append(twin)
 
 
+class _StagingSeqCounter:
+    """Monotonic enqueue sequence shared across staging rings.
+
+    Prefill and verify stage through separate rings (capacity isolation), but
+    the export barrier must stay one number and finalize must settle slots in
+    enqueue order. A shared counter gives every slot a global seq; readiness
+    is monotonic in it because all staging D2H rides one capture stream, so
+    the finalize thread can merge the rings by seq without ever blocking on
+    an unready-earlier / ready-later inversion.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._next = 0
+        self.last_enqueued_seq = -1
+
+    def next_seq(self) -> int:
+        with self._lock:
+            seq = self._next
+            self._next += 1
+            self.last_enqueued_seq = seq
+            return seq
+
+
 class HiddenStagingRing:
     """Fixed-slot pinned staging for async D2H, FIFO-finalized.
 
@@ -227,13 +251,13 @@ class HiddenStagingRing:
         dtype: torch.dtype,
         pin_memory: bool = True,
         use_cuda_events: bool = True,
+        seq_counter: Optional[_StagingSeqCounter] = None,
     ) -> None:
         self.slot_tokens = slot_tokens
         self._lock = threading.Lock()
         self._free: deque[_StagingSlot] = deque()
         self._inflight: deque[_StagingSlot] = deque()
-        self._next_seq = 0
-        self.last_enqueued_seq = -1
+        self._seq = seq_counter if seq_counter is not None else _StagingSeqCounter()
 
         def _pinned(shape: Tuple[int, ...], dt: torch.dtype) -> torch.Tensor:
             return torch.empty(shape, dtype=dt, pin_memory=pin_memory)
@@ -265,6 +289,11 @@ class HiddenStagingRing:
             if len(self._free) < num_slots:
                 return None
             return [self._free.popleft() for _ in range(num_slots)]
+
+    def peek_inflight_seq(self) -> Optional[int]:
+        """Sequence of the oldest in-flight slot (for cross-ring merging)."""
+        with self._lock:
+            return self._inflight[0].ring_seq if self._inflight else None
 
     def enqueue_verify_segment(
         self,
@@ -304,9 +333,7 @@ class HiddenStagingRing:
         slot.num_reqs = num_reqs
         slot.twin = twin
         with self._lock:
-            slot.ring_seq = self._next_seq
-            self._next_seq += 1
-            self.last_enqueued_seq = slot.ring_seq
+            slot.ring_seq = self._seq.next_seq()
             self._inflight.append(slot)
 
     def enqueue_segment(
@@ -345,9 +372,7 @@ class HiddenStagingRing:
         slot.num_rows = num_rows
         slot.req_ranges = req_ranges
         with self._lock:
-            slot.ring_seq = self._next_seq
-            self._next_seq += 1
-            self.last_enqueued_seq = slot.ring_seq
+            slot.ring_seq = self._seq.next_seq()
             self._inflight.append(slot)
 
     def pop_ready(self) -> Optional[_StagingSlot]:
@@ -356,6 +381,10 @@ class HiddenStagingRing:
             if not self._inflight or not self._inflight[0].event.query():
                 return None
             return self._inflight.popleft()
+
+    @property
+    def last_enqueued_seq(self) -> int:
+        return self._seq.last_enqueued_seq
 
     def reap_ready_twins(self, twin_pool: DeviceTwinPool) -> int:
         """Release device twins whose D2H into pinned memory has completed.
@@ -549,11 +578,15 @@ class HiddenCaptureBookkeeper:
 
 
 class HiddenFinalizeWorker:
-    """Daemon thread: drains the staging ring into the sidecar in FIFO order.
+    """Daemon thread: drains the staging rings into the sidecar in enqueue
+    (global sequence) order.
 
     Sole writer of the sidecar arrays. Advances ``last_finalized_seq`` so the
     export thread's ring barrier (``last_finalized_seq >= snapshot``) implies
-    every slot enqueued at or before the snapshot has settled.
+    every slot enqueued at or before the snapshot has settled. Prefill and
+    verify rings share one seq counter and one capture stream, so readiness
+    is monotonic in seq and merging by lowest in-flight seq never blocks on
+    an inversion.
     """
 
     def __init__(
@@ -563,11 +596,13 @@ class HiddenFinalizeWorker:
         sidecar: HiddenHostSidecar,
         bookkeeper: HiddenCaptureBookkeeper,
         stats: HiddenCaptureStats,
+        verify_ring: Optional[HiddenStagingRing] = None,
         twin_pool: Optional[DeviceTwinPool] = None,
         poll_interval_s: float = 0.001,
         stats_log_interval_s: float = _STATS_LOG_INTERVAL_S,
     ) -> None:
         self.ring = ring
+        self.verify_ring = verify_ring
         self.sidecar = sidecar
         self.bookkeeper = bookkeeper
         self.stats = stats
@@ -589,18 +624,40 @@ class HiddenFinalizeWorker:
     def stop(self) -> None:
         self._running = False
 
+    def _pop_next_ready(self) -> Optional[Tuple[_StagingSlot, "HiddenStagingRing"]]:
+        """Ready head of whichever ring holds the globally oldest slot.
+
+        Strict seq order across rings: both record their copy events on the
+        one capture stream, so completion order equals seq order and waiting
+        on the older head never starves a ready younger one.
+        """
+        if self.verify_ring is None:
+            slot = self.ring.pop_ready()
+            return (slot, self.ring) if slot is not None else None
+        prefill_seq = self.ring.peek_inflight_seq()
+        verify_seq = self.verify_ring.peek_inflight_seq()
+        if prefill_seq is None and verify_seq is None:
+            return None
+        if verify_seq is None or (prefill_seq is not None and prefill_seq < verify_seq):
+            source = self.ring
+        else:
+            source = self.verify_ring
+        slot = source.pop_ready()
+        return (slot, source) if slot is not None else None
+
     def _run(self) -> None:
         while self._running:
             self._maybe_log_stats()
             # Recycle twins as soon as their D2H completes, independent of
             # this thread's (much slower) sidecar-memcpy progress; the
             # forward thread also reaps opportunistically on pool miss.
-            if self.twin_pool is not None:
-                self.ring.reap_ready_twins(self.twin_pool)
-            slot = self.ring.pop_ready()
-            if slot is None:
+            if self.twin_pool is not None and self.verify_ring is not None:
+                self.verify_ring.reap_ready_twins(self.twin_pool)
+            popped = self._pop_next_ready()
+            if popped is None:
                 time.sleep(self._poll_interval_s)
                 continue
+            slot, source_ring = popped
             try:
                 self.finalize_slot(slot)
             except Exception:
@@ -618,7 +675,7 @@ class HiddenFinalizeWorker:
                     # Safe: pop_ready() already confirmed the D2H out of the
                     # twin completed.
                     self.twin_pool.release(slot.twin)
-                self.ring.release(slot)
+                source_ring.release(slot)
                 self.last_finalized_seq = seq
 
     def _maybe_log_stats(self) -> None:
