@@ -51,6 +51,7 @@ class EngineBase(ABC):
         named_tensors: List[Tuple[str, torch.Tensor]],
         load_format: Optional[str] = None,
         flush_cache: bool = True,
+        draft_only: bool = False,
     ):
         """Update model weights with in-memory tensor data."""
         pass

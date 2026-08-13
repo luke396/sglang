@@ -1407,6 +1407,7 @@ class Engine(EngineScoreMixin, EngineBase):
         ],
         load_format: Optional[str] = None,
         flush_cache: bool = True,
+        draft_only: bool = False,
     ):
         """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
         to avoid duplicated cache cleaning operation."""
@@ -1417,6 +1418,7 @@ class Engine(EngineScoreMixin, EngineBase):
             serialized_named_tensors=serialized_named_tensors,
             load_format=load_format,
             flush_cache=flush_cache,
+            draft_only=draft_only,
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_tensor(obj, None)

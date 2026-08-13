@@ -1508,13 +1508,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         monkey_patch_torch_reductions()
-        named_tensors = MultiprocessingSerializer.deserialize(
-            recv_req.serialized_named_tensors[self.ps.tp_rank]
-        )
+        try:
+            named_tensors = MultiprocessingSerializer.deserialize(
+                recv_req.serialized_named_tensors[self.ps.tp_rank]
+            )
+        except Exception as e:
+            return False, f"Failed to deserialize model weights: {e}"
         success, message = (
             self.draft_worker.draft_runner.weight_updater.update_weights_from_tensor(
                 named_tensors=named_tensors,
                 load_format=recv_req.load_format,
+                stream_tensors=recv_req.draft_only,
             )
         )
         if not success:

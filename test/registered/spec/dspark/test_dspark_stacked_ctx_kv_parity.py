@@ -69,7 +69,12 @@ def _make_model(rope, num_layers, **kw):
         for _ in range(num_layers)
     ]
     model = types.SimpleNamespace(layers=layers)
-    for name in ("_stacked_ctx_kv_params", "_project_ctx_kv_stacked"):
+    for name in (
+        "_stacked_ctx_kv_params",
+        "_build_stacked_ctx_kv_params",
+        "refresh_derived_weight_caches",
+        "_project_ctx_kv_stacked",
+    ):
         setattr(model, name, types.MethodType(getattr(DSparkDraftMixin, name), model))
     return model
 
@@ -136,6 +141,28 @@ class TestDSparkStackedCtxKvParity(CustomTestCase):
     def test_parity_with_bias(self):
         self._check_parity(dtype=torch.float16, has_bias=True)
 
+    def test_refresh_preserves_captured_storage(self):
+        g = torch.Generator(device=DEVICE).manual_seed(0)
+        model = _make_model(self.rope, 3, g=g)
+        with torch.inference_mode():
+            cached = model._stacked_ctx_kv_params()
+        weight_ptr = cached["weight"].data_ptr()
+        norm_ptr = cached["k_norm_weight"].data_ptr()
+
+        with torch.no_grad():
+            for layer in model.layers:
+                layer.self_attn.qkv_proj.weight.add_(0.5)
+                layer.self_attn.k_norm.weight.add_(0.25)
+
+        model.refresh_derived_weight_caches()
+        expected = model._build_stacked_ctx_kv_params()
+
+        self.assertIs(model._stacked_ctx_kv_params(), cached)
+        self.assertEqual(cached["weight"].data_ptr(), weight_ptr)
+        self.assertEqual(cached["k_norm_weight"].data_ptr(), norm_ptr)
+        torch.testing.assert_close(cached["weight"], expected["weight"])
+        torch.testing.assert_close(cached["k_norm_weight"], expected["k_norm_weight"])
+
     def test_fallback_quantized_layer(self):
         g = torch.Generator(device=DEVICE).manual_seed(0)
         model = _make_model(self.rope, 3, g=g)
@@ -149,6 +176,9 @@ class TestDSparkStackedCtxKvParity(CustomTestCase):
                 types.SimpleNamespace(self_attn=_make_attn(self.rope, eps=1e-6, g=g)),
                 types.SimpleNamespace(self_attn=_make_attn(self.rope, eps=1e-5, g=g)),
             ]
+        )
+        model._build_stacked_ctx_kv_params = types.MethodType(
+            DSparkDraftMixin._build_stacked_ctx_kv_params, model
         )
         model._stacked_ctx_kv_params = types.MethodType(
             DSparkDraftMixin._stacked_ctx_kv_params, model
@@ -166,6 +196,9 @@ class TestDSparkStackedCtxKvParity(CustomTestCase):
                     self_attn=_make_attn(self.rope, has_bias=False, g=g)
                 ),
             ]
+        )
+        model._build_stacked_ctx_kv_params = types.MethodType(
+            DSparkDraftMixin._build_stacked_ctx_kv_params, model
         )
         model._stacked_ctx_kv_params = types.MethodType(
             DSparkDraftMixin._stacked_ctx_kv_params, model

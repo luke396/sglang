@@ -320,6 +320,8 @@ class WeightUpdater:
         self: WeightUpdater,
         named_tensors: List[Tuple[str, Union[torch.Tensor, LocalSerializedTensor]]],
         load_format: Optional[str] = None,
+        *,
+        stream_tensors: bool = False,
     ):
         error = _unsupported_derived_weight_cache_error()
         if error is not None:
@@ -337,19 +339,49 @@ class WeightUpdater:
         device_module = torch.get_device_module(self.device)
         infered_device = device_module.current_device()
 
-        named_tensors = [
-            (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
-            for name, tensor in named_tensors
-        ]
+        # Model-native and direct loaders consume iterables in one pass. Keep
+        # the legacy eager list for custom loaders, which may rely on indexing
+        # or multiple passes, and for all callers that did not opt in.
+        stream_tensors = stream_tensors and load_format in (None, "direct")
+        model = self.get_model()
+        weight_name_filter = (
+            getattr(model, "should_materialize_weight", None)
+            if stream_tensors and load_format is None
+            else None
+        )
+        source_named_tensors = named_tensors
+
+        def materialize_tensors():
+            for name, tensor in source_named_tensors:
+                if weight_name_filter is not None and not weight_name_filter(name):
+                    continue
+                yield (
+                    name,
+                    _unwrap_tensor(
+                        tensor,
+                        tp_rank=self.tp_rank,
+                        device=infered_device,
+                    ),
+                )
+
+        named_tensors = (
+            materialize_tensors() if stream_tensors else list(materialize_tensors())
+        )
         if load_format == "direct":
-            _model_load_weights_direct(self.get_model(), named_tensors)
+            _model_load_weights_direct(model, named_tensors)
         elif load_format in self.custom_weight_loaders:
             custom_loader = dynamic_import(load_format)
-            custom_loader(self.get_model(), named_tensors)
+            custom_loader(model, named_tensors)
         elif load_format is None:
-            self.get_model().load_weights(named_tensors)
+            model.load_weights(named_tensors)
         else:
             raise NotImplementedError(f"Unknown load_format={load_format}")
+
+        if stream_tensors and self.device != "cpu":
+            # Make the response a completion fence for producer-owned IPC
+            # tensors. The producer may release them as soon as HTTP returns.
+            device_module.current_stream().synchronize()
+
         return True, "Success"
 
     def _update_weights_from_flattened_bucket(

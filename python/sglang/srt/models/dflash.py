@@ -436,61 +436,70 @@ class DFlashDraftModel(nn.Module):
             hidden_states=hidden_states,
         )
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
+    @staticmethod
+    def _resolve_weight_param_name(name: str, params_dict: dict) -> Optional[str]:
+        if name in params_dict:
+            return name
+        if name.startswith("model."):
+            stripped_name = name[len("model.") :]
+            if stripped_name in params_dict:
+                return stripped_name
+        else:
+            prefixed_name = f"model.{name}"
+            if prefixed_name in params_dict:
+                return prefixed_name
+        return None
+
+    def _load_dflash_weight(
+        self,
+        name: str,
+        loaded_weight: torch.Tensor,
+        params_dict: dict,
+    ) -> None:
+        for param_name, weight_name, shard_id in (
             # (param_name, weight_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
-        ]
+        ):
+            if f".{weight_name}." not in name:
+                continue
+            mapped_name = name.replace(weight_name, param_name)
+            resolved_name = self._resolve_weight_param_name(mapped_name, params_dict)
+            if resolved_name is None:
+                continue
+            param = params_dict[resolved_name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight, shard_id)
+            return
 
+        resolved_name = self._resolve_weight_param_name(name, params_dict)
+        if resolved_name is None:
+            # Ignore unexpected weights (e.g., HF rotary caches).
+            return
+        param = params_dict[resolved_name]
+        if resolved_name.endswith("fc.weight") and tuple(loaded_weight.shape) != tuple(
+            param.shape
+        ):
+            raise ValueError(
+                "DFLASH fc.weight shape mismatch. This usually means the draft checkpoint's "
+                "number of context features (K) does not match this config. "
+                f"Expected fc.weight.shape={tuple(param.shape)} "
+                f"(num_context_features={self.num_context_features}, hidden_size={int(self.config.hidden_size)}), "
+                f"but got {tuple(loaded_weight.shape)} for weight '{name}'."
+            )
+        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+        weight_loader(param, loaded_weight)
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters())
-
-        def resolve_param_name(name: str) -> Optional[str]:
-            if name in params_dict:
-                return name
-            if name.startswith("model."):
-                stripped_name = name[len("model.") :]
-                if stripped_name in params_dict:
-                    return stripped_name
-            else:
-                prefixed_name = f"model.{name}"
-                if prefixed_name in params_dict:
-                    return prefixed_name
-            return None
-
         for name, loaded_weight in weights:
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if f".{weight_name}." not in name:
-                    continue
-                mapped_name = name.replace(weight_name, param_name)
-                resolved_name = resolve_param_name(mapped_name)
-                if resolved_name is None:
-                    continue
-                param = params_dict[resolved_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                resolved_name = resolve_param_name(name)
-                if resolved_name is None:
-                    # Ignore unexpected weights (e.g., HF rotary caches).
-                    continue
-                param = params_dict[resolved_name]
-                if resolved_name.endswith("fc.weight") and tuple(
-                    loaded_weight.shape
-                ) != tuple(param.shape):
-                    raise ValueError(
-                        "DFLASH fc.weight shape mismatch. This usually means the draft checkpoint's "
-                        "number of context features (K) does not match this config. "
-                        f"Expected fc.weight.shape={tuple(param.shape)} "
-                        f"(num_context_features={self.num_context_features}, hidden_size={int(self.config.hidden_size)}), "
-                        f"but got {tuple(loaded_weight.shape)} for weight '{name}'."
-                    )
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+            self._load_dflash_weight(name, loaded_weight, params_dict)
+            # Drop the consumer reference before requesting the next streamed
+            # tensor, so two temporary device tensors do not overlap.
+            del loaded_weight
 
 
 class DFlashLagunaAttention(DFlashAttention):

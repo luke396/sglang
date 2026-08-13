@@ -71,6 +71,11 @@ def register_sgl_tp_rank(rank: int):
 
 def _reduce_tensor_modified(*args, **kwargs):
     output_fn, output_args = reductions._reduce_tensor_original(*args, **kwargs)
+    if len(output_args) <= _REDUCE_TENSOR_ARG_DEVICE_INDEX:
+        # CPU, meta, and sparse tensor reducers do not carry a CUDA device at
+        # this position. Leave their payloads untouched; only CUDA IPC needs
+        # the ordinal-to-UUID translation below.
+        return output_fn, output_args
     output_args = _modify_tuple(
         output_args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_to_uuid
     )

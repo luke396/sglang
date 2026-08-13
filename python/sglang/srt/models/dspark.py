@@ -402,69 +402,59 @@ class DSparkDraftMixin:
         base_logits = gather_and_crop_vocab(local_logits, self.lm_head)
         return base_logits, None
 
+    @staticmethod
+    def should_materialize_weight(name: str) -> bool:
+        return not any(name.startswith(p) for p in _DSPARK_SKIPPED_WEIGHT_PREFIXES)
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        markov_weights = []
-        confidence_weights = []
-        backbone_weights = []
         params_dict = dict(self.named_parameters())
+        loaded_confidence_names = set()
         for name, loaded_weight in weights:
             if any(name.startswith(p) for p in _DSPARK_SKIPPED_WEIGHT_PREFIXES):
+                del loaded_weight
                 continue
             if name.startswith("confidence_head."):
-                if self.confidence_head is None:
-                    continue
-                confidence_weights.append((name, loaded_weight))
+                if self.confidence_head is not None:
+                    if name not in params_dict:
+                        raise ValueError(
+                            f"DSpark unexpected confidence weight {name!r} not found in "
+                            "model parameters."
+                        )
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+                    loaded_confidence_names.add(name)
             elif name.startswith("markov_head."):
-                markov_weights.append((name, loaded_weight))
+                if name not in params_dict:
+                    raise ValueError(
+                        f"DSpark unexpected markov weight {name!r} not found in model "
+                        f"parameters (known markov params require a {type(self.markov_head).__name__} head)."
+                    )
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
             else:
-                backbone_weights.append((name, loaded_weight))
+                # Reuse one parameter index while consuming the lazy payload.
+                self._load_dflash_weight(name, loaded_weight, params_dict)
+            # Drop the consumer reference before requesting the next streamed
+            # tensor, so two temporary device tensors do not overlap.
+            del loaded_weight
 
-        super().load_weights(backbone_weights)
-
-        for name, loaded_weight in markov_weights:
-            if name not in params_dict:
+        if self.confidence_head is not None:
+            confidence_param_names = {
+                name for name in params_dict if name.startswith("confidence_head.")
+            }
+            missing = confidence_param_names - loaded_confidence_names
+            if missing:
                 raise ValueError(
-                    f"DSpark unexpected markov weight {name!r} not found in model "
-                    f"parameters (known markov params require a {type(self.markov_head).__name__} head)."
+                    f"DSpark confidence head is enabled but the checkpoint is missing "
+                    f"{sorted(missing)}. Provide a checkpoint with trained confidence weights, "
+                    f"or disable the confidence head (enable_confidence_head=False)."
                 )
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
 
-        self._load_confidence_weights(
-            confidence_weights=confidence_weights, params_dict=params_dict
-        )
-
-    def _load_confidence_weights(
-        self,
-        *,
-        confidence_weights: list,
-        params_dict: dict,
-    ) -> None:
-        if self.confidence_head is None:
-            return
-        loaded_names = set()
-        for name, loaded_weight in confidence_weights:
-            if name not in params_dict:
-                raise ValueError(
-                    f"DSpark unexpected confidence weight {name!r} not found in "
-                    "model parameters."
-                )
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
-            loaded_names.add(name)
-
-        confidence_param_names = {
-            name for name in params_dict if name.startswith("confidence_head.")
-        }
-        missing = confidence_param_names - loaded_names
-        if missing:
-            raise ValueError(
-                f"DSpark confidence head is enabled but the checkpoint is missing "
-                f"{sorted(missing)}. Provide a checkpoint with trained confidence weights, "
-                f"or disable the confidence head (enable_confidence_head=False)."
-            )
+        self.refresh_derived_weight_caches()
 
     def _stacked_ctx_kv_params(self) -> Optional[dict]:
         """Stack every layer's KV projection into one weight (exact: the input
@@ -475,13 +465,16 @@ class DSparkDraftMixin:
         cached = getattr(self, "_stacked_ctx_kv_cache", False)
         if cached is not False:
             return cached
+        self._stacked_ctx_kv_cache = self._build_stacked_ctx_kv_params()
+        return self._stacked_ctx_kv_cache
+
+    def _build_stacked_ctx_kv_params(self) -> Optional[dict]:
         weights, biases, k_norm_weights = [], [], []
         eps = None
         for layer in self.layers:
             attn = layer.self_attn
             can_slice, _ = can_dflash_slice_qkv_weight(attn.qkv_proj)
             if not can_slice or eps not in (None, attn.k_norm.variance_epsilon):
-                self._stacked_ctx_kv_cache = None
                 return None
             eps = attn.k_norm.variance_epsilon
             kv_slice = slice(attn.q_size, attn.q_size + 2 * attn.kv_size)
@@ -492,15 +485,46 @@ class DSparkDraftMixin:
             k_norm_weights.append(attn.k_norm.weight)
         has_bias = [b is not None for b in biases]
         if any(has_bias) and not all(has_bias):
-            self._stacked_ctx_kv_cache = None
             return None
-        self._stacked_ctx_kv_cache = {
+        return {
             "weight": torch.cat(weights, dim=0),
             "bias": torch.cat(biases, dim=0) if all(has_bias) else None,
             "k_norm_weight": torch.stack(k_norm_weights, dim=0).float(),
             "eps": eps,
         }
-        return self._stacked_ctx_kv_cache
+
+    @torch.inference_mode()
+    def refresh_derived_weight_caches(self) -> None:
+        """Refresh captured derived weights without changing their storage."""
+        cached = getattr(self, "_stacked_ctx_kv_cache", False)
+        if not isinstance(cached, dict):
+            return
+
+        refreshed = self._build_stacked_ctx_kv_params()
+        if refreshed is None:
+            raise RuntimeError("Unable to refresh DSpark stacked context-KV weights.")
+
+        for key in ("weight", "bias", "k_norm_weight"):
+            old_value = cached[key]
+            new_value = refreshed[key]
+            if (old_value is None) != (new_value is None):
+                raise RuntimeError(
+                    f"DSpark stacked context-KV cache field {key!r} changed layout."
+                )
+            if old_value is None:
+                continue
+            if (
+                old_value.shape != new_value.shape
+                or old_value.dtype != new_value.dtype
+                or old_value.device != new_value.device
+            ):
+                raise RuntimeError(
+                    f"DSpark stacked context-KV cache field {key!r} changed "
+                    "shape, dtype, or device."
+                )
+            # CUDA graphs may capture old_value's pointer, so refresh in place.
+            old_value.copy_(new_value)
+        cached["eps"] = refreshed["eps"]
 
     def write_target_hidden_kv(
         self,

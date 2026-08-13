@@ -7,6 +7,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.entrypoints.http_server_engine import HttpServerEngineAdapter
 from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromTensorReqInput,
@@ -189,8 +190,32 @@ class TestBaseSpecWorkerWeightUpdate(unittest.TestCase):
         self.assertEqual(output, (True, "Succeeded to update model weights."))
         deserialize.assert_called_once_with(b"rank-0")
         draft_updater.update_weights_from_tensor.assert_called_once_with(
-            named_tensors=[("draft.weight", "tensor")], load_format=None
+            named_tensors=[("draft.weight", "tensor")],
+            load_format=None,
+            stream_tensors=True,
         )
+        target_updater.update_weights_from_tensor.assert_not_called()
+
+    @patch("sglang.srt.speculative.base_spec_worker.monkey_patch_torch_reductions")
+    @patch(
+        "sglang.srt.speculative.base_spec_worker."
+        "MultiprocessingSerializer.deserialize",
+        side_effect=RuntimeError("bad CPU IPC handle"),
+    )
+    def test_tensor_deserialization_error_does_not_reach_updater(self, deserialize, _):
+        worker, target_updater, draft_updater = self._worker()
+        req = UpdateWeightsFromTensorReqInput(
+            serialized_named_tensors=[b"rank-0"],
+            load_format=None,
+            draft_only=True,
+        )
+
+        success, message = worker.update_weights_from_tensor(req)
+
+        self.assertFalse(success)
+        self.assertIn("bad CPU IPC handle", message)
+        deserialize.assert_called_once_with(b"rank-0")
+        draft_updater.update_weights_from_tensor.assert_not_called()
         target_updater.update_weights_from_tensor.assert_not_called()
 
     def test_tensor_default_route_preserves_target_worker_dispatch(self):
@@ -221,6 +246,40 @@ class TestBaseSpecWorkerWeightUpdate(unittest.TestCase):
         self.assertFalse(output[0])
         self.assertIn("model-backed speculative draft", output[1])
         target.update_weights_from_tensor.assert_not_called()
+
+
+class TestDraftOnlyPublicClient(unittest.TestCase):
+    @patch(
+        "sglang.srt.entrypoints.http_server_engine."
+        "MultiprocessingSerializer.serialize",
+        side_effect=["rank-0", "rank-1"],
+    )
+    def test_http_adapter_forwards_draft_only_with_safe_cpu_sharing(self, serialize):
+        adapter = HttpServerEngineAdapter.__new__(HttpServerEngineAdapter)
+        adapter.server_args = SimpleNamespace(tp_size=2)
+        adapter._make_request = MagicMock(return_value={"success": True})
+        tensors = [("draft.weight", "cpu-tensor")]
+
+        result = adapter.update_weights_from_tensor(
+            tensors, load_format=None, flush_cache=False, draft_only=True
+        )
+
+        self.assertEqual(result, {"success": True})
+        self.assertEqual(serialize.call_count, 2)
+        serialize.assert_any_call(
+            tensors,
+            output_str=True,
+            cpu_sharing_strategy="file_system",
+        )
+        adapter._make_request.assert_called_once_with(
+            "update_weights_from_tensor",
+            {
+                "serialized_named_tensors": ["rank-0", "rank-1"],
+                "load_format": None,
+                "flush_cache": False,
+                "draft_only": True,
+            },
+        )
 
 
 class TestTokenizerDraftOnlyModelPath(unittest.IsolatedAsyncioTestCase):
