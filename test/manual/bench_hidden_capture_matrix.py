@@ -1,32 +1,37 @@
 """Performance-degradation characterization matrix for hidden-state capture.
 
-Runs capture OFF vs ON (Mooncake sink) across isolated main-effect factors
-and worst-combination cells on Qwen3-8B DSpark:
+Runs capture OFF vs ON (Mooncake sink) on Qwen3-8B DSpark. OFF is stock
+sglang (no capture flag); ON adds --enable-hidden-state-capture with the
+mooncake sink. The delta between the two IS the cost of capture.
 
-  prefix   : cold (unique random prompts, radix on) / warm (shared-prefix,
-             observed hit signal) / no_radix (--disable-radix-cache)
-  length   : short (128) / mid (1024) / long (8192) random inputs
-  chunk    : large (8192) vs forced small (128)
-  graphs   : prefill graph off/on x decode graph off/on
-  dp       : 1 / 2
-  load     : low / mid / high fixed rates, plus unbounded (saturation)
+THE STANDARD MATRIX v2 (project convention — use these, don't improvise):
 
-THE STANDARD MATRIX (project convention — use these, don't improvise):
+  BASE workload: random 4096-in / 512-out (realistic chat/RAG shape; the
+  longer decode leg exercises the verify-capture path in proportion).
+  All serving features ON: chunked prefill 8192 + radix cache + prefill &
+  decode CUDA graphs.
 
-  --cells regression   per-change gate: run for EVERY perf-relevant capture
-                       change. baseline x2 (anchor, continuity with all
-                       historical rows) + chunked_128 (staging-geometry /
-                       coverage guard) + load_high (tail-latency-under-load
-                       guard, 24 rps open-loop) + saturation_dp1
-                       (max-throughput-cost guard, unbounded rate). All dp1,
-                       single GPU, ~40-50 min.
-  --cells all          milestone/merge gate: full characterization
-                       (main + worst + supplement), multi-hour, needs 2 GPUs
-                       for the dp2 cells.
+  --cells regression   per-change gate, 12 runs, one GPU each (shardable
+                       across GPUs via --only + CUDA_VISIBLE_DEVICES):
+    rand_low   x2  random cold, rate=2  (light-load anchor, noise floor)
+    rand_high      random cold, rate=8  (~125% of capacity: sustained
+                   queueing + admission pressure; verify-ring stress)
+    warm_low       shared-prefix (~50% radix hit), rate=2
+    warm_high      shared-prefix, rate=8 (hit + overload interaction,
+                   closest to production)
+    bare_high      random cold, rate=8, chunked/radix/graphs ALL OFF
+                   (isolates capture-cost dependence on the feature stack)
+
+  --cells all          adds supplement cells (saturation, longer inputs,
+                       dp2) for milestone/merge characterization.
 
 Concurrency semantics: fixed-rate cells are open-loop Poisson — in-flight
-count is emergent (rate x e2e), NOT pinned; saturation cells enqueue all
-prompts at once, so concurrency rides the server admission limit.
+count is emergent (rate x e2e), NOT pinned. Use cell["max_concurrency"]
+(closed-loop semaphore in bench_serving) when a pinned concurrency is
+needed; regression cells use open-loop rates because production load is
+open-loop.
+
+v1 rows (1024/128 BASE) are superseded: not comparable to v2 rows.
 
 Measurement hygiene:
 - fixed seed and prompt shapes; 16-request warmup per run;
@@ -38,19 +43,27 @@ Measurement hygiene:
 - export coverage is observed at a FIXED 20-second post-run drain horizon
   (this client build has no non-destructive count, so no stability polling);
 - GPU memory is sampled DURING the run by a background thread (1 Hz,
-  nvidia-smi); reported as max-over-time of per-GPU max and of the sum;
+  nvidia-smi, restricted to CUDA_VISIBLE_DEVICES when set); reported as
+  max-over-time of per-GPU max and of the sum;
 - capture-side counters (export_ok / *_miss_ct) are parsed from the server's
-  periodic stats log lines when present (logged every 256 finalized slots),
-  giving direct miss attribution rather than coverage-only inference.
+  periodic stats log lines when present (logged every 30 seconds), giving
+  direct miss attribution rather than coverage-only inference;
+- the FULL bench_serving result dict is preserved per row (all latency
+  percentiles, ITL, concurrency, accept_length, cache stats, server_info).
 
-Each cell reports throughput, TTFT/TPOT/E2E mean/p50/p99, during-run GPU
-memory, observed cache-hit rate, drained export coverage, and raw capture
-counters. Rows append to a JSONL for auditability.
+Rows append to a JSONL for auditability.
+
+Sharding: cells are independent; run several shards in parallel, one GPU
+each, by splitting with --only and giving each shard its own --shard index
+(offsets the server and mooncake-master ports):
+
+    CUDA_VISIBLE_DEVICES=0 ... --only rand_low --shard 0 &
+    CUDA_VISIBLE_DEVICES=1 ... --only rand_high --shard 1 &
 
 Usage:
     PYTHONPATH=python SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 \
         python3 test/manual/bench_hidden_capture_matrix.py \
-        --out /tmp/capture_matrix.jsonl [--cells main|worst|supplement|all]
+        --out /tmp/capture_matrix.jsonl [--cells regression|supplement|all]
 """
 
 import argparse
@@ -77,11 +90,16 @@ from sglang.test.test_utils import (
 
 TARGET_MODEL = "Qwen/Qwen3-8B"
 DRAFT_MODEL = "deepseek-ai/dspark_qwen3_8b_block7"
-MASTER_PORT = 50057
+BASE_MASTER_PORT = 50060
+BASE_SERVER_PORT = 21500
 STORE_ID = "matrix_capture"
 MASTER_BIN = "/usr/local/lib/python3.12/dist-packages/mooncake/mooncake_master"
 SEED = 42
 DRAIN_HORIZON_S = 20.0
+
+# Set per-shard in main(); defaults for shard 0.
+MASTER_PORT = BASE_MASTER_PORT
+SERVER_URL = f"http://127.0.0.1:{BASE_SERVER_PORT}"
 
 _STATS_RE = re.compile(r"hidden capture stats: (\{.*\})")
 
@@ -101,19 +119,16 @@ def _server_args(cell):
         "0.7",
         "--page-size",
         "1",
-        "--chunked-prefill-size",
-        str(cell["chunk"]),
     ]
-    if cell["prefix"] == "no_radix":
-        args += ["--disable-radix-cache"]
-    if not cell["prefill_graph"]:
-        args += ["--cuda-graph-backend-prefill", "disabled"]
-    if not cell["decode_graph"]:
-        args += ["--disable-decode-cuda-graph"]
-    else:
+    if cell["features"]:
+        args += ["--chunked-prefill-size", "8192"]
         args += ["--cuda-graph-max-bs-decode", "64"]
-    if cell["dp"] > 1:
-        args += ["--dp", str(cell["dp"])]
+    else:
+        # Bare stack: no chunking, no radix cache, no CUDA graphs.
+        args += ["--chunked-prefill-size", "-1"]
+        args += ["--disable-radix-cache"]
+        args += ["--cuda-graph-backend-prefill", "disabled"]
+        args += ["--disable-decode-cuda-graph"]
     if cell["capture"]:
         args += ["--enable-hidden-state-capture"]
     return args
@@ -122,13 +137,16 @@ def _server_args(cell):
 class GpuMemSampler:
     """1 Hz during-run nvidia-smi sampler: max-over-time of per-GPU max and
     of the all-GPU sum (labels what each number means, unlike a single
-    post-run snapshot)."""
+    post-run snapshot). Restricted to CUDA_VISIBLE_DEVICES when set, so
+    parallel shards on other GPUs don't pollute the numbers."""
 
     def __init__(self):
         self.max_single_mb = 0
         self.max_sum_mb = 0
         self._stop = threading.Event()
         self._thread = None
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        self._id_args = ["--id=" + visible] if visible else []
 
     def _run(self):
         while not self._stop.is_set():
@@ -136,6 +154,7 @@ class GpuMemSampler:
                 out = subprocess.check_output(
                     [
                         "nvidia-smi",
+                        *self._id_args,
                         "--query-gpu=memory.used",
                         "--format=csv,noheader,nounits",
                     ],
@@ -231,11 +250,12 @@ def run_cell(cell, repeat_idx):
                 "SGLANG_HIDDEN_CAPTURE_STORE_ID": STORE_ID,
                 "MOONCAKE_MASTER": f"127.0.0.1:{MASTER_PORT}",
                 "MOONCAKE_PROTOCOL": "tcp",
-                # Size the bench store above one run's full sample volume
-                # (~60MB/sample x up to 600 requests); otherwise the store's
-                # eviction watermark rejects puts mid-run and coverage
-                # measures the BENCH store, not the capture pipeline.
-                "MOONCAKE_GLOBAL_SEGMENT_SIZE": "48gb",
+                # Size the bench store above one run's full sample volume;
+                # otherwise the store's eviction watermark rejects puts
+                # mid-run and coverage measures the BENCH store, not the
+                # capture pipeline. v2 samples are ~4.5k tokens x ~57KB/token
+                # -> ~260MB/sample x 300 requests needs headroom.
+                "MOONCAKE_GLOBAL_SEGMENT_SIZE": "96gb",
             }
         )
     log_file = tempfile.NamedTemporaryFile(
@@ -246,7 +266,7 @@ def run_cell(cell, repeat_idx):
     )
     process = popen_launch_server(
         TARGET_MODEL,
-        DEFAULT_URL_FOR_TEST,
+        SERVER_URL,
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
         other_args=_server_args(cell),
         env=env,
@@ -255,37 +275,42 @@ def run_cell(cell, repeat_idx):
     store = _mooncake_store() if cell["capture"] else None
     try:
         common = dict(
-            base_url=DEFAULT_URL_FOR_TEST,
+            base_url=SERVER_URL,
             tokenizer=TARGET_MODEL,
             num_prompts=cell["num_prompts"],
             request_rate=cell["rate"],
+            max_concurrency=cell.get("max_concurrency"),
             seed=SEED,
         )
         if cell["prefix"] == "warm":
+            # Shared-prefix: system 4096 + question 512 (in-shape ~4.6k, close
+            # to the random cells' 4096) with 8 prompts/group -> the radix hit
+            # rate lands near the 7/8 group-interior fraction under low load.
             args = get_benchmark_args(
                 dataset_name="generated-shared-prefix",
                 gsp_num_groups=max(2, cell["num_prompts"] // 8),
                 gsp_prompts_per_group=8,
-                gsp_system_prompt_len=1024,
-                gsp_question_len=128,
-                gsp_output_len=128,
+                gsp_system_prompt_len=4096,
+                gsp_question_len=512,
+                gsp_output_len=IN_OUT[1],
                 **common,
             )
         else:
             args = get_benchmark_args(
                 dataset_name="random",
-                random_input_len=cell.get("input_len", 1024),
-                random_output_len=128,
+                random_input_len=cell.get("input_len", IN_OUT[0]),
+                random_output_len=cell.get("output_len", IN_OUT[1]),
                 **common,
             )
         args.cache_report = True
 
         warmup = copy.deepcopy(args)
         warmup.num_prompts = 16
+        warmup.max_concurrency = None
         warmup.cache_report = False
         asyncio.run(asyncio.to_thread(run_benchmark, warmup))
         if cell["prefix"] == "cold":
-            requests.post(DEFAULT_URL_FOR_TEST + "/flush_cache", timeout=30)
+            requests.post(SERVER_URL + "/flush_cache", timeout=30)
         # Remove warmup exports so coverage counts ONLY the measured run.
         warmup_exports = _clear_capture_store(store)
 
@@ -296,19 +321,16 @@ def run_cell(cell, repeat_idx):
             "cell": {k: v for k, v in cell.items()},
             "repeat": repeat_idx,
             "server_args": " ".join(_server_args(cell)),
-            "completed": res["completed"],
-            "output_throughput": res["output_throughput"],
-            "mean_ttft_ms": res["mean_ttft_ms"],
-            "p50_ttft_ms": res["median_ttft_ms"],
-            "p99_ttft_ms": res["p99_ttft_ms"],
-            "mean_tpot_ms": res["mean_tpot_ms"],
-            "p50_tpot_ms": res["median_tpot_ms"],
-            "p99_tpot_ms": res["p99_tpot_ms"],
-            "mean_e2e_ms": res["mean_e2e_latency_ms"],
-            "p50_e2e_ms": res["median_e2e_latency_ms"],
-            "p99_e2e_ms": res["p99_e2e_latency_ms"],
             "gpu_mem_max_single_mb": mem.max_single_mb,
             "gpu_mem_max_sum_mb": mem.max_sum_mb,
+            # The FULL bench_serving result: every latency percentile
+            # (mean/median/std/p90/p95/p99 of TTFT/TPOT/ITL/E2E), all
+            # throughput variants, concurrency, accept_length, cache stats.
+            "bench": {
+                k: v
+                for k, v in res.items()
+                if isinstance(v, (int, float, str, bool, type(None)))
+            },
             "cache_hit_rate_pct": (res.get("cache_report") or {}).get(
                 "cache_hit_rate_pct"
             ),
@@ -317,8 +339,7 @@ def run_cell(cell, repeat_idx):
             exported = _drained_export_count(store)
             # Store-KEY count from the pre-measure clear (meta + tensor keys,
             # possibly including previous-cell tensor residue) — NOT a number
-            # of warmup samples. v2 raw rows recorded this same quantity
-            # under the legacy name warmup_exports_removed.
+            # of warmup samples.
             row["pre_measure_keys_removed"] = warmup_exports
             row["exported_samples_at_drain"] = exported
             row["drain_horizon_s"] = DRAIN_HORIZON_S
@@ -351,79 +372,53 @@ def _pair(cells, name, base, repeats=1, **overrides):
             )
 
 
+# v2 BASE workload: 4k in / 512 out, all serving features on, open-loop.
+IN_OUT = (4096, 512)
+
 BASE = dict(
     prefix="cold",
-    chunk=8192,
-    prefill_graph=True,
-    decode_graph=True,
-    dp=1,
-    rate=8.0,
-    num_prompts=200,
-    input_len=1024,
+    features=True,
+    rate=2.0,
+    num_prompts=100,
+    max_concurrency=None,
 )
 
+# Rate ladder: server capacity at 4k/512 is ~6-7 req/s (H200, DSpark 8B);
+# low = comfortable in-flight handful, high = ~125% capacity (sustained
+# queueing + admission pressure without the rate=inf artifact).
+RATE_LOW = 2.0
+RATE_HIGH = 8.0
 
-def main_effect_cells():
+
+def regression_cells():
+    """The per-change gate (see module docstring). Cells are independent —
+    shard across GPUs with --only + --shard."""
     cells = []
-    _pair(cells, "baseline", BASE, repeats=2)
-    _pair(cells, "warm_prefix", BASE, prefix="warm")
-    _pair(cells, "chunked_128", BASE, chunk=128)
-    _pair(cells, "prefill_graph_off", BASE, prefill_graph=False)
-    _pair(cells, "decode_graph_off", BASE, decode_graph=False)
-    _pair(cells, "dp2", BASE, dp=2, rate=16.0, num_prompts=400)
-    _pair(cells, "load_low", BASE, rate=2.0, num_prompts=100)
-    _pair(cells, "load_high", BASE, rate=24.0, num_prompts=300)
+    _pair(cells, "rand_low", BASE, repeats=2)
+    _pair(cells, "rand_high", BASE, rate=RATE_HIGH, num_prompts=240)
+    _pair(cells, "warm_low", BASE, prefix="warm", num_prompts=96)
+    _pair(cells, "warm_high", BASE, prefix="warm", rate=RATE_HIGH, num_prompts=240)
+    _pair(cells, "bare_high", BASE, features=False, rate=RATE_HIGH, num_prompts=240)
     return cells
 
 
 def supplement_cells():
+    """Milestone extras on top of regression."""
     cells = []
-    _pair(cells, "no_radix", BASE, prefix="no_radix")
-    _pair(cells, "input_short_128", BASE, input_len=128)
-    _pair(cells, "input_long_8192", BASE, input_len=8192, num_prompts=100, rate=4.0)
     # Saturation: unbounded rate = offered load beyond capacity; the OFF/ON
     # delta here measures max-throughput cost, unlike fixed-rate cells.
+    _pair(cells, "saturation", BASE, rate=float("inf"), num_prompts=200)
+    # Pinned-concurrency variant (closed loop): the counterpart to the
+    # open-loop rate cells when a fixed in-flight count is wanted.
     _pair(
         cells,
-        "saturation_dp1",
+        "conc32",
         BASE,
         rate=float("inf"),
-        num_prompts=300,
-        repeats=2,
+        max_concurrency=32,
+        num_prompts=200,
     )
-    _pair(cells, "saturation_dp2", BASE, dp=2, rate=float("inf"), num_prompts=600)
-    return cells
-
-
-def worst_cells():
-    worst = dict(
-        prefix="warm",
-        chunk=128,
-        prefill_graph=True,
-        decode_graph=True,
-        dp=2,
-        rate=24.0,
-        num_prompts=400,
-    )
-    cells = []
-    _pair(cells, "worst_combo", worst, repeats=2)
-    return cells
-
-
-def regression_cells():
-    """The per-change gate (see module docstring): anchor + the three cells
-    that each guard a distinct capture failure mode. All dp1 / one GPU."""
-    cells = []
-    _pair(cells, "baseline", BASE, repeats=2)
-    _pair(cells, "chunked_128", BASE, chunk=128)
-    _pair(cells, "load_high", BASE, rate=24.0, num_prompts=300)
-    _pair(
-        cells,
-        "saturation_dp1",
-        BASE,
-        rate=float("inf"),
-        num_prompts=300,
-    )
+    _pair(cells, "input_long_16k", BASE, rate=1.0, num_prompts=50, input_len=16384)
     return cells
 
 
@@ -432,11 +427,22 @@ def main():
     parser.add_argument("--out", required=True)
     parser.add_argument(
         "--cells",
-        choices=["main", "worst", "supplement", "all", "regression"],
-        default="all",
+        choices=["regression", "supplement", "all"],
+        default="regression",
     )
     parser.add_argument("--only", default=None, help="substring filter on cell name")
+    parser.add_argument(
+        "--shard",
+        type=int,
+        default=0,
+        help="parallel-shard index: offsets server + mooncake-master ports "
+        "so shards on different GPUs don't collide",
+    )
     opts = parser.parse_args()
+
+    global MASTER_PORT, SERVER_URL
+    MASTER_PORT = BASE_MASTER_PORT + opts.shard
+    SERVER_URL = f"http://127.0.0.1:{BASE_SERVER_PORT + opts.shard}"
 
     master = subprocess.Popen(
         [
@@ -450,12 +456,8 @@ def main():
     time.sleep(2)
     try:
         todo = []
-        if opts.cells == "regression":
-            todo = regression_cells()
-        if opts.cells in ("main", "all"):
-            todo += main_effect_cells()
-        if opts.cells in ("worst", "all"):
-            todo += worst_cells()
+        if opts.cells in ("regression", "all"):
+            todo += regression_cells()
         if opts.cells in ("supplement", "all"):
             todo += supplement_cells()
         if opts.only:
@@ -480,28 +482,27 @@ def main():
                 k: (str(v) if isinstance(v, float) and v == float("inf") else v)
                 for k, v in row.items()
             }
-            if isinstance(row_out.get("cell"), dict):
-                row_out["cell"] = {
-                    k: (str(v) if isinstance(v, float) and v == float("inf") else v)
-                    for k, v in row_out["cell"].items()
-                }
+            for sub in ("cell", "bench"):
+                if isinstance(row_out.get(sub), dict):
+                    row_out[sub] = {
+                        k: (str(v) if isinstance(v, float) and v == float("inf") else v)
+                        for k, v in row_out[sub].items()
+                    }
             with open(opts.out, "a") as f:
                 f.write(json.dumps(row_out) + "\n")
+            bench = row_out.get("bench") or {}
             print(
                 json.dumps(
                     {
-                        k: row_out.get(k)
-                        for k in (
-                            "name",
-                            "status",
-                            "output_throughput",
-                            "p50_tpot_ms",
-                            "p99_tpot_ms",
-                            "cache_hit_rate_pct",
-                            "export_coverage_frac",
-                            "pre_measure_keys_removed",
-                            "gpu_mem_max_single_mb",
-                        )
+                        "name": row_out.get("name"),
+                        "status": row_out.get("status"),
+                        "output_throughput": bench.get("output_throughput"),
+                        "p50_tpot_ms": bench.get("median_tpot_ms"),
+                        "p99_tpot_ms": bench.get("p99_tpot_ms"),
+                        "concurrency": bench.get("concurrency"),
+                        "cache_hit_rate_pct": row_out.get("cache_hit_rate_pct"),
+                        "export_coverage_frac": row_out.get("export_coverage_frac"),
+                        "gpu_mem_max_single_mb": row_out.get("gpu_mem_max_single_mb"),
                     }
                 )
             )
