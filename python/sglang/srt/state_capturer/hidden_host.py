@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 _GB = 1024**3
 
 # Finalize-side log cadence, in finalized slots.
-_STATS_LOG_EVERY_SLOTS = 256
+_STATS_LOG_INTERVAL_S = 30.0
 # Orphaned bookkeeping entries (aborted requests) older than this are swept.
 _BOOKKEEPING_TTL_S = 600.0
 
@@ -565,6 +565,7 @@ class HiddenFinalizeWorker:
         stats: HiddenCaptureStats,
         twin_pool: Optional[DeviceTwinPool] = None,
         poll_interval_s: float = 0.001,
+        stats_log_interval_s: float = _STATS_LOG_INTERVAL_S,
     ) -> None:
         self.ring = ring
         self.sidecar = sidecar
@@ -573,6 +574,9 @@ class HiddenFinalizeWorker:
         self.twin_pool = twin_pool
         self.last_finalized_seq = -1
         self._poll_interval_s = poll_interval_s
+        self._stats_log_interval_s = stats_log_interval_s
+        self._last_stats_log_s = time.monotonic()
+        self._last_stats_snapshot: Optional[Dict[str, int]] = None
         self._running = True
         self._thread: Optional[threading.Thread] = None
 
@@ -587,6 +591,7 @@ class HiddenFinalizeWorker:
 
     def _run(self) -> None:
         while self._running:
+            self._maybe_log_stats()
             # Recycle twins as soon as their D2H completes, independent of
             # this thread's (much slower) sidecar-memcpy progress; the
             # forward thread also reaps opportunistically on pool miss.
@@ -615,11 +620,21 @@ class HiddenFinalizeWorker:
                     self.twin_pool.release(slot.twin)
                 self.ring.release(slot)
                 self.last_finalized_seq = seq
-            if (
-                self.stats.slots_finalized_ct % _STATS_LOG_EVERY_SLOTS
-                == _STATS_LOG_EVERY_SLOTS - 1
-            ):
-                self.stats.log("hidden capture stats:")
+
+    def _maybe_log_stats(self) -> None:
+        """Time-based periodic stats emission (finalize thread, off the hot
+        slot path); skipped while counters are unchanged. The old slot-count
+        trigger (slots_finalized_ct % N) went silent exactly when it
+        mattered: a short saturation burst finalizes fewer than N slots, so
+        runs whose misses needed attribution logged nothing."""
+        now = time.monotonic()
+        if now - self._last_stats_log_s < self._stats_log_interval_s:
+            return
+        self._last_stats_log_s = now
+        snapshot = self.stats.snapshot()
+        if snapshot != self._last_stats_snapshot:
+            self._last_stats_snapshot = snapshot
+            logger.info("hidden capture stats: %s", snapshot)
 
     def finalize_slot(self, slot: _StagingSlot) -> None:
         if slot.kind == "verify":
