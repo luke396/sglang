@@ -118,12 +118,16 @@ DRAIN_MAX_S = 300.0
 MANIFEST_POLL_S = 2.0
 MANIFEST_QUIET_POLLS = 10
 MANIFEST_EXACT_QUIET_POLLS = 2
+ACCESS_LOG_POLL_S = 0.1
+ACCESS_LOG_QUIET_POLLS = 5
+ACCESS_LOG_TIMEOUT_S = 5.0
 
 # Set per-shard in main(); defaults for shard 0.
 MASTER_PORT = BASE_MASTER_PORT
 SERVER_URL = f"http://127.0.0.1:{BASE_SERVER_PORT}"
 
 _STATS_RE = re.compile(r"hidden capture stats: (\{.*\})")
+_COMPLETED_GENERATE_RE = re.compile(r'"POST /generate HTTP/[0-9.]+" 200(?: OK)?')
 ARTIFACT_DIR = None
 SERVER_SOURCE_ROOT = None
 
@@ -345,6 +349,49 @@ def _manifest_snapshot(store, store_id, scan_limit):
     }
 
 
+def _completed_generate_requests(log_path):
+    """Count completed generate calls in the server access log."""
+    try:
+        text = Path(log_path).read_text(errors="replace")
+    except OSError:
+        return 0
+    return len(_COMPLETED_GENERATE_RE.findall(text))
+
+
+def _wait_for_completed_generate_quiet(
+    log_path,
+    *,
+    minimum_count,
+    timeout_s=ACCESS_LOG_TIMEOUT_S,
+    poll_s=ACCESS_LOG_POLL_S,
+    quiet_polls=ACCESS_LOG_QUIET_POLLS,
+):
+    """Return the exact completed pre-measurement request count.
+
+    ``popen_launch_server`` may issue a readiness ``/generate`` in addition to
+    this harness's explicit outer warmup.  Both are capture producers.  The
+    access log is therefore the common V5/V6 source of truth for how many
+    manifest entries must exist before the measured counter window opens.
+    """
+    deadline = time.monotonic() + timeout_s
+    previous = None
+    quiet = 0
+    history = []
+    while time.monotonic() < deadline:
+        count = _completed_generate_requests(log_path)
+        quiet = quiet + 1 if count == previous else 0
+        previous = count
+        history.append(count)
+        if count >= minimum_count and quiet >= quiet_polls:
+            return count, history
+        time.sleep(poll_s)
+    raise AssertionError(
+        "server access log did not settle at the completed pre-measurement "
+        f"request count: minimum={minimum_count}, observed={previous}, "
+        f"history={history}"
+    )
+
+
 def _drain_manifest(
     store,
     store_id,
@@ -392,7 +439,8 @@ def _drain_manifest(
         if expected_delta is not None and delta == expected_delta:
             required_quiet = MANIFEST_EXACT_QUIET_POLLS
         if quiet >= required_quiet:
-            return snapshot, history, time.monotonic() - started, True
+            exact = expected_delta is None or delta == expected_delta
+            return snapshot, history, time.monotonic() - started, exact
         time.sleep(MANIFEST_POLL_S)
     snapshot = _manifest_snapshot(store, store_id, scan_limit)
     return snapshot, history, time.monotonic() - started, False
@@ -978,6 +1026,16 @@ def run_cell(cell, repeat_idx, attempt_name):
                 f"outer warmup request set mismatch: completed={warmup_completed}, "
                 f"expected={OUTER_WARMUP_REQUESTS}"
             )
+        (
+            pre_measurement_generate_requests,
+            pre_measurement_access_log_history,
+        ) = _wait_for_completed_generate_quiet(
+            log_file.name,
+            minimum_count=warmup_completed,
+        )
+        non_warmup_generate_requests = (
+            pre_measurement_generate_requests - warmup_completed
+        )
         if cell["prefix"] == "cold":
             requests.post(SERVER_URL + "/flush_cache", timeout=30)
         if cell["capture"]:
@@ -990,9 +1048,20 @@ def run_cell(cell, repeat_idx, attempt_name):
                 observer,
                 run_store_id,
                 baseline_count=0,
-                expected_delta=None,
-                scan_limit=OUTER_WARMUP_REQUESTS + 128,
+                expected_delta=pre_measurement_generate_requests,
+                scan_limit=pre_measurement_generate_requests + 128,
             )
+            if (
+                not warmup_drained
+                or int(manifest_baseline["count"]) != pre_measurement_generate_requests
+            ):
+                raise AssertionError(
+                    "pre-measurement manifest did not reach the exact access-log "
+                    "request set before the counter baseline: "
+                    f"manifest={manifest_baseline['count']}, "
+                    f"access_log={pre_measurement_generate_requests}, "
+                    f"snapshot={manifest_baseline}"
+                )
             before_snapshots = _capture_snapshot()
             before_stats = _sum_capture_stats(before_snapshots)
         else:
@@ -1122,6 +1191,13 @@ def run_cell(cell, repeat_idx, attempt_name):
                 "completed": warmup_completed,
                 "inner_warmup_requests": int(warmup.warmup_requests),
                 "fingerprint": warmup_request_fingerprint,
+                "completed_generate_requests_before_measurement": (
+                    pre_measurement_generate_requests
+                ),
+                "non_warmup_generate_requests_before_measurement": (
+                    non_warmup_generate_requests
+                ),
+                "access_log_count_history": pre_measurement_access_log_history,
                 "gsp_num_groups": (
                     int(warmup.gsp_num_groups) if cell["prefix"] == "warm" else None
                 ),

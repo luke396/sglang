@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
-"""Reproducible crossed comparison of two hidden-capture revisions.
+"""Reproducible comparison of two hidden-capture revisions.
 
 This orchestrator deliberately runs the repo-resident
 ``bench_hidden_capture_matrix.py`` as a script for every leg.  The driver
-revision stays fixed while only the child server worktree changes.  Two GPUs
-run complementary orders so every concurrent step contains one baseline, one
-candidate, one capture-OFF, and one capture-ON leg::
+revision stays fixed while only the child server worktree changes.  By default,
+each cell stays on one GPU for all four version/capture arms.  Different cells
+are sharded across the selected GPUs, with complementary orders balancing
+capture and version load in each concurrent wave::
+
+    GPU A, cell X: baseline/off, baseline/on, candidate/off, candidate/on
+    GPU B, cell Y: candidate/on, candidate/off, baseline/on, baseline/off
+
+Use ``--cross-gpu-repeat`` only when a material card-dependent discrepancy
+needs confirmation.  It uses the original two-GPU, eight-arm protocol for each
+cell::
 
     GPU A: baseline/off, baseline/on, candidate/off, candidate/on
     GPU B: candidate/on, candidate/off, baseline/on, baseline/off
@@ -29,9 +37,9 @@ revisions/Mooncake bindings, request-fingerprint drift, incomplete coverage or
 drain, and selected-GPU residue.  It never overwrites a prior output directory.
 ``run_manifest.json`` freezes sources, scripts, hardware and scheduling;
 ``attempts.jsonl`` retains every arm; ``comparison_summary.json`` contains
-same-GPU deltas and crossed geometric means; ``artifact_index.json`` hashes all
-raw evidence.  Future comparisons should change only roots, exact SHAs, labels,
-GPU selection and the new output directory.
+capture deltas and aggregate geometric means; ``artifact_index.json`` hashes
+all raw evidence.  Future comparisons should change only roots, exact SHAs,
+labels, GPU selection and the new output directory.
 """
 
 from __future__ import annotations
@@ -191,6 +199,56 @@ def crossed_schedules(
     )
 
 
+def comparison_waves(cells, gpus, baseline, candidate, cross_gpu_repeat=False):
+    """Build deterministic waves while keeping a default cell on one GPU."""
+    if not gpus or len(set(gpus)) != len(gpus):
+        raise ValueError("comparison waves require distinct GPUs")
+    if cross_gpu_repeat:
+        if len(gpus) != 2:
+            raise ValueError("cross-GPU repetition requires exactly two GPUs")
+        schedules = crossed_schedules(baseline, candidate)
+        return tuple(
+            tuple(
+                {
+                    "cell_index": cell_index,
+                    "cell": cell,
+                    "step": step,
+                    "worker": worker,
+                    "gpu": gpu,
+                    "revision": schedules[worker][step][0],
+                    "capture": schedules[worker][step][1],
+                }
+                for worker, gpu in enumerate(gpus)
+            )
+            for cell_index, cell in enumerate(cells)
+            for step in range(len(schedules[0]))
+        )
+
+    forward = _schedule(baseline, candidate)
+    reverse = tuple(reversed(forward))
+    waves = []
+    for batch_start in range(0, len(cells), len(gpus)):
+        batch = tuple(enumerate(cells[batch_start : batch_start + len(gpus)]))
+        for step in range(len(forward)):
+            wave = []
+            for worker, (batch_offset, cell) in enumerate(batch):
+                schedule = forward if worker % 2 == 0 else reverse
+                revision, capture = schedule[step]
+                wave.append(
+                    {
+                        "cell_index": batch_start + batch_offset,
+                        "cell": cell,
+                        "step": step,
+                        "worker": worker,
+                        "gpu": gpus[worker],
+                        "revision": revision,
+                        "capture": capture,
+                    }
+                )
+            waves.append(tuple(wave))
+    return tuple(waves)
+
+
 def _load_single_row(path: Path) -> dict:
     rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
     if len(rows) != 1:
@@ -256,6 +314,23 @@ def _row_gate(
     if not (outer_warmup.get("fingerprint") or {}).get("sha256"):
         failures.append("missing outer warmup request-set fingerprint")
     if row.get("cell", {}).get("capture"):
+        pre_measurement_requests = outer_warmup.get(
+            "completed_generate_requests_before_measurement"
+        )
+        if not isinstance(pre_measurement_requests, int):
+            failures.append("missing pre-measurement access-log request count")
+        elif pre_measurement_requests < outer_warmup.get("completed", 0):
+            failures.append(
+                "pre-measurement access-log request count is smaller than "
+                f"outer warmup: {pre_measurement_requests}"
+            )
+        manifest_baseline_count = (row.get("manifest_baseline") or {}).get("count")
+        if manifest_baseline_count != pre_measurement_requests:
+            failures.append(
+                "manifest baseline is not bound to the pre-measurement "
+                f"access-log request set: manifest={manifest_baseline_count}, "
+                f"access_log={pre_measurement_requests}"
+            )
         if row.get("coverage_source") != "mooncake_manifest_delta":
             failures.append(f"coverage_source={row.get('coverage_source')}")
         if row.get("export_coverage_frac") != 1.0:
@@ -449,10 +524,34 @@ def _geomean_ratio_pct(pairs):
     return (math.exp(sum(math.log(value) for value in ratios) / len(ratios)) - 1) * 100
 
 
+def _geomean(values):
+    usable = [float(value) for value in values if value not in (None, 0)]
+    if not usable:
+        return None
+    return math.exp(sum(math.log(value) for value in usable) / len(usable))
+
+
+def _ratio_of_geomeans_pct(numerators, denominators):
+    numerator = _geomean(numerators)
+    denominator = _geomean(denominators)
+    return _ratio_pct(numerator, denominator)
+
+
+def _capture_did_pct(candidate_pairs, baseline_pairs):
+    candidate_ratio = _geomean(
+        float(on) / float(off) for on, off in candidate_pairs if on and off
+    )
+    baseline_ratio = _geomean(
+        float(on) / float(off) for on, off in baseline_pairs if on and off
+    )
+    return _ratio_pct(candidate_ratio, baseline_ratio)
+
+
 def summarize_attempts(
     attempts: list[dict],
     labels: tuple[str, str],
     cells: tuple[str, ...] = SUITE_CELLS,
+    scheduling_mode: str = "fixed-cell-gpu",
 ) -> dict:
     baseline_label, candidate_label = labels
     summary = {"suite": SUITE, "cells": {}, "all_gates_pass": True}
@@ -492,10 +591,13 @@ def summarize_attempts(
                 f"{sorted(outer_warmup_fingerprints)}"
             )
         expected_keys = {
-            (gpu, label, capture)
-            for gpu in {attempt["gpu"] for attempt in attempts}
-            for label in labels
-            for capture in (False, True)
+            (
+                attempt["gpu"],
+                attempt["version_label"],
+                bool(attempt["capture"]),
+            )
+            for attempt in attempts
+            if attempt.get("cell") == cell
         }
         missing = sorted(expected_keys - set(rows))
         if missing:
@@ -503,6 +605,7 @@ def summarize_attempts(
 
         cell_summary = {
             "comparable": not failures,
+            "scheduling_mode": scheduling_mode,
             "gate_failures": failures,
             "request_fingerprint_sha256": next(iter(fingerprints), None),
             "outer_warmup_fingerprint_sha256": next(
@@ -518,11 +621,6 @@ def summarize_attempts(
         gpus = sorted({key[0] for key in rows})
         for metric in COMMON_METRICS:
             per_gpu = {}
-            candidate_on_vs_baseline_on = []
-            candidate_off_vs_baseline_off = []
-            baseline_on_vs_off = []
-            candidate_on_vs_off = []
-            did_ratios = []
             for gpu in gpus:
 
                 def value(label, capture):
@@ -544,66 +642,94 @@ def summarize_attempts(
                     "candidate_vs_baseline_off_pct": _ratio_pct(co, bo),
                     "candidate_vs_baseline_on_pct": _ratio_pct(cn, bn),
                 }
-                if all(value not in (None, 0) for value in (bo, bn, co, cn)):
-                    candidate_on_vs_baseline_on.append((cn, bn))
-                    candidate_off_vs_baseline_off.append((co, bo))
-                    baseline_on_vs_off.append((bn, bo))
-                    candidate_on_vs_off.append((cn, co))
-                    did_ratios.append((cn * bo, co * bn))
+            baseline_pairs = []
+            candidate_pairs = []
+            for gpu in gpus:
+                baseline_off = (
+                    rows.get((gpu, baseline_label, False), {}).get("bench") or {}
+                ).get(metric)
+                baseline_on = (
+                    rows.get((gpu, baseline_label, True), {}).get("bench") or {}
+                ).get(metric)
+                candidate_off = (
+                    rows.get((gpu, candidate_label, False), {}).get("bench") or {}
+                ).get(metric)
+                candidate_on = (
+                    rows.get((gpu, candidate_label, True), {}).get("bench") or {}
+                ).get(metric)
+                if baseline_on not in (None, 0) and baseline_off not in (None, 0):
+                    baseline_pairs.append((baseline_on, baseline_off))
+                if candidate_on not in (None, 0) and candidate_off not in (None, 0):
+                    candidate_pairs.append((candidate_on, candidate_off))
+            baseline_off_values = [
+                (row.get("bench") or {}).get(metric)
+                for (gpu, label, capture), row in rows.items()
+                if label == baseline_label and not capture
+            ]
+            baseline_on_values = [
+                (row.get("bench") or {}).get(metric)
+                for (gpu, label, capture), row in rows.items()
+                if label == baseline_label and capture
+            ]
+            candidate_off_values = [
+                (row.get("bench") or {}).get(metric)
+                for (gpu, label, capture), row in rows.items()
+                if label == candidate_label and not capture
+            ]
+            candidate_on_values = [
+                (row.get("bench") or {}).get(metric)
+                for (gpu, label, capture), row in rows.items()
+                if label == candidate_label and capture
+            ]
+            aggregate_geomean = {
+                "baseline_capture_cost_pct": _geomean_ratio_pct(baseline_pairs),
+                "candidate_capture_cost_pct": _geomean_ratio_pct(candidate_pairs),
+                "candidate_vs_baseline_off_pct": _ratio_of_geomeans_pct(
+                    candidate_off_values, baseline_off_values
+                ),
+                "candidate_vs_baseline_on_pct": _ratio_of_geomeans_pct(
+                    candidate_on_values, baseline_on_values
+                ),
+                "capture_cost_difference_in_differences_pct": _capture_did_pct(
+                    candidate_pairs, baseline_pairs
+                ),
+            }
             cell_summary["metrics"][metric] = {
                 "per_gpu": per_gpu,
-                "crossed_geomean": {
-                    "baseline_capture_cost_pct": _geomean_ratio_pct(baseline_on_vs_off),
-                    "candidate_capture_cost_pct": _geomean_ratio_pct(
-                        candidate_on_vs_off
-                    ),
-                    "candidate_vs_baseline_off_pct": _geomean_ratio_pct(
-                        candidate_off_vs_baseline_off
-                    ),
-                    "candidate_vs_baseline_on_pct": _geomean_ratio_pct(
-                        candidate_on_vs_baseline_on
-                    ),
-                    "capture_cost_difference_in_differences_pct": (
-                        _geomean_ratio_pct(did_ratios)
-                    ),
-                },
+                "aggregate_geomean": aggregate_geomean,
+                "crossed_geomean": (
+                    aggregate_geomean if scheduling_mode == "cross-gpu-repeat" else None
+                ),
             }
 
-        for gpu in gpus:
-            for label in labels:
-                on = rows.get((gpu, label, True), {})
-                cell_summary["coverage"][f"gpu{gpu}:{label}"] = {
-                    "coverage": on.get("export_coverage_frac"),
-                    "drain_s": on.get("measured_drain_s"),
-                    "cache_hit_rate_pct": on.get("cache_hit_rate_pct"),
-                    "counter_delta": on.get("measured_counter_delta"),
-                    "last_log_counters": on.get("capture_counters_last_log"),
+        for gpu, label in sorted({(key[0], key[1]) for key in rows}):
+            on = rows.get((gpu, label, True), {})
+            cell_summary["coverage"][f"gpu{gpu}:{label}"] = {
+                "coverage": on.get("export_coverage_frac"),
+                "drain_s": on.get("measured_drain_s"),
+                "cache_hit_rate_pct": on.get("cache_hit_rate_pct"),
+                "counter_delta": on.get("measured_counter_delta"),
+                "last_log_counters": on.get("capture_counters_last_log"),
+            }
+            for capture in (False, True):
+                row = rows.get((gpu, label, capture), {})
+                process = row.get("process_resources") or {}
+                gpu_resources = row.get("gpu_resources") or {}
+                cell_summary["resources"][f"gpu{gpu}:{label}:cap={int(capture)}"] = {
+                    "startup_s": row.get("server_startup_s"),
+                    "rss_peak_bytes": process.get("rss_peak_bytes"),
+                    "cpu_mean_one_core_units": process.get("cpu_mean_one_core_units"),
+                    "process_read_bytes_delta": process.get("process_read_bytes_delta"),
+                    "process_write_bytes_delta": process.get(
+                        "process_write_bytes_delta"
+                    ),
+                    "host_net_pernic_delta": process.get("host_net_pernic_delta"),
+                    "gpu_memory_max_single_mb": gpu_resources.get(
+                        "memory_max_single_mb"
+                    ),
+                    "gpu_util_mean_pct": gpu_resources.get("gpu_util_mean_pct"),
+                    "power_mean_w": gpu_resources.get("power_mean_w"),
                 }
-                for capture in (False, True):
-                    row = rows.get((gpu, label, capture), {})
-                    process = row.get("process_resources") or {}
-                    gpu_resources = row.get("gpu_resources") or {}
-                    cell_summary["resources"][
-                        f"gpu{gpu}:{label}:cap={int(capture)}"
-                    ] = {
-                        "startup_s": row.get("server_startup_s"),
-                        "rss_peak_bytes": process.get("rss_peak_bytes"),
-                        "cpu_mean_one_core_units": process.get(
-                            "cpu_mean_one_core_units"
-                        ),
-                        "process_read_bytes_delta": process.get(
-                            "process_read_bytes_delta"
-                        ),
-                        "process_write_bytes_delta": process.get(
-                            "process_write_bytes_delta"
-                        ),
-                        "host_net_pernic_delta": process.get("host_net_pernic_delta"),
-                        "gpu_memory_max_single_mb": gpu_resources.get(
-                            "memory_max_single_mb"
-                        ),
-                        "gpu_util_mean_pct": gpu_resources.get("gpu_util_mean_pct"),
-                        "power_mean_w": gpu_resources.get("power_mean_w"),
-                    }
         summary["cells"][cell] = cell_summary
     return summary
 
@@ -630,6 +756,14 @@ def main() -> int:
         "--only-cells",
         default=None,
         help="comma-separated diagnosis subset; omitted is the formal full suite",
+    )
+    parser.add_argument(
+        "--cross-gpu-repeat",
+        action="store_true",
+        help=(
+            "repeat each version on the other GPU; opt in only to investigate "
+            "a material card-dependent discrepancy"
+        ),
     )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -670,8 +804,14 @@ def main() -> int:
         raise SystemExit(f"driver worktree must be committed and clean: {driver}")
 
     gpus = tuple(part.strip() for part in opts.gpus.split(",") if part.strip())
-    if len(gpus) != 2 or len(set(gpus)) != 2 or not all(gpu.isdigit() for gpu in gpus):
-        raise SystemExit("--gpus must name exactly two distinct physical GPU indices")
+    if (
+        not gpus
+        or len(set(gpus)) != len(gpus)
+        or not all(gpu.isdigit() for gpu in gpus)
+    ):
+        raise SystemExit("--gpus must name one or more distinct physical GPU indices")
+    if opts.cross_gpu_repeat and len(gpus) != 2:
+        raise SystemExit("--cross-gpu-repeat requires exactly two GPUs")
     labels = (opts.baseline_label, opts.candidate_label)
     if labels[0] == labels[1] or _safe_label(labels[0]) == _safe_label(labels[1]):
         raise SystemExit(
@@ -715,6 +855,9 @@ def main() -> int:
         "mooncake": mooncake,
         "mooncake_python_root": str(mooncake_python_root),
         "gpus": list(gpus),
+        "scheduling_mode": (
+            "cross-gpu-repeat" if opts.cross_gpu_repeat else "fixed-cell-gpu"
+        ),
         "numa_node": opts.numa_node,
         "numa_policy": (
             "CPU node pinned; memory placement is first-touch because this "
@@ -732,94 +875,105 @@ def main() -> int:
     }
     _write_json(run_manifest_path, run_manifest)
 
-    schedules = crossed_schedules(baseline, candidate)
+    scheduling_mode = "cross-gpu-repeat" if opts.cross_gpu_repeat else "fixed-cell-gpu"
+    waves = comparison_waves(
+        cells,
+        gpus,
+        baseline,
+        candidate,
+        cross_gpu_repeat=opts.cross_gpu_repeat,
+    )
     attempts = []
-    for cell_index, cell in enumerate(cells):
-        for step in range(4):
-            specs = []
-            for worker, gpu in enumerate(gpus):
-                revision, capture = schedules[worker][step]
-                attempt_id = _safe_label(
-                    f"{cell}.step{step}.gpu{gpu}.{revision['label']}.cap{int(capture)}"
-                )
-                attempt_dir = out_dir / attempt_id
-                attempt_dir.mkdir(exist_ok=True)
-                out = attempt_dir / "row.jsonl"
-                artifacts = attempt_dir / "raw"
-                command, env = _build_command(
-                    matrix_script=matrix_script,
-                    driver_root=driver_root,
-                    revision=revision,
-                    capture=capture,
-                    cell=cell,
-                    gpu=gpu,
-                    shard=opts.shard_base + worker,
-                    out=out,
-                    artifact_dir=artifacts,
-                    numa_node=opts.numa_node,
-                    mooncake_python_root=mooncake_python_root,
-                    expected_mooncake_version=opts.expected_mooncake_version,
-                )
-                specs.append(
-                    {
-                        "attempt_id": attempt_id,
-                        "cell": cell,
-                        "cell_index": cell_index,
-                        "step": step,
-                        "worker": worker,
-                        "gpu": gpu,
-                        "version_label": revision["label"],
-                        "revision": revision["revision"],
-                        "capture": capture,
-                        "driver_root": str(driver_root),
-                        "command": command,
-                        "command_shell": shlex.join(command),
-                        "env": env,
-                        "out": str(out),
-                        "artifact_dir": str(artifacts),
-                        "stdout": str(attempt_dir / "driver.stdout"),
-                        "stderr": str(attempt_dir / "driver.stderr"),
-                    }
-                )
-            print(
-                json.dumps(
-                    {
-                        "event": "start_pair",
-                        "cell": cell,
-                        "step": step,
-                        "attempts": [spec["attempt_id"] for spec in specs],
-                    }
-                ),
-                flush=True,
+    for wave_index, wave in enumerate(waves):
+        specs = []
+        for arm in wave:
+            cell = arm["cell"]
+            step = arm["step"]
+            worker = arm["worker"]
+            gpu = arm["gpu"]
+            revision = arm["revision"]
+            capture = arm["capture"]
+            attempt_id = _safe_label(
+                f"{cell}.step{step}.gpu{gpu}.{revision['label']}.cap{int(capture)}"
             )
-            running = [
-                _launch_attempt(spec, resume=opts.resume, dry_run=opts.dry_run)
-                for spec in specs
-            ]
-            finished = [_finish_attempt(record) for record in running]
-            for record in finished:
-                attempts.append(record)
-                if not opts.dry_run:
-                    with attempts_path.open("a") as stream:
-                        stream.write(json.dumps(_attempt_public(record)) + "\n")
-            print(
-                json.dumps(
-                    {
-                        "event": "finish_pair",
-                        "cell": cell,
-                        "step": step,
-                        "results": [
-                            {
-                                "attempt": record["attempt_id"],
-                                "exit": record.get("exit_code"),
-                                "gate_failures": record.get("row_gate_failures"),
-                            }
-                            for record in finished
-                        ],
-                    }
-                ),
-                flush=True,
+            attempt_dir = out_dir / attempt_id
+            attempt_dir.mkdir(exist_ok=True)
+            out = attempt_dir / "row.jsonl"
+            artifacts = attempt_dir / "raw"
+            command, env = _build_command(
+                matrix_script=matrix_script,
+                driver_root=driver_root,
+                revision=revision,
+                capture=capture,
+                cell=cell,
+                gpu=gpu,
+                shard=opts.shard_base + worker,
+                out=out,
+                artifact_dir=artifacts,
+                numa_node=opts.numa_node,
+                mooncake_python_root=mooncake_python_root,
+                expected_mooncake_version=opts.expected_mooncake_version,
             )
+            specs.append(
+                {
+                    "attempt_id": attempt_id,
+                    "cell": cell,
+                    "cell_index": arm["cell_index"],
+                    "wave": wave_index,
+                    "step": step,
+                    "worker": worker,
+                    "gpu": gpu,
+                    "version_label": revision["label"],
+                    "revision": revision["revision"],
+                    "capture": capture,
+                    "driver_root": str(driver_root),
+                    "command": command,
+                    "command_shell": shlex.join(command),
+                    "env": env,
+                    "out": str(out),
+                    "artifact_dir": str(artifacts),
+                    "stdout": str(attempt_dir / "driver.stdout"),
+                    "stderr": str(attempt_dir / "driver.stderr"),
+                }
+            )
+        print(
+            json.dumps(
+                {
+                    "event": "start_wave",
+                    "wave": wave_index,
+                    "cells": [spec["cell"] for spec in specs],
+                    "attempts": [spec["attempt_id"] for spec in specs],
+                }
+            ),
+            flush=True,
+        )
+        running = [
+            _launch_attempt(spec, resume=opts.resume, dry_run=opts.dry_run)
+            for spec in specs
+        ]
+        finished = [_finish_attempt(record) for record in running]
+        for record in finished:
+            attempts.append(record)
+            if not opts.dry_run:
+                with attempts_path.open("a") as stream:
+                    stream.write(json.dumps(_attempt_public(record)) + "\n")
+        print(
+            json.dumps(
+                {
+                    "event": "finish_wave",
+                    "wave": wave_index,
+                    "results": [
+                        {
+                            "attempt": record["attempt_id"],
+                            "exit": record.get("exit_code"),
+                            "gate_failures": record.get("row_gate_failures"),
+                        }
+                        for record in finished
+                    ],
+                }
+            ),
+            flush=True,
+        )
 
     if opts.dry_run:
         _write_json(
@@ -827,7 +981,12 @@ def main() -> int:
         )
         return 0
 
-    summary = summarize_attempts(attempts, labels, cells)
+    summary = summarize_attempts(
+        attempts,
+        labels,
+        cells,
+        scheduling_mode=scheduling_mode,
+    )
     _write_json(summary_path, summary)
     run_manifest["finished_unix_s"] = time.time()
     run_manifest["all_gates_pass"] = summary["all_gates_pass"]

@@ -3,6 +3,7 @@
 import importlib.util
 import math
 import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -55,6 +56,45 @@ class TestHiddenCaptureBenchmarkHarness(unittest.TestCase):
             self.assertEqual({revision["label"] for revision, _ in pair}, {"v5", "v6"})
             self.assertEqual({capture for _, capture in pair}, {False, True})
 
+    def test_default_schedule_keeps_each_cell_on_one_gpu(self):
+        baseline = {"label": "v5"}
+        candidate = {"label": "v6"}
+        waves = versions.comparison_waves(
+            ("cell_a", "cell_b"), ("0", "1"), baseline, candidate
+        )
+        self.assertEqual(len(waves), 4)
+        by_cell = {"cell_a": [], "cell_b": []}
+        for wave in waves:
+            self.assertEqual({arm["gpu"] for arm in wave}, {"0", "1"})
+            self.assertEqual({arm["revision"]["label"] for arm in wave}, {"v5", "v6"})
+            self.assertEqual({arm["capture"] for arm in wave}, {False, True})
+            for arm in wave:
+                by_cell[arm["cell"]].append(arm)
+        self.assertEqual({arm["gpu"] for arm in by_cell["cell_a"]}, {"0"})
+        self.assertEqual({arm["gpu"] for arm in by_cell["cell_b"]}, {"1"})
+        for arms in by_cell.values():
+            self.assertEqual(
+                {(arm["revision"]["label"], arm["capture"]) for arm in arms},
+                {("v5", False), ("v5", True), ("v6", False), ("v6", True)},
+            )
+
+    def test_default_schedule_shards_cells_across_multiple_gpus(self):
+        baseline = {"label": "v5"}
+        candidate = {"label": "v6"}
+        cells = tuple(f"cell_{index}" for index in range(10))
+        waves = versions.comparison_waves(
+            cells, ("0", "1", "2", "3"), baseline, candidate
+        )
+        arms = [arm for wave in waves for arm in wave]
+        self.assertEqual(len(arms), 4 * len(cells))
+        self.assertEqual(len(waves), 12)
+        for cell in cells:
+            cell_arms = [arm for arm in arms if arm["cell"] == cell]
+            self.assertEqual(len(cell_arms), 4)
+            self.assertEqual(len({arm["gpu"] for arm in cell_arms}), 1)
+        for wave in waves:
+            self.assertEqual(len({arm["gpu"] for arm in wave}), len(wave))
+
     def test_manifest_snapshot_is_non_destructive_and_reports_holes(self):
         prefix = "store/_seq/0"
         store = _FakeStore({f"{prefix}/0", f"{prefix}/2", f"{prefix}/3"})
@@ -64,6 +104,46 @@ class TestHiddenCaptureBenchmarkHarness(unittest.TestCase):
         self.assertEqual(snapshot["last_seq"], 3)
         self.assertEqual(snapshot["holes_through_last"], [1])
         self.assertEqual(len(store.keys), 3)
+
+    def test_access_log_counts_all_completed_pre_measurement_generates(self):
+        with tempfile.NamedTemporaryFile(mode="w") as stream:
+            stream.write(
+                '[date] INFO: 127.0.0.1 - "POST /generate HTTP/1.1" 200 OK\n'
+                '[date] INFO: 127.0.0.1 - "GET /health HTTP/1.1" 200 OK\n'
+                '[date] INFO: 127.0.0.1 - "POST /generate HTTP/1.1" 200 OK\n'
+            )
+            stream.flush()
+            self.assertEqual(matrix._completed_generate_requests(stream.name), 2)
+
+    def test_manifest_drain_marks_stable_incomplete_baseline_invalid(self):
+        store = _FakeStore({"store/_seq/0/0"})
+        with (
+            mock.patch.object(matrix, "MANIFEST_POLL_S", 0),
+            mock.patch.object(matrix, "MANIFEST_QUIET_POLLS", 0),
+            mock.patch.object(matrix, "MANIFEST_EXACT_QUIET_POLLS", 0),
+        ):
+            snapshot, _, _, drained = matrix._drain_manifest(
+                store,
+                "store",
+                baseline_count=0,
+                expected_delta=2,
+                scan_limit=4,
+                timeout_s=0.1,
+            )
+            self.assertEqual(snapshot["count"], 1)
+            self.assertFalse(drained)
+
+            store.keys.add("store/_seq/0/1")
+            snapshot, _, _, drained = matrix._drain_manifest(
+                store,
+                "store",
+                baseline_count=0,
+                expected_delta=2,
+                scan_limit=4,
+                timeout_s=0.1,
+            )
+            self.assertEqual(snapshot["count"], 2)
+            self.assertTrue(drained)
 
     def test_coverage_fails_closed_on_contamination(self):
         with self.assertRaisesRegex(AssertionError, "outside the measured request set"):
@@ -137,6 +217,49 @@ class TestHiddenCaptureBenchmarkHarness(unittest.TestCase):
         # (candidate on/off) / (baseline on/off) = (99/100)/(102/100)
         did = versions._geomean_ratio_pct([(99 * 100, 100 * 102)])
         self.assertTrue(math.isclose(did, -2.941176470588236, abs_tol=1e-12))
+
+    def test_fixed_gpu_summary_compares_capture_pairs_without_missing_swaps(self):
+        def row(value):
+            return {
+                "bench": {metric: value for metric in versions.COMMON_METRICS},
+                "measured_request_set": {"fingerprint": {"sha256": "requests"}},
+                "outer_warmup_request_set": {"fingerprint": {"sha256": "warmup"}},
+            }
+
+        attempts = []
+        for gpu, label, capture, value in (
+            ("0", "v5", False, 100.0),
+            ("0", "v5", True, 99.0),
+            ("0", "v6", True, 98.0),
+            ("0", "v6", False, 100.0),
+        ):
+            attempts.append(
+                {
+                    "attempt_id": f"{gpu}-{label}-{capture}",
+                    "cell": "v1_short_low",
+                    "gpu": gpu,
+                    "version_label": label,
+                    "capture": capture,
+                    "row": row(value),
+                    "row_gate_failures": [],
+                }
+            )
+        summary = versions.summarize_attempts(
+            attempts,
+            ("v5", "v6"),
+            ("v1_short_low",),
+            scheduling_mode="fixed-cell-gpu",
+        )
+        cell = summary["cells"]["v1_short_low"]
+        metric = cell["metrics"]["request_throughput"]
+        self.assertTrue(cell["comparable"])
+        self.assertIsNone(metric["crossed_geomean"])
+        self.assertAlmostEqual(
+            metric["aggregate_geomean"]["baseline_capture_cost_pct"], -1.0
+        )
+        self.assertAlmostEqual(
+            metric["aggregate_geomean"]["candidate_capture_cost_pct"], -2.0
+        )
 
 
 if __name__ == "__main__":
