@@ -86,6 +86,7 @@ COMMON_METRICS = (
     "p99_e2e_latency_ms",
     "accept_length",
 )
+EXPECTED_PROGRESS_PROBES_PER_BOUNDARY = 2
 
 
 def _sha256(path: Path) -> str:
@@ -303,6 +304,16 @@ def _row_gate(
         failures.append("missing measured process resource samples")
     if not isinstance(process_resources.get("host_net_pernic_delta"), dict):
         failures.append("missing per-NIC network readback")
+    progress_probes = row.get("capture_progress_probes") or {}
+    for stage in ("pre_measurement", "post_measurement"):
+        probes = progress_probes.get(stage) or []
+        if len(probes) != EXPECTED_PROGRESS_PROBES_PER_BOUNDARY:
+            failures.append(
+                f"{stage} progress probes={len(probes)} "
+                f"expected={EXPECTED_PROGRESS_PROBES_PER_BOUNDARY}"
+            )
+        elif any(probe.get("status_code") != 200 for probe in probes):
+            failures.append(f"{stage} progress probe failed: {probes}")
     outer_warmup = row.get("outer_warmup_request_set") or {}
     if outer_warmup.get("completed") != outer_warmup.get("requested"):
         failures.append(

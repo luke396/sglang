@@ -145,6 +145,23 @@ class TestHiddenCaptureBenchmarkHarness(unittest.TestCase):
             self.assertEqual(snapshot["count"], 2)
             self.assertTrue(drained)
 
+    def test_progress_probes_advance_both_overlap_slots(self):
+        response = mock.Mock(status_code=200)
+        with (
+            mock.patch.object(matrix, "SERVER_URL", "http://server"),
+            mock.patch.object(matrix.requests, "get", return_value=response) as get,
+        ):
+            probes = matrix._run_capture_progress_probes("pre_measurement")
+        self.assertEqual(len(probes), 2)
+        self.assertTrue(all(probe["status_code"] == 200 for probe in probes))
+        self.assertEqual(
+            get.call_args_list,
+            [
+                mock.call("http://server/health_generate", timeout=30),
+                mock.call("http://server/health_generate", timeout=30),
+            ],
+        )
+
     def test_coverage_fails_closed_on_contamination(self):
         with self.assertRaisesRegex(AssertionError, "outside the measured request set"):
             matrix._validated_export_coverage(
@@ -158,8 +175,9 @@ class TestHiddenCaptureBenchmarkHarness(unittest.TestCase):
 
     def test_version_suite_requires_one_numeric_visible_gpu(self):
         for value in ("", "0,1", "GPU-deadbeef"):
-            with self.subTest(value=value), mock.patch.dict(
-                os.environ, {"CUDA_VISIBLE_DEVICES": value}
+            with (
+                self.subTest(value=value),
+                mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": value}),
             ):
                 with self.assertRaisesRegex(
                     SystemExit, "exactly one numeric physical GPU"
@@ -194,6 +212,10 @@ class TestHiddenCaptureBenchmarkHarness(unittest.TestCase):
             "process_resources": {
                 "samples": [{"elapsed_s": 0.0}],
                 "host_net_pernic_delta": {},
+            },
+            "capture_progress_probes": {
+                stage: [{"status_code": 200}, {"status_code": 200}]
+                for stage in ("pre_measurement", "post_measurement")
             },
             "gpu_process_settled": True,
             "gpu_process_introduced_after_cleanup": [],

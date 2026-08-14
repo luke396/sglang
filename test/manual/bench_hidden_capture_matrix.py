@@ -121,6 +121,10 @@ MANIFEST_EXACT_QUIET_POLLS = 2
 ACCESS_LOG_POLL_S = 0.1
 ACCESS_LOG_QUIET_POLLS = 5
 ACCESS_LOG_TIMEOUT_S = 5.0
+# The overlap scheduler retains results for two iterations.  Two generated
+# health checks advance those slots but are explicitly excluded from export by
+# HiddenStatesCapturer.collect_batch_at_finish (HEALTH_CHECK_RID_PREFIX).
+CAPTURE_PROGRESS_PROBES = 2
 
 # Set per-shard in main(); defaults for shard 0.
 MASTER_PORT = BASE_MASTER_PORT
@@ -390,6 +394,29 @@ def _wait_for_completed_generate_quiet(
         f"request count: minimum={minimum_count}, observed={previous}, "
         f"history={history}"
     )
+
+
+def _run_capture_progress_probes(stage):
+    """Advance delayed finish hooks without adding capture samples."""
+    results = []
+    for index in range(CAPTURE_PROGRESS_PROBES):
+        started = time.monotonic()
+        response = requests.get(SERVER_URL + "/health_generate", timeout=30)
+        elapsed_s = time.monotonic() - started
+        results.append(
+            {
+                "stage": stage,
+                "index": index,
+                "status_code": response.status_code,
+                "elapsed_s": elapsed_s,
+            }
+        )
+        if response.status_code != 200:
+            raise AssertionError(
+                f"capture progress probe failed: stage={stage}, index={index}, "
+                f"status={response.status_code}, body={response.text[:200]!r}"
+            )
+    return results
 
 
 def _drain_manifest(
@@ -1036,6 +1063,9 @@ def run_cell(cell, repeat_idx, attempt_name):
         non_warmup_generate_requests = (
             pre_measurement_generate_requests - warmup_completed
         )
+        pre_measurement_progress_probes = _run_capture_progress_probes(
+            "pre_measurement"
+        )
         if cell["prefix"] == "cold":
             requests.post(SERVER_URL + "/flush_cache", timeout=30)
         if cell["capture"]:
@@ -1084,6 +1114,9 @@ def run_cell(cell, repeat_idx, attempt_name):
                 GpuMemSampler() as drain_mem,
                 ProcessResourceSampler(process.pid) as drain_resources,
             ):
+                post_measurement_progress_probes = _run_capture_progress_probes(
+                    "post_measurement"
+                )
                 (
                     manifest_final,
                     measured_drain,
@@ -1100,6 +1133,9 @@ def run_cell(cell, repeat_idx, attempt_name):
                 after_stats = _sum_capture_stats(after_snapshots)
                 counter_delta = _counter_delta(after_stats, before_stats)
         else:
+            post_measurement_progress_probes = _run_capture_progress_probes(
+                "post_measurement"
+            )
             drain_mem = None
             drain_resources = None
             manifest_final = None
@@ -1154,6 +1190,10 @@ def run_cell(cell, repeat_idx, attempt_name):
                 drain_resources.summary() if drain_resources is not None else None
             ),
             "capture_state_samples": capture_sampler.samples,
+            "capture_progress_probes": {
+                "pre_measurement": pre_measurement_progress_probes,
+                "post_measurement": post_measurement_progress_probes,
+            },
             "store_id": run_store_id if cell["capture"] else None,
             "stdout_path": log_file.name,
             "stderr_path": err_file.name,
