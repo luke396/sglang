@@ -304,6 +304,10 @@ class TestHiddenCaptureBenchmarkHarness(unittest.TestCase):
             "bench": {metric: 1.0 for metric in versions.COMMON_METRICS},
             "measured_request_set": {"fingerprint": {"sha256": "requests"}},
             "outer_warmup_request_set": {"fingerprint": {"sha256": "warmup"}},
+            "driver_source": {
+                "git_revision": "measurement-driver",
+                "worktree_dirty": False,
+            },
         }
         attempts = [
             {
@@ -327,6 +331,36 @@ class TestHiddenCaptureBenchmarkHarness(unittest.TestCase):
         self.assertTrue(
             any("missing arms" in failure for failure in cell["gate_failures"])
         )
+        candidate_row = {
+            **row,
+            "driver_source": {
+                "git_revision": "different-driver",
+                "worktree_dirty": False,
+            },
+        }
+        attempts.append(
+            {
+                "attempt_id": "candidate-reference",
+                "cell": "v1_short_low",
+                "gpu": "0",
+                "version_label": "v6",
+                "capture": False,
+                "row": candidate_row,
+                "row_gate_failures": [],
+            }
+        )
+        summary = versions.summarize_attempts(
+            attempts,
+            ("stock", "v6"),
+            ("v1_short_low",),
+            required_arms=(("stock", False), ("v6", False)),
+        )
+        self.assertTrue(
+            any(
+                "measurement driver revisions differ" in failure
+                for failure in summary["cells"]["v1_short_low"]["gate_failures"]
+            )
+        )
 
     def test_diagnosis_summary_does_not_expand_to_frozen_full_suite(self):
         summary = versions.summarize_attempts(
@@ -346,6 +380,10 @@ class TestHiddenCaptureBenchmarkHarness(unittest.TestCase):
                 "bench": {metric: value for metric in versions.COMMON_METRICS},
                 "measured_request_set": {"fingerprint": {"sha256": "requests"}},
                 "outer_warmup_request_set": {"fingerprint": {"sha256": "warmup"}},
+                "driver_source": {
+                    "git_revision": "measurement-driver",
+                    "worktree_dirty": False,
+                },
             }
 
         attempts = []

@@ -560,6 +560,7 @@ def _load_candidate_off_references(
     candidate: dict,
     cells: tuple[str, ...],
     cell_gpus: dict[str, str],
+    expected_driver_revision: str | None = None,
 ) -> tuple[list[dict], dict]:
     """Select one exact same-GPU candidate/off row per scheduled cell.
 
@@ -604,6 +605,18 @@ def _load_candidate_off_references(
         else:
             if row.get("cell", {}).get("capture") is not False:
                 failures.append("source row is not capture-off")
+            driver_source = row.get("driver_source") or {}
+            if (
+                expected_driver_revision
+                and driver_source.get("git_revision") != expected_driver_revision
+            ):
+                failures.append(
+                    "source measurement driver revision="
+                    f"{driver_source.get('git_revision')} "
+                    f"expected={expected_driver_revision}"
+                )
+            if driver_source.get("worktree_dirty"):
+                failures.append("source measurement driver is dirty")
             failures.extend(
                 _row_gate(
                     row,
@@ -719,6 +732,20 @@ def summarize_attempts(
                 "outer warmup request fingerprints differ: "
                 f"{sorted(outer_warmup_fingerprints)}"
             )
+        driver_revisions = {
+            (row.get("driver_source") or {}).get("git_revision")
+            for row in rows.values()
+        }
+        driver_revisions.discard(None)
+        if len(driver_revisions) != 1:
+            failures.append(
+                f"measurement driver revisions differ: {sorted(driver_revisions)}"
+            )
+        if any(
+            (row.get("driver_source") or {}).get("worktree_dirty")
+            for row in rows.values()
+        ):
+            failures.append("a measurement driver source is dirty")
         planned_gpus = sorted({str(attempt["gpu"]) for attempt in cell_attempts})
         expected_keys = {
             (gpu, label, capture)
@@ -741,6 +768,7 @@ def summarize_attempts(
             "outer_warmup_fingerprint_sha256": next(
                 iter(outer_warmup_fingerprints), None
             ),
+            "measurement_driver_revision": next(iter(driver_revisions), None),
             "metrics": {},
             "coverage": {},
             "resources": {},
@@ -877,6 +905,14 @@ def main() -> int:
     parser.add_argument("--candidate-root", required=True)
     parser.add_argument("--candidate-revision", required=True)
     parser.add_argument("--candidate-label", default="candidate")
+    parser.add_argument(
+        "--matrix-driver-root",
+        default=None,
+        help=(
+            "clean worktree supplying the matrix script and benchmark client; "
+            "use the exact prior driver when reusing candidate evidence"
+        ),
+    )
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--gpus", default="0,1")
     parser.add_argument("--numa-node", type=int, default=None)
@@ -909,8 +945,12 @@ def main() -> int:
     opts = parser.parse_args()
 
     driver_root = Path(__file__).resolve().parents[2]
-    matrix_script = driver_root / "test/manual/bench_hidden_capture_matrix.py"
     driver = _git_identity(driver_root)
+    measurement_driver_root = Path(opts.matrix_driver_root or driver_root).resolve()
+    measurement_driver = _git_identity(measurement_driver_root)
+    matrix_script = (
+        measurement_driver_root / "test/manual/bench_hidden_capture_matrix.py"
+    )
     baseline = {
         **_git_identity(Path(opts.baseline_root)),
         "label": opts.baseline_label,
@@ -941,6 +981,11 @@ def main() -> int:
             raise SystemExit(f"{identity['label']} worktree is dirty: {identity}")
     if driver["dirty"]:
         raise SystemExit(f"driver worktree must be committed and clean: {driver}")
+    if measurement_driver["dirty"]:
+        raise SystemExit(
+            "measurement driver worktree must be committed and clean: "
+            f"{measurement_driver}"
+        )
 
     gpus = tuple(part.strip() for part in opts.gpus.split(",") if part.strip())
     if (
@@ -991,6 +1036,7 @@ def main() -> int:
         "selected_cells": list(cells),
         "formal_full_suite": cells == SUITE_CELLS,
         "driver": driver,
+        "measurement_driver": measurement_driver,
         "driver_script": {
             "path": str(Path(__file__).resolve()),
             "sha256": _sha256(Path(__file__).resolve()),
@@ -1046,6 +1092,7 @@ def main() -> int:
             candidate=candidate,
             cells=cells,
             cell_gpus=cell_gpus,
+            expected_driver_revision=measurement_driver["revision"],
         )
         attempts.extend(references)
         required_arms = (
@@ -1076,7 +1123,7 @@ def main() -> int:
             artifacts = attempt_dir / "raw"
             command, env = _build_command(
                 matrix_script=matrix_script,
-                driver_root=driver_root,
+                driver_root=measurement_driver_root,
                 revision=revision,
                 capture=capture,
                 cell=cell,
@@ -1100,7 +1147,7 @@ def main() -> int:
                     "version_label": revision["label"],
                     "revision": revision["revision"],
                     "capture": capture,
-                    "driver_root": str(driver_root),
+                    "driver_root": str(measurement_driver_root),
                     "command": command,
                     "command_shell": shlex.join(command),
                     "env": env,
