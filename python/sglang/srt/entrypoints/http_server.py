@@ -798,6 +798,28 @@ async def server_info():
             "startup_time": _global_state.tokenizer_manager.startup_time,
             "internal_states": internal_states,
             "version": __version__,
+            "draft_weight_update": {
+                "unhealthy": bool(
+                    getattr(
+                        _global_state.tokenizer_manager,
+                        "draft_weight_update_unhealthy",
+                        False,
+                    )
+                ),
+                "reason": getattr(
+                    _global_state.tokenizer_manager,
+                    "draft_weight_update_unhealthy_reason",
+                    None,
+                ),
+                "update_id": getattr(
+                    _global_state.tokenizer_manager,
+                    "draft_weight_update_unhealthy_id",
+                    None,
+                ),
+                "paused": bool(
+                    getattr(_global_state.tokenizer_manager, "is_pause", False)
+                ),
+            },
             # Structured KV-event publisher descriptor for KV-aware routers.
             # `None` when publishing is disabled or misconfigured; see
             # `ServerArgs.describe_kv_events_publisher` for the precise contract.
@@ -1360,13 +1382,28 @@ async def update_weights_from_tensor(
     3. Any binary data in the named tensors should be base64 encoded.
     """
 
-    success, message = await _global_state.tokenizer_manager.update_weights_from_tensor(
+    result = await _global_state.tokenizer_manager.update_weights_from_tensor_detailed(
         obj, request
     )
-
-    content = {"success": success, "message": message}
     return ORJSONResponse(
-        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+        result.http_content(),
+        status_code=200 if result.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.post("/update_weights_from_tensor_atomic")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def update_weights_from_tensor_atomic(
+    obj: Annotated[UpdateWeightsFromTensorReqInput, Body()], request: Request
+):
+    """CPU-stage, pause, commit in place, and resume as one shielded operation."""
+
+    result = await _global_state.tokenizer_manager.update_weights_from_tensor_atomic(
+        obj, request
+    )
+    return ORJSONResponse(
+        result.http_content(),
+        status_code=200 if result.success else HTTPStatus.BAD_REQUEST,
     )
 
 
@@ -1681,9 +1718,17 @@ async def continue_generation(
     obj: Annotated[ContinueGenerationReqInput, Body()], request: Request
 ):
     """Continue generation."""
-    await _global_state.tokenizer_manager.continue_generation(obj)
+    result = await _global_state.tokenizer_manager.continue_generation(obj)
+    if isinstance(result, tuple) and not result[0]:
+        return ORJSONResponse(
+            content={"message": result[1], "status": "unhealthy"},
+            status_code=HTTPStatus.CONFLICT,
+        )
+    message = (
+        result[1] if isinstance(result, tuple) else "Generation continued successfully."
+    )
     return ORJSONResponse(
-        content={"message": "Generation continued successfully.", "status": "ok"},
+        content={"message": message, "status": "ok"},
         status_code=200,
     )
 

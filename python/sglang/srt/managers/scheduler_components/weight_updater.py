@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import logging
+import os
 import time
 import traceback
 from contextlib import contextmanager
@@ -72,6 +74,19 @@ def _merge_checksum_payloads(target: Dict, draft: Dict) -> Dict:
     return target
 
 
+def _process_rss_bytes() -> int:
+    with open("/proc/self/statm") as statm:
+        resident_pages = int(statm.read().split()[1])
+    return resident_pages * os.sysconf("SC_PAGE_SIZE")
+
+
+@dataclass(slots=True)
+class _StagedTensorUpdate:
+    future: Optional[concurrent.futures.Future]
+    request: UpdateWeightsFromTensorReqInput
+    scheduler_rss_before_bytes: int
+
+
 @dataclass(kw_only=True, slots=True)
 class SchedulerWeightUpdaterManager:
     tp_worker: Any
@@ -84,6 +99,15 @@ class SchedulerWeightUpdaterManager:
     metrics_collector: Optional[Any] = None
     offload_tags: set = field(default_factory=set)
     stashed_model_static_state: Any = None
+    tensor_stage_executor: concurrent.futures.ThreadPoolExecutor = field(
+        default_factory=lambda: concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="sglang-weight-stage"
+        ),
+        repr=False,
+    )
+    staged_tensor_updates: Dict[str, _StagedTensorUpdate] = field(
+        default_factory=dict, repr=False
+    )
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -163,30 +187,235 @@ class SchedulerWeightUpdaterManager:
                 success=success, message=message
             )
 
-    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
-        """Update the online model parameter from tensors."""
-        with self._observe_weight_load("tensor"):
-            if recv_req.draft_only and recv_req.disable_draft_model:
-                success = False
-                message = "draft_only and disable_draft_model are mutually exclusive."
-                worker = None
-            elif recv_req.draft_only and self.draft_worker is None:
-                success = False
-                message = "draft_only weight update requires a speculative draft model."
-                worker = None
-            elif recv_req.disable_draft_model:
-                worker = self.tp_worker
-            else:
-                worker = self.draft_worker or self.tp_worker
+    def _select_tensor_update_worker(
+        self, recv_req: UpdateWeightsFromTensorReqInput
+    ) -> Tuple[Optional[Any], Optional[str]]:
+        if recv_req.draft_only and recv_req.disable_draft_model:
+            return None, "draft_only and disable_draft_model are mutually exclusive."
+        if recv_req.draft_only and self.draft_worker is None:
+            return None, "draft_only weight update requires a speculative draft model."
+        if recv_req.disable_draft_model:
+            return self.tp_worker, None
+        return self.draft_worker or self.tp_worker, None
 
-            if worker is not None:
+    @staticmethod
+    def _prepare_tensor_update_in_background(worker, recv_req):
+        started = time.perf_counter()
+        staged = worker.prepare_weights_from_tensor(recv_req)
+        staged.phase_timings_ms["background_stage_wall_ms"] = (
+            time.perf_counter() - started
+        ) * 1000
+        return staged
+
+    def _handle_staged_tensor_update(
+        self,
+        worker,
+        recv_req: UpdateWeightsFromTensorReqInput,
+    ) -> UpdateWeightsFromTensorReqOutput:
+        update_id = recv_req.update_id
+        if not recv_req.draft_only:
+            return UpdateWeightsFromTensorReqOutput(
+                success=False,
+                message="staged tensor updates currently require draft_only=true.",
+                update_id=update_id,
+            )
+        if not update_id:
+            return UpdateWeightsFromTensorReqOutput(
+                success=False,
+                message=f"operation={recv_req.operation!r} requires update_id.",
+            )
+
+        if recv_req.operation == "stage":
+            if update_id in self.staged_tensor_updates:
+                return UpdateWeightsFromTensorReqOutput(
+                    success=False,
+                    message=f"staged tensor update {update_id!r} already exists.",
+                    update_id=update_id,
+                )
+            rss_before = _process_rss_bytes()
+            dispatch_started = time.perf_counter()
+            future = self.tensor_stage_executor.submit(
+                self._prepare_tensor_update_in_background, worker, recv_req
+            )
+            self.staged_tensor_updates[update_id] = _StagedTensorUpdate(
+                future=future,
+                request=recv_req,
+                scheduler_rss_before_bytes=rss_before,
+            )
+            return UpdateWeightsFromTensorReqOutput(
+                success=True,
+                message="CPU tensor staging started.",
+                update_id=update_id,
+                staging_state="pending",
+                phase_timings_ms={
+                    "stage_dispatch_ms": (time.perf_counter() - dispatch_started) * 1000
+                },
+                host_memory_bytes={"scheduler_rss_before_stage_bytes": rss_before},
+            )
+
+        record = self.staged_tensor_updates.get(update_id)
+        if record is None or record.future is None:
+            return UpdateWeightsFromTensorReqOutput(
+                success=False,
+                message=f"unknown staged tensor update {update_id!r}.",
+                update_id=update_id,
+            )
+
+        if recv_req.operation == "discard":
+            record.future.cancel()
+            self.staged_tensor_updates.pop(update_id, None)
+            record.future = None
+            return UpdateWeightsFromTensorReqOutput(
+                success=True,
+                message="CPU staged tensor update discarded.",
+                update_id=update_id,
+                host_memory_bytes={
+                    "scheduler_rss_after_release_bytes": _process_rss_bytes()
+                },
+            )
+
+        if not record.future.done():
+            return UpdateWeightsFromTensorReqOutput(
+                success=True,
+                message="CPU tensor staging is still running.",
+                update_id=update_id,
+                staging_state="pending",
+                host_memory_bytes={
+                    "scheduler_rss_before_stage_bytes": (
+                        record.scheduler_rss_before_bytes
+                    ),
+                    "scheduler_rss_current_bytes": _process_rss_bytes(),
+                },
+            )
+
+        stage_error = record.future.exception()
+        if stage_error is not None:
+            return UpdateWeightsFromTensorReqOutput(
+                success=False,
+                message=f"CPU tensor staging failed: {stage_error}",
+                update_id=update_id,
+                staging_state="failed",
+                host_memory_bytes={
+                    "scheduler_rss_before_stage_bytes": (
+                        record.scheduler_rss_before_bytes
+                    ),
+                    "scheduler_rss_current_bytes": _process_rss_bytes(),
+                },
+            )
+
+        staged = record.future.result()
+        host_memory = dict(staged.host_memory_bytes)
+        host_memory.update(
+            {
+                "scheduler_rss_before_stage_bytes": record.scheduler_rss_before_bytes,
+                "scheduler_rss_after_stage_bytes": _process_rss_bytes(),
+            }
+        )
+        if recv_req.operation == "status":
+            return UpdateWeightsFromTensorReqOutput(
+                success=True,
+                message="CPU tensor staging is ready.",
+                update_id=update_id,
+                staging_state="ready",
+                phase_timings_ms=dict(staged.phase_timings_ms),
+                host_memory_bytes=host_memory,
+            )
+        if recv_req.operation != "commit":
+            return UpdateWeightsFromTensorReqOutput(
+                success=False,
+                message=f"unsupported staged tensor operation {recv_req.operation!r}.",
+                update_id=update_id,
+            )
+
+        phase_timings: Dict[str, float] = {}
+        update_status: Dict[str, Any] = {}
+        try:
+            success, message = worker.apply_prepared_weights_from_tensor(
+                staged,
+                record.request,
+                phase_timings_ms=phase_timings,
+                update_status=update_status,
+            )
+        except BaseException as error:
+            success = False
+            message = f"Staged tensor commit failed: {error}"
+            update_status["partial_update"] = True
+
+        barrier_started = time.perf_counter()
+        torch.distributed.barrier(group=self.tp_cpu_group)
+        phase_timings["rank_barrier_ms"] = (
+            time.perf_counter() - barrier_started
+        ) * 1000
+        self.staged_tensor_updates.pop(update_id, None)
+        record.future = None
+        del staged
+        host_memory["scheduler_rss_after_release_bytes"] = _process_rss_bytes()
+        if not success:
+            logger.error(message)
+        return UpdateWeightsFromTensorReqOutput(
+            success=success,
+            message=message,
+            update_id=update_id,
+            partial_update=bool(update_status.get("partial_update", False)),
+            phase_timings_ms=phase_timings,
+            host_memory_bytes=host_memory,
+        )
+
+    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
+        """Update model tensors or manage an additive CPU-staged transaction."""
+        with self._observe_weight_load("tensor"):
+            worker, routing_error = self._select_tensor_update_worker(recv_req)
+            if routing_error is not None:
+                barrier_started = time.perf_counter()
+                torch.distributed.barrier(group=self.tp_cpu_group)
+                return UpdateWeightsFromTensorReqOutput(
+                    success=False,
+                    message=routing_error,
+                    update_id=recv_req.update_id,
+                    phase_timings_ms={
+                        "rank_barrier_ms": (time.perf_counter() - barrier_started)
+                        * 1000
+                    },
+                )
+            assert worker is not None
+
+            if recv_req.operation != "apply":
+                return self._handle_staged_tensor_update(worker, recv_req)
+
+            phase_timings: Dict[str, float] = {}
+            update_status: Dict[str, Any] = {}
+            try:
+                success, message = worker.update_weights_from_tensor(
+                    recv_req,
+                    phase_timings_ms=phase_timings,
+                    update_status=update_status,
+                )
+            except TypeError as error:
+                # Preserve non-draft legacy workers that have not opted into the
+                # additive timing kwargs.
+                if recv_req.draft_only:
+                    raise
                 success, message = worker.update_weights_from_tensor(recv_req)
+            except BaseException as error:
+                success = False
+                message = f"Tensor update raised unexpectedly: {error}"
+                update_status["partial_update"] = True
             if success and not recv_req.draft_only:
                 self.flush_cache_after_weight_update(recv_req)
             elif not success:
                 logger.error(message)
+            barrier_started = time.perf_counter()
             torch.distributed.barrier(group=self.tp_cpu_group)
-            return UpdateWeightsFromTensorReqOutput(success=success, message=message)
+            phase_timings["rank_barrier_ms"] = (
+                time.perf_counter() - barrier_started
+            ) * 1000
+            return UpdateWeightsFromTensorReqOutput(
+                success=success,
+                message=message,
+                update_id=recv_req.update_id,
+                partial_update=bool(update_status.get("partial_update", False)),
+                phase_timings_ms=phase_timings,
+            )
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""

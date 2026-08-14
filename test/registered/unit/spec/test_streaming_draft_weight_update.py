@@ -57,7 +57,7 @@ class TestStreamingWeightUpdater(unittest.TestCase):
             current_stream=MagicMock(return_value=stream),
         )
         get_device_module.return_value = device_module
-        unwrap_tensor.side_effect = lambda tensor, **_: f"device-{tensor}"
+        unwrap_tensor.side_effect = lambda tensor, **_: f"device-{int(tensor.item())}"
 
         class SinglePassModel:
             def __init__(self):
@@ -89,7 +89,11 @@ class TestStreamingWeightUpdater(unittest.TestCase):
         )
 
         success, _ = updater.update_weights_from_tensor(
-            named_tensors=[("a", "one"), ("b", "two"), ("c", "three")],
+            named_tensors=[
+                ("a", torch.tensor(1)),
+                ("b", torch.tensor(2)),
+                ("c", torch.tensor(3)),
+            ],
             stream_tensors=True,
         )
 
@@ -98,7 +102,7 @@ class TestStreamingWeightUpdater(unittest.TestCase):
         self.assertEqual(model.materialized_counts, [1, 2])
         self.assertEqual(
             model.loaded,
-            [("a", "device-one"), ("c", "device-three")],
+            [("a", "device-1"), ("c", "device-3")],
         )
         stream.synchronize.assert_called_once_with()
 

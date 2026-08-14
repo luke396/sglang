@@ -1735,11 +1735,33 @@ class UpdateWeightsFromTensorReqInput(BaseReq, kw_only=True):
     draft_only: bool = False
     # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
+    # v3 additive control-plane fields. Existing callers keep the default
+    # single-call apply behavior. The atomic HTTP endpoint owns stage/status/
+    # commit and generates update_id; callers should not set those directly.
+    operation: Literal["apply", "stage", "status", "commit", "discard"] = "apply"
+    update_id: Optional[str] = None
+    # The payload already contains the tensor-parallel slice for each rank.
+    # Model loaders must not shard these tensors a second time.
+    tensors_are_pre_sharded: bool = False
+    # Stage CPU tensors in pinned memory before the pause/commit window.
+    pin_memory: bool = False
+    # Explicitly restore a fail-closed instance using a known-good full image.
+    recovery: bool = False
+    # Emit CUDA-event-backed phase timings in the response.
+    collect_phase_timings: bool = False
+    # Test-only fault injection. It is rejected unless the server process was
+    # launched with SGLANG_ENABLE_WEIGHT_UPDATE_FAULT_INJECTION=1.
+    fault_injection_after_tensors: Optional[int] = None
 
 
 class UpdateWeightsFromTensorReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
+    update_id: Optional[str] = None
+    staging_state: Optional[Literal["pending", "ready", "failed"]] = None
+    partial_update: bool = False
+    phase_timings_ms: Dict[str, float] = msgspec.field(default_factory=dict)
+    host_memory_bytes: Dict[str, int] = msgspec.field(default_factory=dict)
 
 
 class InitWeightsSendGroupForRemoteInstanceReqInput(BaseReq, kw_only=True):

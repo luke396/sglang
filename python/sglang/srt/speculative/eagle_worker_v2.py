@@ -1506,7 +1506,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
             grammar_barrier=grammar_barrier,
         )
 
-    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
+    def update_weights_from_tensor(
+        self,
+        recv_req: UpdateWeightsFromTensorReqInput,
+        *,
+        phase_timings_ms=None,
+        update_status=None,
+    ):
+        if recv_req.draft_only:
+            return super().update_weights_from_tensor(
+                recv_req,
+                phase_timings_ms=phase_timings_ms,
+                update_status=update_status,
+            )
         monkey_patch_torch_reductions()
         try:
             named_tensors = MultiprocessingSerializer.deserialize(

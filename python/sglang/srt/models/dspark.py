@@ -9,7 +9,11 @@ from torch import nn
 
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.dflash import DFlashDraftModel
+from sglang.srt.models.dflash import (
+    DFlashDraftModel,
+    _make_validation_parameter,
+    _validate_loaded_weight_dtype,
+)
 from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
 from sglang.srt.speculative.dspark_components.dspark_config import (
     parse_dspark_draft_config,
@@ -405,6 +409,68 @@ class DSparkDraftMixin:
     @staticmethod
     def should_materialize_weight(name: str) -> bool:
         return not any(name.startswith(p) for p in _DSPARK_SKIPPED_WEIGHT_PREFIXES)
+
+    def validate_weights(
+        self,
+        weights: Iterable[Tuple[str, torch.Tensor]],
+        *,
+        tensors_are_pre_sharded: bool = False,
+    ) -> None:
+        """Validate a complete loader pass without mutating active parameters."""
+
+        del tensors_are_pre_sharded  # Loader modules already carry this mode.
+        params_dict = {
+            name: _make_validation_parameter(param)
+            for name, param in self.named_parameters()
+        }
+        loaded_confidence_names = set()
+        seen = set()
+        for name, loaded_weight in weights:
+            if name in seen:
+                raise ValueError(f"duplicate DSpark weight {name!r}")
+            seen.add(name)
+            if any(
+                name.startswith(prefix) for prefix in _DSPARK_SKIPPED_WEIGHT_PREFIXES
+            ):
+                continue
+            if name.startswith("confidence_head."):
+                if self.confidence_head is None:
+                    continue
+                if name not in params_dict:
+                    raise ValueError(
+                        f"DSpark confidence weight {name!r} has no destination parameter"
+                    )
+                param = params_dict[name]
+                _validate_loaded_weight_dtype(name, loaded_weight, param)
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_confidence_names.add(name)
+            elif name.startswith("markov_head."):
+                if name not in params_dict:
+                    raise ValueError(
+                        f"DSpark markov weight {name!r} has no destination parameter"
+                    )
+                param = params_dict[name]
+                _validate_loaded_weight_dtype(name, loaded_weight, param)
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+            else:
+                loaded = self._load_dflash_weight(name, loaded_weight, params_dict)
+                if not loaded and "rotary_emb" not in name:
+                    raise ValueError(
+                        f"unexpected DSpark weight {name!r}; no destination parameter exists"
+                    )
+
+        if self.confidence_head is not None:
+            expected = {
+                name for name in params_dict if name.startswith("confidence_head.")
+            }
+            missing = expected - loaded_confidence_names
+            if missing:
+                raise ValueError(
+                    "DSpark confidence head is enabled but the update is missing "
+                    f"{sorted(missing)}"
+                )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters())

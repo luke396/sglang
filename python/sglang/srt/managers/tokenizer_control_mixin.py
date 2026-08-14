@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import logging
 import time
 import uuid
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import fastapi
@@ -21,6 +23,7 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
+    ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     DetachHiCacheStorageReqInput,
@@ -48,6 +51,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
     OpenSessionReqInput,
+    PauseGenerationReqInput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -86,6 +90,67 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class TensorUpdateControlResult:
+    success: bool
+    message: str
+    update_id: Optional[str] = None
+    partial_update: bool = False
+    unhealthy: bool = False
+    unhealthy_reason: Optional[str] = None
+    staging_state: Optional[str] = None
+    phase_timings_ms: Dict[str, float] = field(default_factory=dict)
+    rank_phase_timings_ms: List[Dict[str, Any]] = field(default_factory=list)
+    rank_host_memory_bytes: List[Dict[str, Any]] = field(default_factory=list)
+
+    def http_content(self) -> Dict[str, Any]:
+        return {
+            "success": self.success,
+            "message": self.message,
+            "update_id": self.update_id,
+            "partial_update": self.partial_update,
+            "unhealthy": self.unhealthy,
+            "unhealthy_reason": self.unhealthy_reason,
+            "staging_state": self.staging_state,
+            "phase_timings_ms": self.phase_timings_ms,
+            "rank_phase_timings_ms": self.rank_phase_timings_ms,
+            "rank_host_memory_bytes": self.rank_host_memory_bytes,
+        }
+
+
+def _merge_tensor_update_outputs(
+    results: List[UpdateWeightsFromTensorReqOutput],
+    *,
+    rank_dispatch_ms: Optional[float] = None,
+) -> TensorUpdateControlResult:
+    success, message = FanOutCommunicator.merge_results(results)
+    phase_keys = {key for result in results for key in result.phase_timings_ms}
+    phases = {
+        key: max(result.phase_timings_ms.get(key, 0.0) for result in results)
+        for key in phase_keys
+    }
+    if rank_dispatch_ms is not None:
+        phases["rank_dispatch_ms"] = rank_dispatch_ms
+    states = {result.staging_state for result in results}
+    return TensorUpdateControlResult(
+        success=success,
+        message=message,
+        update_id=results[0].update_id if results else None,
+        partial_update=any(result.partial_update for result in results),
+        staging_state=states.pop() if len(states) == 1 else None,
+        phase_timings_ms=phases,
+        rank_phase_timings_ms=[
+            {"rank": rank, **result.phase_timings_ms}
+            for rank, result in enumerate(results)
+        ],
+        rank_host_memory_bytes=[
+            {"rank": rank, **result.host_memory_bytes}
+            for rank, result in enumerate(results)
+        ],
+    )
+
 
 # Declarative spec: (attr_name_prefix, response_type[, mode])
 # Each entry creates self.{prefix}_communicator and registers
@@ -494,19 +559,71 @@ class TokenizerControlMixin:
         result = (await self.send_weights_to_remote_instance_communicator(obj))[0]
         return result.success, result.message
 
-    async def update_weights_from_tensor(
+    def _tensor_update_health(self) -> Tuple[bool, Optional[str]]:
+        return (
+            bool(getattr(self, "draft_weight_update_unhealthy", False)),
+            getattr(self, "draft_weight_update_unhealthy_reason", None),
+        )
+
+    def _mark_tensor_update_unhealthy(self, reason: str, update_id: Optional[str]):
+        self.draft_weight_update_unhealthy = True
+        self.draft_weight_update_unhealthy_reason = reason
+        self.draft_weight_update_unhealthy_id = update_id
+
+    def _clear_tensor_update_unhealthy(self):
+        self.draft_weight_update_unhealthy = False
+        self.draft_weight_update_unhealthy_reason = None
+        self.draft_weight_update_unhealthy_id = None
+
+    async def _dispatch_tensor_update(
+        self,
+        obj: UpdateWeightsFromTensorReqInput,
+    ) -> TensorUpdateControlResult:
+        dispatch_started = time.perf_counter()
+        results = await self.update_weights_from_tensor_communicator(obj)
+        return _merge_tensor_update_outputs(
+            results,
+            rank_dispatch_ms=(time.perf_counter() - dispatch_started) * 1000,
+        )
+
+    async def update_weights_from_tensor_detailed(
         self: TokenizerManager,
         obj: UpdateWeightsFromTensorReqInput,
         request: Optional[fastapi.Request] = None,
-    ) -> Tuple[bool, str]:
+    ) -> TensorUpdateControlResult:
+        """Legacy apply endpoint with enforced fail-closed draft semantics."""
+
+        del request
         self.auto_create_handle_loop()
         assert (
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
+        if obj.operation != "apply":
+            return TensorUpdateControlResult(
+                success=False,
+                message="stage/status/commit/discard are internal to the atomic endpoint.",
+            )
+        unhealthy, unhealthy_reason = self._tensor_update_health()
+        if unhealthy and not obj.recovery:
+            return TensorUpdateControlResult(
+                success=False,
+                message=(
+                    "Draft weight updates are fail-closed; explicitly restore known-good "
+                    f"tensors with recovery=true first. Cause: {unhealthy_reason}"
+                ),
+                unhealthy=True,
+                unhealthy_reason=unhealthy_reason,
+            )
+        if obj.recovery and not obj.draft_only:
+            return TensorUpdateControlResult(
+                success=False,
+                message="recovery=true requires draft_only=true.",
+                unhealthy=unhealthy,
+                unhealthy_reason=unhealthy_reason,
+            )
 
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
-
         obj.serialized_named_tensors = normalize_serialized_named_tensor_payloads(
             obj.serialized_named_tensors
         )
@@ -514,18 +631,221 @@ class TokenizerControlMixin:
         async with self.is_pause_cond:
             is_paused = self.is_pause
             if is_paused:
-                results = await self.update_weights_from_tensor_communicator(obj)
-
+                result = await self._dispatch_tensor_update(obj)
         if not is_paused:
             async with self.model_update_lock.writer_lock:
-                results = await self.update_weights_from_tensor_communicator(obj)
+                result = await self._dispatch_tensor_update(obj)
 
-        success, message = FanOutCommunicator.merge_results(results)
-        if success and obj.weight_version is not None:
+        if result.success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
-            message += f" Weight version updated to {obj.weight_version}."
+            result.message += f" Weight version updated to {obj.weight_version}."
+        if obj.draft_only and not result.success:
+            self._mark_tensor_update_unhealthy(result.message, result.update_id)
+            if not is_paused:
+                await self.pause_generation(PauseGenerationReqInput(mode="in_place"))
+        elif obj.draft_only and obj.recovery and result.success:
+            self._clear_tensor_update_unhealthy()
 
-        return success, message
+        unhealthy, unhealthy_reason = self._tensor_update_health()
+        result.unhealthy = unhealthy
+        result.unhealthy_reason = unhealthy_reason
+        return result
+
+    async def update_weights_from_tensor(
+        self: TokenizerManager,
+        obj: UpdateWeightsFromTensorReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        result = await self.update_weights_from_tensor_detailed(obj, request)
+        return result.success, result.message
+
+    async def _atomic_tensor_update_impl(
+        self: TokenizerManager,
+        obj: UpdateWeightsFromTensorReqInput,
+    ) -> TensorUpdateControlResult:
+        atomic_started = time.perf_counter()
+        if not obj.draft_only:
+            return TensorUpdateControlResult(
+                success=False,
+                message="Atomic CPU-staged updates currently require draft_only=true.",
+            )
+        if obj.operation != "apply":
+            return TensorUpdateControlResult(
+                success=False,
+                message="Atomic callers must leave operation at its default apply value.",
+            )
+        unhealthy, unhealthy_reason = self._tensor_update_health()
+        if unhealthy and not obj.recovery:
+            return TensorUpdateControlResult(
+                success=False,
+                message=(
+                    "Draft weight updates are fail-closed; use recovery=true with a "
+                    f"known-good image. Cause: {unhealthy_reason}"
+                ),
+                unhealthy=True,
+                unhealthy_reason=unhealthy_reason,
+            )
+        if obj.abort_all_requests:
+            self.abort_request(abort_all=True)
+
+        obj.serialized_named_tensors = normalize_serialized_named_tensor_payloads(
+            obj.serialized_named_tensors
+        )
+        update_id = obj.update_id or str(uuid.uuid4())
+        stage_req = copy.copy(obj)
+        stage_req.operation = "stage"
+        stage_req.update_id = update_id
+        stage_req.pin_memory = True
+        stage_req.collect_phase_timings = True
+        stage_req.weight_version = None
+        stage_result: Optional[TensorUpdateControlResult] = None
+        paused_by_atomic = False
+
+        async def discard_stage():
+            discard_req = copy.copy(stage_req)
+            discard_req.operation = "discard"
+            discard_req.serialized_named_tensors = []
+            try:
+                await self._dispatch_tensor_update(discard_req)
+            except BaseException:
+                logger.exception("Failed to discard CPU staged update %s", update_id)
+
+        async def fail_closed(result: TensorUpdateControlResult):
+            nonlocal paused_by_atomic
+            await discard_stage()
+            self._mark_tensor_update_unhealthy(result.message, update_id)
+            if not self.is_pause:
+                await self.pause_generation(PauseGenerationReqInput(mode="in_place"))
+                paused_by_atomic = True
+            result.update_id = update_id
+            result.unhealthy = True
+            result.unhealthy_reason = result.message
+            result.phase_timings_ms["atomic_total_ms"] = (
+                time.perf_counter() - atomic_started
+            ) * 1000
+            return result
+
+        try:
+            stage_dispatch_started = time.perf_counter()
+            stage_result = await self._dispatch_tensor_update(stage_req)
+            stage_dispatch_ms = (time.perf_counter() - stage_dispatch_started) * 1000
+            if not stage_result.success:
+                return await fail_closed(stage_result)
+
+            stage_wait_started = time.perf_counter()
+            stage_deadline = stage_wait_started + 300.0
+            while True:
+                status_req = copy.copy(stage_req)
+                status_req.operation = "status"
+                status_req.serialized_named_tensors = []
+                stage_result = await self._dispatch_tensor_update(status_req)
+                if not stage_result.success:
+                    return await fail_closed(stage_result)
+                if stage_result.staging_state == "ready":
+                    break
+                if time.perf_counter() >= stage_deadline:
+                    return await fail_closed(
+                        TensorUpdateControlResult(
+                            success=False,
+                            message="CPU tensor staging timed out after 300 seconds.",
+                            update_id=update_id,
+                        )
+                    )
+                await asyncio.sleep(0.002)
+            cpu_stage_wait_ms = (time.perf_counter() - stage_wait_started) * 1000
+
+            pause_window_started = time.perf_counter()
+            pause_started = time.perf_counter()
+            if not self.is_pause:
+                await self.pause_generation(PauseGenerationReqInput(mode="in_place"))
+                paused_by_atomic = True
+            pause_dispatch_ms = (time.perf_counter() - pause_started) * 1000
+
+            commit_req = copy.copy(stage_req)
+            commit_req.operation = "commit"
+            commit_req.serialized_named_tensors = []
+            commit_result = await self._dispatch_tensor_update(commit_req)
+            if not commit_result.success:
+                commit_result.phase_timings_ms.update(
+                    {
+                        "stage_dispatch_ms": stage_dispatch_ms,
+                        "cpu_stage_wait_ms": cpu_stage_wait_ms,
+                        "pause_dispatch_ms": pause_dispatch_ms,
+                        "pause_window_ms": (time.perf_counter() - pause_window_started)
+                        * 1000,
+                    }
+                )
+                return await fail_closed(commit_result)
+
+            if obj.weight_version is not None:
+                self._update_weight_version_if_provided(obj.weight_version)
+                commit_result.message += (
+                    f" Weight version updated to {obj.weight_version}."
+                )
+            if obj.recovery:
+                self._clear_tensor_update_unhealthy()
+
+            resume_started = time.perf_counter()
+            if paused_by_atomic or (obj.recovery and unhealthy):
+                await self.continue_generation(
+                    ContinueGenerationReqInput(torch_empty_cache=False)
+                )
+            resume_ms = (time.perf_counter() - resume_started) * 1000
+            commit_result.phase_timings_ms.update(
+                {
+                    "stage_dispatch_ms": stage_dispatch_ms,
+                    "cpu_stage_wait_ms": cpu_stage_wait_ms,
+                    "pause_dispatch_ms": pause_dispatch_ms,
+                    "resume_ms": resume_ms,
+                    "pause_window_ms": (time.perf_counter() - pause_window_started)
+                    * 1000,
+                    "atomic_total_ms": (time.perf_counter() - atomic_started) * 1000,
+                }
+            )
+            unhealthy, unhealthy_reason = self._tensor_update_health()
+            commit_result.unhealthy = unhealthy
+            commit_result.unhealthy_reason = unhealthy_reason
+            return commit_result
+        except BaseException as error:
+            logger.exception("Atomic draft tensor update %s failed", update_id)
+            return await fail_closed(
+                TensorUpdateControlResult(
+                    success=False,
+                    message=f"Atomic draft tensor update failed: {error}",
+                    update_id=update_id,
+                    partial_update=paused_by_atomic,
+                    phase_timings_ms=(
+                        dict(stage_result.phase_timings_ms)
+                        if stage_result is not None
+                        else {}
+                    ),
+                )
+            )
+
+    async def update_weights_from_tensor_atomic(
+        self: TokenizerManager,
+        obj: UpdateWeightsFromTensorReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> TensorUpdateControlResult:
+        """Shield one CPU-stage/pause/commit/resume transaction from disconnects."""
+
+        del request
+        self.auto_create_handle_loop()
+        lock = getattr(self, "atomic_tensor_update_lock", None)
+        if lock is None:
+            lock = self.atomic_tensor_update_lock = asyncio.Lock()
+        tasks = getattr(self, "atomic_tensor_update_tasks", None)
+        if tasks is None:
+            tasks = self.atomic_tensor_update_tasks = set()
+
+        async def run_serialized():
+            async with lock:
+                return await self._atomic_tensor_update_impl(obj)
+
+        task = asyncio.create_task(run_serialized())
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+        return await asyncio.shield(task)
 
     async def update_weights_from_ipc(
         self: TokenizerManager,

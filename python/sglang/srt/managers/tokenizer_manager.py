@@ -623,6 +623,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.model_update_tmp: List[UpdateWeightFromDiskReqOutput] = []
         self.is_pause = False
         self.is_pause_cond = asyncio.Condition()
+        # Draft tensor updates fail closed after any rejected/partial apply.
+        # Only an explicit recovery image may clear this state.
+        self.draft_weight_update_unhealthy = False
+        self.draft_weight_update_unhealthy_reason: Optional[str] = None
+        self.draft_weight_update_unhealthy_id: Optional[str] = None
+        self.atomic_tensor_update_lock = asyncio.Lock()
+        self.atomic_tensor_update_tasks: set[asyncio.Task] = set()
 
     def init_lora(self):
         # LoRA
@@ -1973,10 +1980,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     await asyncio.sleep(1.0)
 
     async def continue_generation(self, obj: ContinueGenerationReqInput):
+        unhealthy = bool(getattr(self, "draft_weight_update_unhealthy", False))
+        if unhealthy:
+            reason = getattr(self, "draft_weight_update_unhealthy_reason", None)
+            return False, (
+                "Generation remains paused because a draft tensor update failed. "
+                f"Restore known-good tensors with recovery=true first. Cause: {reason}"
+            )
         async with self.is_pause_cond:
             self.is_pause = False
             await self._async_dispatch_to_scheduler(obj)
             self.is_pause_cond.notify_all()
+        return True, "Generation continued successfully."
 
     async def update_weights_from_disk(
         self,

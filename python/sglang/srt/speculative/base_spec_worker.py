@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 
@@ -36,6 +37,13 @@ class HiCacheDraftMode(str, Enum):
 class HiCacheDraftPlan:
     mode: HiCacheDraftMode = HiCacheDraftMode.NONE
     device_pools: tuple[object, ...] = ()
+
+
+@dataclass(slots=True)
+class PreparedDraftWeightUpdate:
+    runner_updates: List[object]
+    phase_timings_ms: Dict[str, float]
+    host_memory_bytes: Dict[str, int]
 
 
 def _can_pack_hicache_mtp(
@@ -307,31 +315,118 @@ class BaseSpecWorker(ABC):
                 return success, message
         return True, "Succeeded to update model weights."
 
-    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
+    def prepare_weights_from_tensor(
+        self, recv_req: UpdateWeightsFromTensorReqInput
+    ) -> PreparedDraftWeightUpdate:
         if not recv_req.draft_only:
-            return self.target_worker.update_weights_from_tensor(recv_req)
-
+            raise ValueError("CPU staged tensor updates are draft_only")
         draft_runners = self._draft_model_runners()
         if not draft_runners:
-            return False, "No speculative draft model runner is available."
+            raise ValueError("No speculative draft model runner is available")
 
+        phases: Dict[str, float] = {}
+        deserialize_started = time.perf_counter()
         monkey_patch_torch_reductions()
-        try:
-            named_tensors = MultiprocessingSerializer.deserialize(
-                recv_req.serialized_named_tensors[self.ps.tp_rank]
-            )
-        except Exception as e:
-            return False, f"Failed to deserialize draft model weights: {e}"
+        named_tensors = MultiprocessingSerializer.deserialize(
+            recv_req.serialized_named_tensors[self.ps.tp_rank]
+        )
+        phases["deserialize_ms"] = (time.perf_counter() - deserialize_started) * 1000
+
+        runner_updates = []
+        host_memory = {
+            "source_tensor_bytes": 0,
+            "staged_tensor_bytes": 0,
+            "pinned_tensor_bytes": 0,
+        }
         for runner in draft_runners:
-            success, message = runner.weight_updater.update_weights_from_tensor(
+            runner_phases: Dict[str, float] = {}
+            prepared = runner.weight_updater.prepare_weights_from_tensor(
                 named_tensors=named_tensors,
                 load_format=recv_req.load_format,
                 stream_tensors=True,
+                tensors_are_pre_sharded=recv_req.tensors_are_pre_sharded,
+                pin_memory=recv_req.pin_memory,
+                fault_injection_after_tensors=recv_req.fault_injection_after_tensors,
+                phase_timings_ms=runner_phases,
             )
-            if not success:
-                return success, message
+            runner_updates.append(prepared)
+            for key, value in runner_phases.items():
+                phases[key] = phases.get(key, 0.0) + value
+            for key, value in prepared.host_memory_bytes.items():
+                host_memory[key] = host_memory.get(key, 0) + value
+        return PreparedDraftWeightUpdate(
+            runner_updates=runner_updates,
+            phase_timings_ms=phases,
+            host_memory_bytes=host_memory,
+        )
 
+    def apply_prepared_weights_from_tensor(
+        self,
+        staged: PreparedDraftWeightUpdate,
+        recv_req: UpdateWeightsFromTensorReqInput,
+        *,
+        phase_timings_ms: Optional[Dict[str, float]] = None,
+        update_status: Optional[dict] = None,
+    ):
+        draft_runners = self._draft_model_runners()
+        if len(draft_runners) != len(staged.runner_updates):
+            return False, "Draft runner count changed after CPU staging."
+
+        partial_update = False
+        applied_tensor_count = 0
+        success = False
+        message = "No draft runner update was applied."
+        for runner, prepared in zip(draft_runners, staged.runner_updates):
+            runner_status = {}
+            success, message = runner.weight_updater.apply_prepared_weights_from_tensor(
+                prepared,
+                load_format=recv_req.load_format,
+                stream_tensors=True,
+                collect_phase_timings=recv_req.collect_phase_timings,
+                update_status=runner_status,
+            )
+            partial_update = partial_update or bool(
+                runner_status.get("partial_update", False)
+            )
+            applied_tensor_count += int(runner_status.get("applied_tensor_count", 0))
+            if not success:
+                break
+        if phase_timings_ms is not None:
+            for prepared in staged.runner_updates:
+                for key, value in prepared.phase_timings_ms.items():
+                    phase_timings_ms[key] = phase_timings_ms.get(key, 0.0) + value
+            phase_timings_ms["deserialize_ms"] = staged.phase_timings_ms.get(
+                "deserialize_ms", 0.0
+            )
+        if update_status is not None:
+            update_status["partial_update"] = partial_update
+            update_status["applied_tensor_count"] = applied_tensor_count
+        if not success:
+            return success, message
         return True, "Succeeded to update model weights."
+
+    def update_weights_from_tensor(
+        self,
+        recv_req: UpdateWeightsFromTensorReqInput,
+        *,
+        phase_timings_ms: Optional[Dict[str, float]] = None,
+        update_status: Optional[dict] = None,
+    ):
+        if not recv_req.draft_only:
+            return self.target_worker.update_weights_from_tensor(recv_req)
+
+        try:
+            staged = self.prepare_weights_from_tensor(recv_req)
+        except BaseException as error:
+            if update_status is not None:
+                update_status["partial_update"] = False
+            return False, f"Failed to prepare draft model weights: {error}"
+        return self.apply_prepared_weights_from_tensor(
+            staged,
+            recv_req,
+            phase_timings_ms=phase_timings_ms,
+            update_status=update_status,
+        )
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         for runner in self.draft_worker.draft_runners:

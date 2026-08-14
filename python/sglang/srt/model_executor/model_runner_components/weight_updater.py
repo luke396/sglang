@@ -2,8 +2,21 @@ from __future__ import annotations
 
 import gc
 import logging
+import os
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import torch
 
@@ -30,6 +43,41 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class PreparedWeightUpdate:
+    """Validated host tensors ready for one in-place model update."""
+
+    named_tensors: List[Tuple[str, torch.Tensor]]
+    tensors_are_pre_sharded: bool
+    phase_timings_ms: Dict[str, float]
+    host_memory_bytes: Dict[str, int]
+    fault_injection_after_tensors: Optional[int] = None
+
+
+@contextmanager
+def _presharded_weight_loader_mode(model: Any, enabled: bool) -> Iterator[None]:
+    """Temporarily tell TP linear loaders that input tensors are rank-local."""
+
+    if not enabled:
+        yield
+        return
+
+    changed = []
+    for module in model.modules():
+        if hasattr(module, "use_presharded_weights"):
+            changed.append((module, module.use_presharded_weights))
+            module.use_presharded_weights = True
+    try:
+        yield
+    finally:
+        for module, previous in changed:
+            module.use_presharded_weights = previous
+
+
+def _tensor_bytes(tensor: torch.Tensor) -> int:
+    return tensor.numel() * tensor.element_size()
 
 
 def _unsupported_derived_weight_cache_error() -> Optional[str]:
@@ -316,73 +364,291 @@ class WeightUpdater:
             logger.error(error_msg)
             return False, error_msg
 
+    def prepare_weights_from_tensor(
+        self: WeightUpdater,
+        named_tensors: List[Tuple[str, Union[torch.Tensor, LocalSerializedTensor]]],
+        load_format: Optional[str] = None,
+        *,
+        stream_tensors: bool = False,
+        tensors_are_pre_sharded: bool = False,
+        pin_memory: bool = False,
+        fault_injection_after_tensors: Optional[int] = None,
+        phase_timings_ms: Optional[Dict[str, float]] = None,
+    ) -> PreparedWeightUpdate:
+        """Validate and optionally pin a tensor update without touching the GPU model."""
+
+        phases = phase_timings_ms if phase_timings_ms is not None else {}
+        prepare_started = time.perf_counter()
+        error = _unsupported_derived_weight_cache_error()
+        if error is not None:
+            raise RuntimeError(error)
+
+        monkey_patch_torch_reductions()
+        self._assert_weight_cache_inactive("update_weights_from_tensor")
+        if load_format == "flattened_bucket":
+            raise ValueError("flattened_bucket does not support staged tensor updates")
+        if fault_injection_after_tensors is not None:
+            if os.getenv("SGLANG_ENABLE_WEIGHT_UPDATE_FAULT_INJECTION") != "1":
+                raise ValueError(
+                    "fault_injection_after_tensors requires "
+                    "SGLANG_ENABLE_WEIGHT_UPDATE_FAULT_INJECTION=1"
+                )
+            if fault_injection_after_tensors < 1:
+                raise ValueError("fault_injection_after_tensors must be positive")
+
+        validation_started = time.perf_counter()
+        normalized: List[Tuple[str, torch.Tensor]] = []
+        seen_names = set()
+        for index, item in enumerate(named_tensors):
+            if not isinstance(item, (tuple, list)) or len(item) != 2:
+                raise TypeError(f"named_tensors[{index}] must be a (name, tensor) pair")
+            name, tensor = item
+            if not isinstance(name, str) or not name:
+                raise TypeError(f"named_tensors[{index}] has an invalid name")
+            if name in seen_names:
+                raise ValueError(f"duplicate tensor name {name!r}")
+            seen_names.add(name)
+            if isinstance(tensor, LocalSerializedTensor):
+                tensor = tensor.get(self.tp_rank)
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(f"weight {name!r} is not a torch.Tensor")
+            if tensor.layout != torch.strided:
+                raise TypeError(
+                    f"weight {name!r} must use torch.strided layout, got {tensor.layout}"
+                )
+            normalized.append((name, tensor))
+        if not normalized:
+            raise ValueError("named_tensors must not be empty")
+
+        model = self.get_model()
+        stream_tensors = stream_tensors and load_format in (None, "direct")
+        validator = getattr(model, "validate_weights", None)
+        if validator is not None and load_format is None:
+            with _presharded_weight_loader_mode(model, tensors_are_pre_sharded):
+                validator(
+                    normalized,
+                    tensors_are_pre_sharded=tensors_are_pre_sharded,
+                )
+        phases["input_and_model_validation_ms"] = (
+            time.perf_counter() - validation_started
+        ) * 1000
+
+        weight_name_filter = (
+            getattr(model, "should_materialize_weight", None)
+            if stream_tensors and load_format is None
+            else None
+        )
+        materialized = [
+            (name, tensor)
+            for name, tensor in normalized
+            if weight_name_filter is None or weight_name_filter(name)
+        ]
+        source_bytes = sum(_tensor_bytes(tensor) for _, tensor in materialized)
+
+        pin_started = time.perf_counter()
+        staged = materialized
+        if pin_memory:
+            pinned = []
+            for name, tensor in materialized:
+                if tensor.device.type != "cpu":
+                    raise ValueError(
+                        f"pinned staging requires CPU tensors, got {tensor.device} "
+                        f"for {name!r}"
+                    )
+                if tensor.is_pinned() and tensor.is_contiguous():
+                    staged_tensor = tensor
+                else:
+                    staged_tensor = tensor.contiguous().pin_memory()
+                pinned.append((name, staged_tensor))
+            staged = pinned
+        phases["host_pin_ms"] = (time.perf_counter() - pin_started) * 1000
+        phases["prepare_total_ms"] = (time.perf_counter() - prepare_started) * 1000
+        staged_bytes = sum(_tensor_bytes(tensor) for _, tensor in staged)
+        return PreparedWeightUpdate(
+            named_tensors=staged,
+            tensors_are_pre_sharded=tensors_are_pre_sharded,
+            phase_timings_ms=phases,
+            host_memory_bytes={
+                "source_tensor_bytes": source_bytes,
+                "staged_tensor_bytes": staged_bytes,
+                "pinned_tensor_bytes": staged_bytes if pin_memory else 0,
+            },
+            fault_injection_after_tensors=fault_injection_after_tensors,
+        )
+
+    def apply_prepared_weights_from_tensor(
+        self: WeightUpdater,
+        prepared: PreparedWeightUpdate,
+        load_format: Optional[str] = None,
+        *,
+        stream_tensors: bool = False,
+        collect_phase_timings: bool = False,
+        update_status: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[bool, str]:
+        """Apply one validated image in place and return a completion fence."""
+
+        phases = prepared.phase_timings_ms
+        status = update_status if update_status is not None else {}
+        apply_started = time.perf_counter()
+        device_module = torch.get_device_module(self.device)
+        infered_device = device_module.current_device()
+        stream_tensors = stream_tensors and load_format in (None, "direct")
+        model = self.get_model()
+        source_named_tensors = prepared.named_tensors
+        cuda_events = []
+        mutation_started = False
+        applied_tensor_count = 0
+        failure: Optional[BaseException] = None
+
+        def new_event():
+            return device_module.Event(enable_timing=True)
+
+        def materialize_tensors():
+            nonlocal mutation_started, applied_tensor_count
+            for name, tensor in source_named_tensors:
+                h2d_start = h2d_end = copy_start = copy_end = None
+                if collect_phase_timings and self.device != "cpu":
+                    h2d_start, h2d_end = new_event(), new_event()
+                    h2d_start.record()
+                device_tensor = _unwrap_tensor(
+                    tensor,
+                    tp_rank=self.tp_rank,
+                    device=infered_device,
+                    non_blocking=bool(
+                        tensor.device.type == "cpu" and tensor.is_pinned()
+                    ),
+                )
+                if collect_phase_timings and self.device != "cpu":
+                    h2d_end.record()
+                    copy_start, copy_end = new_event(), new_event()
+                    copy_start.record()
+                mutation_started = True
+                try:
+                    yield name, device_tensor
+                finally:
+                    if copy_end is not None:
+                        copy_end.record()
+                        cuda_events.append((h2d_start, h2d_end, copy_start, copy_end))
+                    del device_tensor
+                applied_tensor_count += 1
+                if (
+                    prepared.fault_injection_after_tensors is not None
+                    and applied_tensor_count >= prepared.fault_injection_after_tensors
+                ):
+                    raise RuntimeError(
+                        "injected mid-update failure after "
+                        f"{applied_tensor_count} tensors"
+                    )
+
+        named_tensors = (
+            materialize_tensors() if stream_tensors else list(materialize_tensors())
+        )
+        model_gpu_start = model_gpu_end = None
+        if collect_phase_timings and self.device != "cpu":
+            model_gpu_start, model_gpu_end = new_event(), new_event()
+            model_gpu_start.record()
+        model_load_started = time.perf_counter()
+        try:
+            with _presharded_weight_loader_mode(
+                model, prepared.tensors_are_pre_sharded
+            ):
+                if load_format == "direct":
+                    _model_load_weights_direct(model, named_tensors)
+                elif load_format in self.custom_weight_loaders:
+                    custom_loader = dynamic_import(load_format)
+                    custom_loader(model, named_tensors)
+                elif load_format is None:
+                    model.load_weights(named_tensors)
+                else:
+                    raise NotImplementedError(f"Unknown load_format={load_format}")
+        except BaseException as error:
+            failure = error
+        finally:
+            if model_gpu_end is not None:
+                model_gpu_end.record()
+            phases["model_load_wall_ms"] = (
+                time.perf_counter() - model_load_started
+            ) * 1000
+
+        if stream_tensors and self.device != "cpu":
+            sync_started = time.perf_counter()
+            try:
+                # Completion fence for producer-owned IPC/pinned tensors and all
+                # derived-cache writes queued by the model loader.
+                device_module.current_stream().synchronize()
+            except BaseException as error:
+                if failure is None:
+                    failure = error
+            phases["completion_fence_ms"] = (time.perf_counter() - sync_started) * 1000
+
+        if cuda_events:
+            phases["gpu_h2d_ms"] = sum(
+                start.elapsed_time(end) for start, end, _, _ in cuda_events
+            )
+            phases["gpu_param_copy_ms"] = sum(
+                start.elapsed_time(end) for _, _, start, end in cuda_events
+            )
+        if model_gpu_start is not None and model_gpu_end is not None:
+            phases["gpu_model_total_ms"] = model_gpu_start.elapsed_time(model_gpu_end)
+            phases["gpu_derived_postprocess_ms"] = max(
+                phases["gpu_model_total_ms"]
+                - phases.get("gpu_h2d_ms", 0.0)
+                - phases.get("gpu_param_copy_ms", 0.0),
+                0.0,
+            )
+        phases["apply_total_ms"] = (time.perf_counter() - apply_started) * 1000
+        status["partial_update"] = mutation_started and failure is not None
+        status["applied_tensor_count"] = applied_tensor_count
+
+        if failure is not None:
+            suffix = (
+                " The draft may be partially updated; keep the instance paused "
+                "until an explicit recovery succeeds."
+                if mutation_started
+                else " No model tensor was applied."
+            )
+            return False, f"Failed to update weights from tensor: {failure}.{suffix}"
+        return True, "Success"
+
     def update_weights_from_tensor(
         self: WeightUpdater,
         named_tensors: List[Tuple[str, Union[torch.Tensor, LocalSerializedTensor]]],
         load_format: Optional[str] = None,
         *,
         stream_tensors: bool = False,
-    ):
-        error = _unsupported_derived_weight_cache_error()
-        if error is not None:
-            return False, error
-
-        monkey_patch_torch_reductions()
-        self._assert_weight_cache_inactive("update_weights_from_tensor")
+        tensors_are_pre_sharded: bool = False,
+        pin_memory: bool = False,
+        collect_phase_timings: bool = False,
+        fault_injection_after_tensors: Optional[int] = None,
+        phase_timings_ms: Optional[Dict[str, float]] = None,
+        update_status: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[bool, str]:
         if load_format == "flattened_bucket":
-            # Handle flattened bucket format
             return self._update_weights_from_flattened_bucket(
                 flattened_tensor_bucket_dict=named_tensors
             )
-
-        # We need to get device after patch otherwise the device would be wrong
-        device_module = torch.get_device_module(self.device)
-        infered_device = device_module.current_device()
-
-        # Model-native and direct loaders consume iterables in one pass. Keep
-        # the legacy eager list for custom loaders, which may rely on indexing
-        # or multiple passes, and for all callers that did not opt in.
-        stream_tensors = stream_tensors and load_format in (None, "direct")
-        model = self.get_model()
-        weight_name_filter = (
-            getattr(model, "should_materialize_weight", None)
-            if stream_tensors and load_format is None
-            else None
+        phases = phase_timings_ms if phase_timings_ms is not None else {}
+        status = update_status if update_status is not None else {}
+        try:
+            prepared = self.prepare_weights_from_tensor(
+                named_tensors,
+                load_format,
+                stream_tensors=stream_tensors,
+                tensors_are_pre_sharded=tensors_are_pre_sharded,
+                pin_memory=pin_memory,
+                fault_injection_after_tensors=fault_injection_after_tensors,
+                phase_timings_ms=phases,
+            )
+        except BaseException as error:
+            status["partial_update"] = False
+            return False, f"Failed to validate weights from tensor: {error}."
+        return self.apply_prepared_weights_from_tensor(
+            prepared,
+            load_format,
+            stream_tensors=stream_tensors,
+            collect_phase_timings=collect_phase_timings,
+            update_status=status,
         )
-        source_named_tensors = named_tensors
-
-        def materialize_tensors():
-            for name, tensor in source_named_tensors:
-                if weight_name_filter is not None and not weight_name_filter(name):
-                    continue
-                yield (
-                    name,
-                    _unwrap_tensor(
-                        tensor,
-                        tp_rank=self.tp_rank,
-                        device=infered_device,
-                    ),
-                )
-
-        named_tensors = (
-            materialize_tensors() if stream_tensors else list(materialize_tensors())
-        )
-        if load_format == "direct":
-            _model_load_weights_direct(model, named_tensors)
-        elif load_format in self.custom_weight_loaders:
-            custom_loader = dynamic_import(load_format)
-            custom_loader(model, named_tensors)
-        elif load_format is None:
-            model.load_weights(named_tensors)
-        else:
-            raise NotImplementedError(f"Unknown load_format={load_format}")
-
-        if stream_tensors and self.device != "cpu":
-            # Make the response a completion fence for producer-owned IPC
-            # tensors. The producer may release them as soon as HTTP returns.
-            device_module.current_stream().synchronize()
-
-        return True, "Success"
 
     def _update_weights_from_flattened_bucket(
         self: WeightUpdater,
@@ -445,10 +711,10 @@ def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tenso
         default_weight_loader(params_dict[name], tensor)
 
 
-def _unwrap_tensor(tensor, tp_rank, device):
+def _unwrap_tensor(tensor, tp_rank, device, non_blocking: bool = False):
     if isinstance(tensor, LocalSerializedTensor):
         tensor = tensor.get(tp_rank)
-    return tensor.to(device)
+    return tensor.to(device, non_blocking=non_blocking)
 
 
 @dataclass

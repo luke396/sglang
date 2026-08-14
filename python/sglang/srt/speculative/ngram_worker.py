@@ -147,7 +147,9 @@ class NGRAMWorker(BaseSpecWorker):
         self.ngram_corpus.reset()
         self._prev_decode_rids = set()
 
-    def update_weights_from_tensor(self, recv_req):
+    def update_weights_from_tensor(
+        self, recv_req, *, phase_timings_ms=None, update_status=None
+    ):
         # NGRAM has no draft weights of its own — the n-gram corpus is a CPU
         # lookup structure built from request token streams — and its
         # `model_runner` is shared with the target worker. The scheduler
@@ -159,7 +161,11 @@ class NGRAMWorker(BaseSpecWorker):
                 False,
                 "draft_only weight update requires a model-backed speculative draft.",
             )
-        return self.target_worker.update_weights_from_tensor(recv_req)
+        return self.target_worker.update_weights_from_tensor(
+            recv_req,
+            phase_timings_ms=phase_timings_ms,
+            update_status=update_status,
+        )
 
     def add_external_corpus(self, corpus_id: str, token_chunks: list[list[int]]) -> int:
         return self.ngram_corpus.load_external_corpus_named(corpus_id, token_chunks)

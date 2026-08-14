@@ -703,10 +703,18 @@ class TokenizerWorker(TokenizerManager):
                 await asyncio.sleep(1.0)
 
     async def continue_generation(self, obj: ContinueGenerationReqInput):
+        unhealthy = bool(getattr(self, "draft_weight_update_unhealthy", False))
+        if unhealthy:
+            reason = getattr(self, "draft_weight_update_unhealthy_reason", None)
+            return False, (
+                "Generation remains paused because a draft tensor update failed. "
+                f"Restore known-good tensors with recovery=true first. Cause: {reason}"
+            )
         loop = asyncio.get_event_loop()
         self._pause_continue_future = loop.create_future()
         self._dispatch_to_scheduler(obj)
         await self._pause_continue_future
+        return True, "Generation continued successfully."
 
     def _handle_pause_continue_broadcast(self, obj: PauseContinueBroadcastReq):
         """Called from handle_loop when a broadcast arrives from the router."""

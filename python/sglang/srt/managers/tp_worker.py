@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -204,12 +205,28 @@ class BaseTpWorker(ABC):
             serialized_named_tensors[self.ps.tp_rank]
         )
 
-    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
-        success, message = self.model_runner.weight_updater.update_weights_from_tensor(
-            named_tensors=self._deserialize_own_rank(recv_req.serialized_named_tensors),
+    def update_weights_from_tensor(
+        self,
+        recv_req: UpdateWeightsFromTensorReqInput,
+        *,
+        phase_timings_ms=None,
+        update_status=None,
+    ):
+        deserialize_started = time.perf_counter()
+        named_tensors = self._deserialize_own_rank(recv_req.serialized_named_tensors)
+        if phase_timings_ms is not None:
+            phase_timings_ms["deserialize_ms"] = (
+                time.perf_counter() - deserialize_started
+            ) * 1000
+        return self.model_runner.weight_updater.update_weights_from_tensor(
+            named_tensors=named_tensors,
             load_format=recv_req.load_format,
+            tensors_are_pre_sharded=recv_req.tensors_are_pre_sharded,
+            collect_phase_timings=recv_req.collect_phase_timings,
+            fault_injection_after_tensors=recv_req.fault_injection_after_tensors,
+            phase_timings_ms=phase_timings_ms,
+            update_status=update_status,
         )
-        return success, message
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update weights from IPC for checkpoint-engine integration."""

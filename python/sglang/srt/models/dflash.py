@@ -39,8 +39,41 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_npu = is_npu()
 if _is_npu:
+
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 logger = logging.getLogger(__name__)
+
+
+def _make_validation_parameter(param: nn.Parameter) -> nn.Parameter:
+    """Make a metadata-only parameter accepted by the normal weight loader."""
+
+    proxy = nn.Parameter(
+        torch.empty(tuple(param.shape), dtype=param.dtype, device="meta"),
+        requires_grad=False,
+    )
+    for name, value in vars(param).items():
+        try:
+            setattr(proxy, name, value)
+        except (AttributeError, TypeError):
+            # Tensor internals are irrelevant; loader metadata such as
+            # input_dim/output_dim/weight_loader is copied above when writable.
+            pass
+    return proxy
+
+
+def _validate_loaded_weight_dtype(
+    name: str, loaded_weight: torch.Tensor, param: nn.Parameter
+) -> None:
+    if loaded_weight.dtype == param.dtype:
+        return
+    # Preserve the loader's established BF16/FP32 compatibility while
+    # rejecting category changes (integer/complex/bool masquerading as weights).
+    if loaded_weight.is_floating_point() and param.is_floating_point():
+        return
+    raise TypeError(
+        f"weight {name!r} dtype {loaded_weight.dtype} is incompatible with "
+        f"destination dtype {param.dtype}"
+    )
 
 
 def _get_dflash_layer_attention_params(
@@ -455,7 +488,7 @@ class DFlashDraftModel(nn.Module):
         name: str,
         loaded_weight: torch.Tensor,
         params_dict: dict,
-    ) -> None:
+    ) -> bool:
         for param_name, weight_name, shard_id in (
             # (param_name, weight_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -471,15 +504,18 @@ class DFlashDraftModel(nn.Module):
             if resolved_name is None:
                 continue
             param = params_dict[resolved_name]
+            _validate_loaded_weight_dtype(name, loaded_weight, param)
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight, shard_id)
-            return
+            return True
 
         resolved_name = self._resolve_weight_param_name(name, params_dict)
         if resolved_name is None:
-            # Ignore unexpected weights (e.g., HF rotary caches).
-            return
+            # Legacy loads ignore unexpected weights (e.g. HF rotary caches),
+            # while validate_weights below rejects every non-cache unknown name.
+            return False
         param = params_dict[resolved_name]
+        _validate_loaded_weight_dtype(name, loaded_weight, param)
         if resolved_name.endswith("fc.weight") and tuple(loaded_weight.shape) != tuple(
             param.shape
         ):
@@ -492,6 +528,31 @@ class DFlashDraftModel(nn.Module):
             )
         weight_loader = getattr(param, "weight_loader", default_weight_loader)
         weight_loader(param, loaded_weight)
+        return True
+
+    def validate_weights(
+        self,
+        weights: Iterable[Tuple[str, torch.Tensor]],
+        *,
+        tensors_are_pre_sharded: bool = False,
+    ) -> None:
+        """Run the real loader's name/shape/dtype logic against meta tensors."""
+
+        del tensors_are_pre_sharded  # Loader modules already carry this mode.
+        params_dict = {
+            name: _make_validation_parameter(param)
+            for name, param in self.named_parameters()
+        }
+        seen = set()
+        for name, loaded_weight in weights:
+            if name in seen:
+                raise ValueError(f"duplicate DFlash weight {name!r}")
+            seen.add(name)
+            loaded = self._load_dflash_weight(name, loaded_weight, params_dict)
+            if not loaded and "rotary_emb" not in name:
+                raise ValueError(
+                    f"unexpected DFlash weight {name!r}; no destination parameter exists"
+                )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters())
