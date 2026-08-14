@@ -1063,8 +1063,8 @@ def run_cell(cell, repeat_idx, attempt_name):
         non_warmup_generate_requests = (
             pre_measurement_generate_requests - warmup_completed
         )
-        pre_measurement_progress_probes = _run_capture_progress_probes(
-            "pre_measurement"
+        pre_measurement_progress_probes = (
+            _run_capture_progress_probes("pre_measurement") if cell["capture"] else []
         )
         if cell["prefix"] == "cold":
             requests.post(SERVER_URL + "/flush_cache", timeout=30)
@@ -1133,9 +1133,7 @@ def run_cell(cell, repeat_idx, attempt_name):
                 after_stats = _sum_capture_stats(after_snapshots)
                 counter_delta = _counter_delta(after_stats, before_stats)
         else:
-            post_measurement_progress_probes = _run_capture_progress_probes(
-                "post_measurement"
-            )
+            post_measurement_progress_probes = []
             drain_mem = None
             drain_resources = None
             manifest_final = None

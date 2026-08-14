@@ -95,6 +95,29 @@ class TestHiddenCaptureBenchmarkHarness(unittest.TestCase):
         for wave in waves:
             self.assertEqual(len({arm["gpu"] for arm in wave}), len(wave))
 
+    def test_upstream_baseline_schedule_launches_only_one_off_arm_per_cell(self):
+        baseline = {"label": "stock"}
+        candidate = {"label": "v6"}
+        cells = tuple(f"cell_{index}" for index in range(5))
+        waves = versions.comparison_waves(
+            cells,
+            ("0", "1"),
+            baseline,
+            candidate,
+            scheduled_arms=((baseline, False),),
+        )
+        arms = [arm for wave in waves for arm in wave]
+        self.assertEqual(len(arms), len(cells))
+        self.assertEqual(len(waves), 3)
+        self.assertTrue(
+            all(
+                arm["revision"]["label"] == "stock" and not arm["capture"]
+                for arm in arms
+            )
+        )
+        for cell in cells:
+            self.assertEqual(len([arm for arm in arms if arm["cell"] == cell]), 1)
+
     def test_manifest_snapshot_is_non_destructive_and_reports_holes(self):
         prefix = "store/_seq/0"
         store = _FakeStore({f"{prefix}/0", f"{prefix}/2", f"{prefix}/3"})
@@ -226,6 +249,83 @@ class TestHiddenCaptureBenchmarkHarness(unittest.TestCase):
         self.assertIn(
             "selected physical GPU=['1'] expected=['0']",
             versions._row_gate(row, "sha", "v1_short_low", "0"),
+        )
+        row["capture_progress_probes"] = {}
+        self.assertEqual(
+            versions._row_gate(
+                row,
+                "sha",
+                "v1_short_low",
+                "1",
+                require_progress_probes=False,
+            ),
+            [],
+        )
+
+    def test_candidate_off_reference_is_same_gpu_and_regated(self):
+        candidate = {"label": "v6", "revision": "candidate-sha"}
+        source_row = {"cell": {"capture": False}}
+        source_attempt = {
+            "attempt_id": "old-attempt",
+            "cell": "v1_short_low",
+            "gpu": "1",
+            "version_label": "old-v6-label",
+            "revision": "candidate-sha",
+            "capture": False,
+            "exit_code": 0,
+            "row": source_row,
+            "row_gate_failures": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "attempts.jsonl"
+            path.write_text(f"{versions.json.dumps(source_attempt)}\n")
+            expected_sha = versions.hashlib.sha256(path.read_bytes()).hexdigest()
+            with mock.patch.object(versions, "_row_gate", return_value=[]) as gate:
+                selected, source = versions._load_candidate_off_references(
+                    path,
+                    candidate=candidate,
+                    cells=("v1_short_low",),
+                    cell_gpus={"v1_short_low": "1"},
+                )
+        self.assertEqual(source["sha256"], expected_sha)
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0]["version_label"], "v6")
+        self.assertTrue(selected[0]["reused"])
+        gate.assert_called_once_with(
+            source_row,
+            "candidate-sha",
+            "v1_short_low",
+            "1",
+            require_progress_probes=False,
+        )
+
+    def test_off_only_summary_requires_both_stock_and_candidate(self):
+        row = {
+            "bench": {metric: 1.0 for metric in versions.COMMON_METRICS},
+            "measured_request_set": {"fingerprint": {"sha256": "requests"}},
+            "outer_warmup_request_set": {"fingerprint": {"sha256": "warmup"}},
+        }
+        attempts = [
+            {
+                "attempt_id": "stock-only",
+                "cell": "v1_short_low",
+                "gpu": "0",
+                "version_label": "stock",
+                "capture": False,
+                "row": row,
+                "row_gate_failures": [],
+            }
+        ]
+        summary = versions.summarize_attempts(
+            attempts,
+            ("stock", "v6"),
+            ("v1_short_low",),
+            required_arms=(("stock", False), ("v6", False)),
+        )
+        cell = summary["cells"]["v1_short_low"]
+        self.assertFalse(cell["comparable"])
+        self.assertTrue(
+            any("missing arms" in failure for failure in cell["gate_failures"])
         )
 
     def test_diagnosis_summary_does_not_expand_to_frozen_full_suite(self):

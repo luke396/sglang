@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reproducible comparison of two hidden-capture revisions.
+"""Reproducible comparison of hidden-capture revisions or upstream stock.
 
 This orchestrator deliberately runs the repo-resident
 ``bench_hidden_capture_matrix.py`` as a script for every leg.  The driver
@@ -10,6 +10,13 @@ capture and version load in each concurrent wave::
 
     GPU A, cell X: baseline/off, baseline/on, candidate/off, candidate/on
     GPU B, cell Y: candidate/on, candidate/off, baseline/on, baseline/off
+
+For a pure upstream baseline with no capture implementation, pass
+``--candidate-off-attempts``.  In that mode the candidate/off rows are
+re-gated from the supplied prior artifact and only baseline/off is launched:
+
+    GPU A, cell X: baseline/off + referenced same-GPU candidate/off
+    GPU B, cell Y: baseline/off + referenced same-GPU candidate/off
 
 Use ``--cross-gpu-repeat`` only when a material card-dependent discrepancy
 needs confirmation.  It uses the original two-GPU, eight-arm protocol for each
@@ -200,10 +207,19 @@ def crossed_schedules(
     )
 
 
-def comparison_waves(cells, gpus, baseline, candidate, cross_gpu_repeat=False):
+def comparison_waves(
+    cells,
+    gpus,
+    baseline,
+    candidate,
+    cross_gpu_repeat=False,
+    scheduled_arms=None,
+):
     """Build deterministic waves while keeping a default cell on one GPU."""
     if not gpus or len(set(gpus)) != len(gpus):
         raise ValueError("comparison waves require distinct GPUs")
+    if scheduled_arms is not None and cross_gpu_repeat:
+        raise ValueError("custom scheduled arms cannot use cross-GPU repetition")
     if cross_gpu_repeat:
         if len(gpus) != 2:
             raise ValueError("cross-GPU repetition requires exactly two GPUs")
@@ -225,7 +241,9 @@ def comparison_waves(cells, gpus, baseline, candidate, cross_gpu_repeat=False):
             for step in range(len(schedules[0]))
         )
 
-    forward = _schedule(baseline, candidate)
+    forward = tuple(scheduled_arms or _schedule(baseline, candidate))
+    if not forward:
+        raise ValueError("comparison waves require at least one scheduled arm")
     reverse = tuple(reversed(forward))
     waves = []
     for batch_start in range(0, len(cells), len(gpus)):
@@ -258,7 +276,12 @@ def _load_single_row(path: Path) -> dict:
 
 
 def _row_gate(
-    row: dict, expected_revision: str, expected_cell: str, expected_gpu: str
+    row: dict,
+    expected_revision: str,
+    expected_cell: str,
+    expected_gpu: str,
+    *,
+    require_progress_probes: bool = True,
 ) -> list[str]:
     failures = []
     if row.get("status") != "ok":
@@ -304,16 +327,17 @@ def _row_gate(
         failures.append("missing measured process resource samples")
     if not isinstance(process_resources.get("host_net_pernic_delta"), dict):
         failures.append("missing per-NIC network readback")
-    progress_probes = row.get("capture_progress_probes") or {}
-    for stage in ("pre_measurement", "post_measurement"):
-        probes = progress_probes.get(stage) or []
-        if len(probes) != EXPECTED_PROGRESS_PROBES_PER_BOUNDARY:
-            failures.append(
-                f"{stage} progress probes={len(probes)} "
-                f"expected={EXPECTED_PROGRESS_PROBES_PER_BOUNDARY}"
-            )
-        elif any(probe.get("status_code") != 200 for probe in probes):
-            failures.append(f"{stage} progress probe failed: {probes}")
+    if require_progress_probes:
+        progress_probes = row.get("capture_progress_probes") or {}
+        for stage in ("pre_measurement", "post_measurement"):
+            probes = progress_probes.get(stage) or []
+            if len(probes) != EXPECTED_PROGRESS_PROBES_PER_BOUNDARY:
+                failures.append(
+                    f"{stage} progress probes={len(probes)} "
+                    f"expected={EXPECTED_PROGRESS_PROBES_PER_BOUNDARY}"
+                )
+            elif any(probe.get("status_code") != 200 for probe in probes):
+                failures.append(f"{stage} progress probe failed: {probes}")
     outer_warmup = row.get("outer_warmup_request_set") or {}
     if outer_warmup.get("completed") != outer_warmup.get("requested"):
         failures.append(
@@ -448,7 +472,11 @@ def _launch_attempt(spec: dict, *, resume: bool, dry_run: bool) -> dict:
             "exit_code": 0,
             "row": row,
             "row_gate_failures": _row_gate(
-                row, spec["revision"], spec["cell"], spec["gpu"]
+                row,
+                spec["revision"],
+                spec["cell"],
+                spec["gpu"],
+                require_progress_probes=bool(spec["capture"]),
             ),
             "output": _artifact_record(out),
         }
@@ -503,7 +531,11 @@ def _finish_attempt(running: dict) -> dict:
             row = _load_single_row(out)
             result["row"] = row
             result["row_gate_failures"] = _row_gate(
-                row, running["revision"], running["cell"], running["gpu"]
+                row,
+                running["revision"],
+                running["cell"],
+                running["gpu"],
+                require_progress_probes=bool(running["capture"]),
             )
         except Exception as error:
             result["row_gate_failures"] = [f"row parse: {error}"]
@@ -520,6 +552,83 @@ def _attempt_public(record: dict) -> dict:
         for key, value in record.items()
         if key not in {"env"} and not key.startswith("_")
     }
+
+
+def _load_candidate_off_references(
+    path: Path,
+    *,
+    candidate: dict,
+    cells: tuple[str, ...],
+    cell_gpus: dict[str, str],
+) -> tuple[list[dict], dict]:
+    """Select one exact same-GPU candidate/off row per scheduled cell.
+
+    Reference rows are re-gated under the current harness.  Progress probes
+    are intentionally not required: the referenced capture-off evidence
+    predates those capture-lifecycle probes, and no export pipeline exists in
+    an off arm.  All measured request, metric, resource, source, cleanup and
+    GPU-identity gates still apply.
+    """
+    path = path.resolve()
+    records = [
+        json.loads(line) for line in path.read_text().splitlines() if line.strip()
+    ]
+    source_record = _artifact_record(path)
+    selected = []
+    for cell in cells:
+        gpu = cell_gpus[cell]
+        matches = [
+            record
+            for record in records
+            if record.get("cell") == cell
+            and str(record.get("gpu")) == gpu
+            and record.get("revision") == candidate["revision"]
+            and record.get("capture") is False
+        ]
+        if len(matches) != 1:
+            raise SystemExit(
+                "candidate/off reference selection must be unique: "
+                f"cell={cell}, gpu={gpu}, revision={candidate['revision']}, "
+                f"matches={len(matches)}, source={path}"
+            )
+        original = matches[0]
+        failures = [
+            f"source gate: {failure}"
+            for failure in original.get("row_gate_failures", [])
+        ]
+        if original.get("exit_code") != 0:
+            failures.append(f"source driver exit={original.get('exit_code')}")
+        row = original.get("row")
+        if not isinstance(row, dict):
+            failures.append("source attempt has no parsed row")
+        else:
+            if row.get("cell", {}).get("capture") is not False:
+                failures.append("source row is not capture-off")
+            failures.extend(
+                _row_gate(
+                    row,
+                    candidate["revision"],
+                    cell,
+                    gpu,
+                    require_progress_probes=False,
+                )
+            )
+        selected.append(
+            {
+                **_attempt_public(original),
+                "attempt_id": f"reference.{original['attempt_id']}",
+                "version_label": candidate["label"],
+                "revision": candidate["revision"],
+                "capture": False,
+                "reused": True,
+                "reference_source": {
+                    **source_record,
+                    "original_attempt_id": original["attempt_id"],
+                },
+                "row_gate_failures": failures,
+            }
+        )
+    return selected, source_record
 
 
 def _ratio_pct(numerator, denominator):
@@ -563,12 +672,21 @@ def summarize_attempts(
     labels: tuple[str, str],
     cells: tuple[str, ...] = SUITE_CELLS,
     scheduling_mode: str = "fixed-cell-gpu",
+    required_arms: tuple[tuple[str, bool], ...] | None = None,
 ) -> dict:
     baseline_label, candidate_label = labels
+    if required_arms is None:
+        required_arms = (
+            (baseline_label, False),
+            (baseline_label, True),
+            (candidate_label, False),
+            (candidate_label, True),
+        )
     summary = {"suite": SUITE, "cells": {}, "all_gates_pass": True}
     for cell in cells:
         rows = {}
         failures = []
+        cell_attempts = [attempt for attempt in attempts if attempt.get("cell") == cell]
         for attempt in attempts:
             if attempt.get("cell") != cell or "row" not in attempt:
                 continue
@@ -601,14 +719,11 @@ def summarize_attempts(
                 "outer warmup request fingerprints differ: "
                 f"{sorted(outer_warmup_fingerprints)}"
             )
+        planned_gpus = sorted({str(attempt["gpu"]) for attempt in cell_attempts})
         expected_keys = {
-            (
-                attempt["gpu"],
-                attempt["version_label"],
-                bool(attempt["capture"]),
-            )
-            for attempt in attempts
-            if attempt.get("cell") == cell
+            (gpu, label, capture)
+            for gpu in planned_gpus
+            for label, capture in required_arms
         }
         missing = sorted(expected_keys - set(rows))
         if missing:
@@ -617,6 +732,10 @@ def summarize_attempts(
         cell_summary = {
             "comparable": not failures,
             "scheduling_mode": scheduling_mode,
+            "required_arms": [
+                {"version_label": label, "capture": capture}
+                for label, capture in required_arms
+            ],
             "gate_failures": failures,
             "request_fingerprint_sha256": next(iter(fingerprints), None),
             "outer_warmup_fingerprint_sha256": next(
@@ -715,13 +834,14 @@ def summarize_attempts(
 
         for gpu, label in sorted({(key[0], key[1]) for key in rows}):
             on = rows.get((gpu, label, True), {})
-            cell_summary["coverage"][f"gpu{gpu}:{label}"] = {
-                "coverage": on.get("export_coverage_frac"),
-                "drain_s": on.get("measured_drain_s"),
-                "cache_hit_rate_pct": on.get("cache_hit_rate_pct"),
-                "counter_delta": on.get("measured_counter_delta"),
-                "last_log_counters": on.get("capture_counters_last_log"),
-            }
+            if on:
+                cell_summary["coverage"][f"gpu{gpu}:{label}"] = {
+                    "coverage": on.get("export_coverage_frac"),
+                    "drain_s": on.get("measured_drain_s"),
+                    "cache_hit_rate_pct": on.get("cache_hit_rate_pct"),
+                    "counter_delta": on.get("measured_counter_delta"),
+                    "last_log_counters": on.get("capture_counters_last_log"),
+                }
             for capture in (False, True):
                 row = rows.get((gpu, label, capture), {})
                 process = row.get("process_resources") or {}
@@ -776,6 +896,14 @@ def main() -> int:
             "a material card-dependent discrepancy"
         ),
     )
+    parser.add_argument(
+        "--candidate-off-attempts",
+        default=None,
+        help=(
+            "reuse one exact same-GPU candidate capture-off row per cell from "
+            "this attempts.jsonl and launch only upstream baseline/off arms"
+        ),
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     opts = parser.parse_args()
@@ -823,6 +951,10 @@ def main() -> int:
         raise SystemExit("--gpus must name one or more distinct physical GPU indices")
     if opts.cross_gpu_repeat and len(gpus) != 2:
         raise SystemExit("--cross-gpu-repeat requires exactly two GPUs")
+    if opts.candidate_off_attempts and opts.cross_gpu_repeat:
+        raise SystemExit(
+            "--candidate-off-attempts intentionally forbids cross-GPU repetition"
+        )
     labels = (opts.baseline_label, opts.candidate_label)
     if labels[0] == labels[1] or _safe_label(labels[0]) == _safe_label(labels[1]):
         raise SystemExit(
@@ -846,6 +978,12 @@ def main() -> int:
     attempts_path = out_dir / "attempts.jsonl"
     summary_path = out_dir / "comparison_summary.json"
 
+    reference_mode = bool(opts.candidate_off_attempts)
+    scheduling_mode = (
+        "reused-candidate-off+baseline-off-only"
+        if reference_mode
+        else ("cross-gpu-repeat" if opts.cross_gpu_repeat else "fixed-cell-gpu")
+    )
     run_manifest = {
         "schema": "hidden-capture-version-comparison-v1",
         "suite": SUITE,
@@ -866,9 +1004,7 @@ def main() -> int:
         "mooncake": mooncake,
         "mooncake_python_root": str(mooncake_python_root),
         "gpus": list(gpus),
-        "scheduling_mode": (
-            "cross-gpu-repeat" if opts.cross_gpu_repeat else "fixed-cell-gpu"
-        ),
+        "scheduling_mode": scheduling_mode,
         "numa_node": opts.numa_node,
         "numa_policy": (
             "CPU node pinned; memory placement is first-touch because this "
@@ -878,23 +1014,50 @@ def main() -> int:
         ),
         "shard_base": opts.shard_base,
         "host_network_accounting": (
-            "host NIC counters are pair-shared because complementary GPU legs "
-            "run concurrently; process IO and capture byte counters are per leg"
+            "host NIC counters are wave-shared when GPU legs run concurrently; "
+            "process IO and capture byte counters are per leg"
         ),
         "hardware": _hardware_inventory(),
         "started_unix_s": time.time(),
     }
     _write_json(run_manifest_path, run_manifest)
 
-    scheduling_mode = "cross-gpu-repeat" if opts.cross_gpu_repeat else "fixed-cell-gpu"
     waves = comparison_waves(
         cells,
         gpus,
         baseline,
         candidate,
         cross_gpu_repeat=opts.cross_gpu_repeat,
+        scheduled_arms=((baseline, False),) if reference_mode else None,
     )
     attempts = []
+    required_arms = None
+    if reference_mode:
+        cell_gpus = {}
+        for wave in waves:
+            for arm in wave:
+                previous = cell_gpus.setdefault(arm["cell"], arm["gpu"])
+                if previous != arm["gpu"]:
+                    raise AssertionError(
+                        f"cell changed GPU: {arm['cell']} {previous} -> {arm['gpu']}"
+                    )
+        references, reference_source = _load_candidate_off_references(
+            Path(opts.candidate_off_attempts),
+            candidate=candidate,
+            cells=cells,
+            cell_gpus=cell_gpus,
+        )
+        attempts.extend(references)
+        required_arms = (
+            (opts.baseline_label, False),
+            (opts.candidate_label, False),
+        )
+        run_manifest["candidate_off_reference_attempts"] = reference_source
+        run_manifest["reference_attempt_count"] = len(references)
+        if not opts.dry_run:
+            with attempts_path.open("a") as stream:
+                for record in references:
+                    stream.write(json.dumps(_attempt_public(record)) + "\n")
     for wave_index, wave in enumerate(waves):
         specs = []
         for arm in wave:
@@ -997,11 +1160,15 @@ def main() -> int:
         labels,
         cells,
         scheduling_mode=scheduling_mode,
+        required_arms=required_arms,
     )
     _write_json(summary_path, summary)
     run_manifest["finished_unix_s"] = time.time()
     run_manifest["all_gates_pass"] = summary["all_gates_pass"]
     run_manifest["attempt_count"] = len(attempts)
+    run_manifest["launched_attempt_count"] = sum(
+        not attempt.get("reused", False) for attempt in attempts
+    )
     run_manifest["comparison_summary"] = _artifact_record(summary_path)
     _write_json(run_manifest_path, run_manifest)
 
