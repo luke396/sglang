@@ -226,6 +226,8 @@ def benchmark_command(
         f"http://127.0.0.1:{case['port']}",
         "--tp-size",
         str(case["tp_size"]),
+        "--update-mode",
+        case["update_mode"],
         "--gpu-indices",
         *(str(index) for index in case["gpus"]),
         "--original-checkpoint",
@@ -255,6 +257,8 @@ def benchmark_command(
         "--artifact",
         str(child_artifact),
     ]
+    if case.get("fault_injection", False):
+        command.append("--fault-injection")
     return command
 
 
@@ -359,6 +363,14 @@ def summarize_child(payload: dict[str, Any]) -> dict[str, Any]:
         },
         "gpu_peak_delta_mib": memory,
         "memory_leak_analysis": payload["memory_leak_analysis"],
+        "host_memory_leak_analysis": payload.get("host_memory_leak_analysis"),
+        "phase_timing_distributions_ms": payload.get(
+            "phase_timing_distributions_ms", {}
+        ),
+        "host_memory_distributions_bytes": payload.get(
+            "host_memory_distributions_bytes", {}
+        ),
+        "fault_injection": payload.get("fault_injection"),
         "graph_log_before": payload["graph_log_before"],
         "graph_log_after": payload["graph_log_after"],
         "invariant_failures": payload["invariant_failures"],
@@ -432,12 +444,23 @@ def expand_cases(variants: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
             | {
                 "version": variant["name"],
                 "label": f"{variant['name']}-tp{template['tp_size']}",
+                "update_mode": variant["update_mode"],
+                "fault_injection": bool(
+                    variant["fault_injection"] and template["tp_size"] == 1
+                ),
             }
         )
     return cases
 
 
 def validate_inputs(variants: dict[str, dict[str, Any]]) -> dict[str, str]:
+    if (
+        variants["candidate"]["fault_injection"]
+        and variants["candidate"]["update_mode"] != "atomic-presharded"
+    ):
+        raise ValueError(
+            "candidate fault injection requires atomic-presharded update mode"
+        )
     if variants["baseline"]["name"] == variants["candidate"]["name"]:
         raise ValueError("baseline and candidate names must differ")
     actual = {}
@@ -487,6 +510,8 @@ def run_case(
         "CUDA_VISIBLE_DEVICES": ",".join(str(index) for index in case["gpus"]),
         "PYTHONPATH": str(source_root / "python"),
     }
+    if case.get("fault_injection", False):
+        server_env_record["SGLANG_ENABLE_WEIGHT_UPDATE_FAULT_INJECTION"] = "1"
     benchmark_env_record = BENCHMARK_ENV | {
         "CUDA_VISIBLE_DEVICES": server_env_record["CUDA_VISIBLE_DEVICES"],
         "PYTHONPATH": str(harness_root / "python"),
@@ -576,11 +601,15 @@ def variants_from_args(args: argparse.Namespace) -> dict[str, dict[str, Any]]:
             "name": args.baseline_name,
             "source_root": args.baseline_source_root.resolve(),
             "expected_sha": args.baseline_sha,
+            "update_mode": args.baseline_update_mode,
+            "fault_injection": False,
         },
         "candidate": {
             "name": args.candidate_name,
             "source_root": args.candidate_source_root.resolve(),
             "expected_sha": args.candidate_sha,
+            "update_mode": args.candidate_update_mode,
+            "fault_injection": args.candidate_fault_injection,
         },
     }
 
@@ -594,7 +623,7 @@ def main(args: argparse.Namespace) -> int:
     artifact_path = args.artifact_dir / "from-tensor-ab.json"
 
     result: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "running",
         "started_unix_seconds": time.time(),
         "execution": {
@@ -615,6 +644,8 @@ def main(args: argparse.Namespace) -> int:
                 "expected_sha": variant["expected_sha"],
                 "actual_sha": source_shas[role],
                 "source_root": str(variant["source_root"]),
+                "update_mode": variant["update_mode"],
+                "fault_injection": variant["fault_injection"],
             }
             for role, variant in variants.items()
         },
@@ -677,8 +708,19 @@ if __name__ == "__main__":
     parser.add_argument("--baseline-name", required=True)
     parser.add_argument("--baseline-source-root", type=Path, required=True)
     parser.add_argument("--baseline-sha", required=True)
+    parser.add_argument(
+        "--baseline-update-mode",
+        choices=("legacy", "atomic-presharded"),
+        default="legacy",
+    )
     parser.add_argument("--candidate-name", required=True)
     parser.add_argument("--candidate-source-root", type=Path, required=True)
     parser.add_argument("--candidate-sha", required=True)
+    parser.add_argument(
+        "--candidate-update-mode",
+        choices=("legacy", "atomic-presharded"),
+        default="legacy",
+    )
+    parser.add_argument("--candidate-fault-injection", action="store_true")
     parser.add_argument("--artifact-dir", type=Path, required=True)
     raise SystemExit(main(parser.parse_args()))

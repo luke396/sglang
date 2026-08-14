@@ -31,6 +31,9 @@ import requests
 from safetensors.torch import load_file
 
 from sglang.srt.utils import MultiprocessingSerializer
+from sglang.srt.weight_sync.draft_tensor_preshard import (
+    preshard_dflash_named_tensors,
+)
 
 MIB = 1024 * 1024
 
@@ -594,25 +597,45 @@ def load_checkpoint(path: Path) -> tuple[dict, list[tuple[str, Any]], dict[str, 
 
 
 def serialize_payloads(
-    items: list[tuple[str, Any]], tp_size: int
-) -> tuple[list[str], dict[str, Any]]:
+    items: list[tuple[str, Any]], tp_size: int, update_mode: str
+) -> tuple[list[str], dict[str, Any], list[list[tuple[str, Any]]]]:
+    if update_mode == "atomic-presharded":
+        per_rank_items, preshard_info = preshard_dflash_named_tensors(items, tp_size)
+    else:
+        per_rank_items = [items for _ in range(tp_size)]
+        preshard_info = {
+            "source_bytes": sum(
+                tensor.numel() * tensor.element_size() for _, tensor in items
+            ),
+            "per_rank_bytes": [
+                sum(tensor.numel() * tensor.element_size() for _, tensor in items)
+                for _ in range(tp_size)
+            ],
+            "mode": "replicated-full-checkpoint",
+        }
+
     per_rank_seconds = []
     payloads = []
-    for _ in range(tp_size):
+    for rank_items in per_rank_items:
         started = time.perf_counter()
         payloads.append(
             MultiprocessingSerializer.serialize(
-                items,
+                rank_items,
                 output_str=True,
                 cpu_sharing_strategy="file_system",
             )
         )
         per_rank_seconds.append(time.perf_counter() - started)
-    return payloads, {
-        "per_rank_seconds": per_rank_seconds,
-        "total_seconds": sum(per_rank_seconds),
-        "metadata_bytes": [len(payload) for payload in payloads],
-    }
+    return (
+        payloads,
+        {
+            "per_rank_seconds": per_rank_seconds,
+            "total_seconds": sum(per_rank_seconds),
+            "metadata_bytes": [len(payload) for payload in payloads],
+            "preshard": preshard_info,
+        },
+        per_rank_items,
+    )
 
 
 def get_server_info(base_url: str) -> dict[str, Any]:
@@ -623,6 +646,8 @@ def get_server_info(base_url: str) -> dict[str, Any]:
         "internal_states": body.get("internal_states"),
         "version": body.get("version"),
         "model_path": body.get("model_path"),
+        "weight_version": body.get("weight_version"),
+        "draft_weight_update": body.get("draft_weight_update"),
     }
 
 
@@ -651,54 +676,218 @@ def transition_update(
     payloads: list[str],
     weight_version: str,
     label: str,
+    update_mode: str,
+    recovery: bool = False,
 ) -> dict[str, Any]:
     traffic.set_phase(f"transition-{label}")
     traffic.wait_active()
     memory_before = sampler.snapshot()
-    pause_started = time.perf_counter()
-    traffic.begin_transition(label, pause_started)
+    transition_started = time.perf_counter()
+    traffic.begin_transition(label, transition_started)
+    common_payload = {
+        "serialized_named_tensors": payloads,
+        "load_format": None,
+        "flush_cache": False,
+        "draft_only": True,
+        "torch_empty_cache": False,
+        "weight_version": weight_version,
+    }
+    if update_mode == "atomic-presharded":
+        common_payload.update(
+            {
+                "tensors_are_pre_sharded": True,
+                "collect_phase_timings": True,
+                "recovery": recovery,
+            }
+        )
+
     pause = None
     update = None
     cont = None
-    try:
-        pause = timed_post(base_url, "/pause_generation", {"mode": "in_place"})
+    if update_mode == "atomic-presharded":
         update = timed_post(
             base_url,
-            "/update_weights_from_tensor",
-            {
-                "serialized_named_tensors": payloads,
-                "load_format": None,
-                "flush_cache": False,
-                "draft_only": True,
-                "torch_empty_cache": False,
-                "weight_version": weight_version,
-            },
+            "/update_weights_from_tensor_atomic",
+            common_payload,
         )
-    finally:
-        if pause is not None:
-            cont = timed_post(
+        transition_ended = update["ended"]
+        phase_timings = update["response"].get("phase_timings_ms") or {}
+        pause_window_seconds = phase_timings.get("pause_window_ms", 0.0) / 1000
+    else:
+        try:
+            pause = timed_post(base_url, "/pause_generation", {"mode": "in_place"})
+            update = timed_post(
                 base_url,
-                "/continue_generation",
-                {"torch_empty_cache": False},
+                "/update_weights_from_tensor",
+                common_payload,
             )
-    if update is None or cont is None:
-        raise RuntimeError(f"incomplete update transition {label}")
-    traffic.end_transition(cont["ended"])
+        finally:
+            if pause is not None:
+                cont = timed_post(
+                    base_url,
+                    "/continue_generation",
+                    {"torch_empty_cache": False},
+                )
+        if update is None or cont is None:
+            raise RuntimeError(f"incomplete update transition {label}")
+        transition_ended = cont["ended"]
+        pause_window_seconds = transition_ended - pause["started"]
+        phase_timings = update["response"].get("phase_timings_ms") or {}
+
+    traffic.end_transition(transition_ended)
     time.sleep(0.100)
     gap = traffic.finish_transition()
     return {
         "label": label,
+        "update_mode": update_mode,
         "pause": pause,
         "update": update,
         "continue": cont,
-        "pause_window_seconds": cont["ended"] - pause["started"],
+        "pause_window_seconds": pause_window_seconds,
+        "phase_timings_ms": phase_timings,
+        "rank_phase_timings_ms": update["response"].get("rank_phase_timings_ms", []),
+        "rank_host_memory_bytes": update["response"].get("rank_host_memory_bytes", []),
         "memory": sampler.window(
-            pause["started"], cont["ended"], baseline_override=memory_before
+            transition_started, transition_ended, baseline_override=memory_before
         ),
         "traffic_gap": {
             "raw_gap_ms": distribution(gap["raw_gap_ms"]),
             "adjusted_itl_ms": distribution(gap["adjusted_itl_ms"]),
         },
+    }
+
+
+def timed_post_allow_error(
+    base_url: str, path: str, payload: dict, timeout: float = 300
+) -> dict[str, Any]:
+    started = time.perf_counter()
+    response = requests.post(f"{base_url}{path}", json=payload, timeout=timeout)
+    ended = time.perf_counter()
+    try:
+        body = response.json()
+    except Exception:
+        body = {"raw": response.text}
+    return {
+        "started": started,
+        "ended": ended,
+        "seconds": ended - started,
+        "status_code": response.status_code,
+        "response": body,
+    }
+
+
+def run_fail_closed_fault_injection(
+    *,
+    args: argparse.Namespace,
+    baseline: ChecksumSnapshot,
+    original_items: list[tuple[str, Any]],
+    updated_items: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    before = get_server_info(args.base_url)
+    updated_payloads, updated_prep, updated_keepalive = serialize_payloads(
+        updated_items, args.tp_size, args.update_mode
+    )
+    failed = timed_post_allow_error(
+        args.base_url,
+        "/update_weights_from_tensor_atomic",
+        {
+            "serialized_named_tensors": updated_payloads,
+            "load_format": None,
+            "flush_cache": False,
+            "draft_only": True,
+            "torch_empty_cache": False,
+            "weight_version": f"{args.weight_version_prefix}-must-not-commit",
+            "tensors_are_pre_sharded": True,
+            "collect_phase_timings": True,
+            "fault_injection_after_tensors": 2,
+        },
+    )
+    del updated_payloads, updated_keepalive
+    if failed["status_code"] < 400:
+        raise RuntimeError("fault-injected update unexpectedly succeeded")
+    failed_body = failed["response"]
+    if not failed_body.get("partial_update") or not failed_body.get("unhealthy"):
+        raise RuntimeError(f"fault response was not partial+unhealthy: {failed_body}")
+
+    after_failure = get_server_info(args.base_url)
+    health = after_failure.get("draft_weight_update") or {}
+    if not health.get("unhealthy") or not health.get("paused"):
+        raise RuntimeError(f"instance did not stay fail-closed: {health}")
+    if after_failure.get("weight_version") != before.get("weight_version"):
+        raise RuntimeError("weight_version advanced after a failed commit")
+
+    continue_attempt = timed_post_allow_error(
+        args.base_url,
+        "/continue_generation",
+        {"torch_empty_cache": False},
+    )
+    if continue_attempt["status_code"] != 409:
+        raise RuntimeError(
+            f"continue was not rejected while unhealthy: {continue_attempt}"
+        )
+
+    failed_snapshot = checksum_snapshot(args.base_url)
+    failed_comparison = compare_checksums(baseline, failed_snapshot)
+    if any(rank["target_changed_count"] for rank in failed_comparison.get("ranks", [])):
+        raise RuntimeError("target changed during fault-injected draft commit")
+    if not any(
+        rank["draft_changed_count"] for rank in failed_comparison.get("ranks", [])
+    ):
+        raise RuntimeError("fault injection did not occur after a draft mutation")
+
+    original_payloads, original_prep, original_keepalive = serialize_payloads(
+        original_items, args.tp_size, args.update_mode
+    )
+    recovered = timed_post(
+        args.base_url,
+        "/update_weights_from_tensor_atomic",
+        {
+            "serialized_named_tensors": original_payloads,
+            "load_format": None,
+            "flush_cache": False,
+            "draft_only": True,
+            "torch_empty_cache": False,
+            "weight_version": f"{args.weight_version_prefix}-fault-recovered",
+            "tensors_are_pre_sharded": True,
+            "collect_phase_timings": True,
+            "recovery": True,
+        },
+    )
+    del original_payloads, original_keepalive
+    after_recovery = get_server_info(args.base_url)
+    recovery_health = after_recovery.get("draft_weight_update") or {}
+    if recovery_health.get("unhealthy") or recovery_health.get("paused"):
+        raise RuntimeError(
+            f"explicit recovery did not restore health: {recovery_health}"
+        )
+    restored_snapshot = checksum_snapshot(args.base_url)
+    restored_comparison = compare_checksums(baseline, restored_snapshot)
+    for rank in restored_comparison.get("ranks", []):
+        if rank["target_changed_count"] or rank["draft_changed_count"]:
+            raise RuntimeError(
+                f"fault recovery checksum mismatch on rank {rank['rank']}"
+            )
+    if not restored_comparison.get("engine_matches", False):
+        raise RuntimeError("combined checksum did not restore after fault")
+
+    return {
+        "status": "passed",
+        "before": before,
+        "failed_update": failed,
+        "after_failure": after_failure,
+        "continue_attempt": continue_attempt,
+        "failed_checksum": {
+            "snapshot": failed_snapshot.summary(),
+            "vs_baseline": failed_comparison,
+        },
+        "updated_payload_preparation": updated_prep,
+        "recovery": recovered,
+        "after_recovery": after_recovery,
+        "recovered_checksum": {
+            "snapshot": restored_snapshot.summary(),
+            "vs_baseline": restored_comparison,
+        },
+        "original_payload_preparation": original_prep,
     }
 
 
@@ -742,6 +931,55 @@ def memory_leak_analysis(
     return result
 
 
+def host_memory_leak_analysis(
+    cycles: list[dict[str, Any]], tp_size: int
+) -> dict[str, Any]:
+    result = {}
+    for rank in range(tp_size):
+        points = []
+        for cycle in cycles:
+            transition = cycle["restore_transition"]
+            rank_payload = next(
+                (
+                    payload
+                    for payload in transition["rank_host_memory_bytes"]
+                    if payload["rank"] == rank
+                ),
+                None,
+            )
+            if rank_payload is None:
+                continue
+            rss = rank_payload.get("scheduler_rss_after_release_bytes")
+            if rss is not None:
+                points.append((transition["update"]["ended"], float(rss)))
+        fit_points = points[1:]
+        slope = None
+        if len(fit_points) >= 2:
+            xs = [point[0] for point in fit_points]
+            ys = [point[1] for point in fit_points]
+            x_mean = statistics.fmean(xs)
+            y_mean = statistics.fmean(ys)
+            denominator = sum((x - x_mean) ** 2 for x in xs)
+            if denominator:
+                slope = (
+                    sum((x - x_mean) * (y - y_mean) for x, y in fit_points)
+                    / denominator
+                )
+        values = [point[1] for point in points]
+        result[str(rank)] = {
+            "restored_points": len(points),
+            "first_restored_rss_bytes": values[0] if values else None,
+            "last_restored_rss_bytes": values[-1] if values else None,
+            "growth_bytes": values[-1] - values[0] if values else None,
+            "post_warmup_slope_bytes_per_second": slope,
+            "post_warmup_slope_mib_per_hour": (
+                slope * 3600 / MIB if slope is not None else None
+            ),
+            "restored_rss_bytes": distribution(values),
+        }
+    return result
+
+
 def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -764,7 +1002,7 @@ def main(args: argparse.Namespace) -> int:
     started_wall = time.time()
     started_perf = time.perf_counter()
     result: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "running",
         "configuration": vars(args)
         | {
@@ -833,9 +1071,11 @@ def main(args: argparse.Namespace) -> int:
         for cycle_index in range(args.repeats):
             cycle: dict[str, Any] = {"index": cycle_index}
 
-            updated_payloads, updated_serialization = serialize_payloads(
-                updated_items, args.tp_size
-            )
+            (
+                updated_payloads,
+                updated_serialization,
+                updated_payload_keepalive,
+            ) = serialize_payloads(updated_items, args.tp_size, args.update_mode)
             cycle["updated_payload_preparation"] = updated_serialization
             cycle["update_transition"] = transition_update(
                 base_url=args.base_url,
@@ -844,8 +1084,9 @@ def main(args: argparse.Namespace) -> int:
                 payloads=updated_payloads,
                 weight_version=f"{args.weight_version_prefix}-updated-{cycle_index}",
                 label=f"update-{cycle_index}",
+                update_mode=args.update_mode,
             )
-            del updated_payloads
+            del updated_payloads, updated_payload_keepalive
 
             updated_phase = f"updated-{cycle_index}"
             traffic.set_phase(updated_phase)
@@ -911,9 +1152,11 @@ def main(args: argparse.Namespace) -> int:
                 }
             )
 
-            original_payloads, original_serialization = serialize_payloads(
-                original_items, args.tp_size
-            )
+            (
+                original_payloads,
+                original_serialization,
+                original_payload_keepalive,
+            ) = serialize_payloads(original_items, args.tp_size, args.update_mode)
             cycle["original_payload_preparation"] = original_serialization
             cycle["restore_transition"] = transition_update(
                 base_url=args.base_url,
@@ -922,8 +1165,9 @@ def main(args: argparse.Namespace) -> int:
                 payloads=original_payloads,
                 weight_version=f"{args.weight_version_prefix}-restored-{cycle_index}",
                 label=f"restore-{cycle_index}",
+                update_mode=args.update_mode,
             )
-            del original_payloads
+            del original_payloads, original_payload_keepalive
 
             restored_phase = f"restored-{cycle_index}"
             traffic.set_phase(restored_phase)
@@ -972,8 +1216,17 @@ def main(args: argparse.Namespace) -> int:
         traffic.set_phase("shutdown")
         traffic.stop()
         sampler.stop()
-        # Preserve references until after traffic/update IPC consumers exit.
-        del original_items, original_tensors, updated_items, updated_tensors
+
+    if args.fault_injection:
+        result["fault_injection"] = run_fail_closed_fault_injection(
+            args=args,
+            baseline=baseline,
+            original_items=original_items,
+            updated_items=updated_items,
+        )
+        atomic_write_json(args.artifact, result)
+    # Preserve references until after every update/recovery IPC consumer exits.
+    del original_items, original_tensors, updated_items, updated_tensors
 
     result["request_metrics"] = {
         "baseline": traffic.aggregate_summary("baseline"),
@@ -1023,6 +1276,41 @@ def main(args: argparse.Namespace) -> int:
             ]
         ),
     }
+    result["phase_timing_distributions_ms"] = {}
+    result["host_memory_distributions_bytes"] = {}
+    for state, transition_name in (
+        ("update", "update_transition"),
+        ("restore", "restore_transition"),
+    ):
+        phase_keys = {
+            key
+            for cycle in result["cycles"]
+            for key in cycle[transition_name]["phase_timings_ms"]
+        }
+        result["phase_timing_distributions_ms"][state] = {
+            key: distribution(
+                [
+                    cycle[transition_name]["phase_timings_ms"][key]
+                    for cycle in result["cycles"]
+                    if key in cycle[transition_name]["phase_timings_ms"]
+                ]
+            )
+            for key in sorted(phase_keys)
+        }
+        rank_host = {}
+        for cycle in result["cycles"]:
+            for rank_payload in cycle[transition_name]["rank_host_memory_bytes"]:
+                rank = str(rank_payload["rank"])
+                for key, value in rank_payload.items():
+                    if key != "rank":
+                        rank_host.setdefault(rank, {}).setdefault(key, []).append(
+                            float(value)
+                        )
+        result["host_memory_distributions_bytes"][state] = {
+            rank: {key: distribution(values) for key, values in sorted(fields.items())}
+            for rank, fields in sorted(rank_host.items())
+        }
+
     for index in args.gpu_indices:
         for state, transition_name in (
             ("update", "update_transition"),
@@ -1040,6 +1328,9 @@ def main(args: argparse.Namespace) -> int:
 
     result["memory_leak_analysis"] = memory_leak_analysis(
         memory_marks, args.gpu_indices
+    )
+    result["host_memory_leak_analysis"] = host_memory_leak_analysis(
+        result["cycles"], args.tp_size
     )
     result["server_info_after"] = get_server_info(args.base_url)
     result["graph_log_after"] = scan_graph_log(args.server_log)
@@ -1082,6 +1373,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--tp-size", type=int, required=True)
+    parser.add_argument(
+        "--update-mode",
+        choices=("legacy", "atomic-presharded"),
+        default="legacy",
+    )
+    parser.add_argument("--fault-injection", action="store_true")
     parser.add_argument("--gpu-indices", type=int, nargs="+", required=True)
     parser.add_argument("--original-checkpoint", type=Path, required=True)
     parser.add_argument("--updated-checkpoint", type=Path, required=True)
@@ -1101,6 +1398,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--tp-size must match the number of --gpu-indices")
     if args.repeats < 1:
         parser.error("--repeats must be positive")
+    if args.fault_injection and args.update_mode != "atomic-presharded":
+        parser.error("--fault-injection requires --update-mode atomic-presharded")
     return args
 
 
