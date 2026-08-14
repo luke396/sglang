@@ -586,7 +586,7 @@ class TokenizerControlMixin:
             rank_dispatch_ms=(time.perf_counter() - dispatch_started) * 1000,
         )
 
-    async def update_weights_from_tensor_detailed(
+    async def _update_weights_from_tensor_detailed_impl(
         self: TokenizerManager,
         obj: UpdateWeightsFromTensorReqInput,
         request: Optional[fastapi.Request] = None,
@@ -650,6 +650,17 @@ class TokenizerControlMixin:
         result.unhealthy = unhealthy
         result.unhealthy_reason = unhealthy_reason
         return result
+
+    async def update_weights_from_tensor_detailed(
+        self: TokenizerManager,
+        obj: UpdateWeightsFromTensorReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> TensorUpdateControlResult:
+        lock = getattr(self, "atomic_tensor_update_lock", None)
+        if lock is None:
+            lock = self.atomic_tensor_update_lock = asyncio.Lock()
+        async with lock:
+            return await self._update_weights_from_tensor_detailed_impl(obj, request)
 
     async def update_weights_from_tensor(
         self: TokenizerManager,

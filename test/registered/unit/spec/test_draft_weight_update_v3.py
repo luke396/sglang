@@ -362,6 +362,31 @@ class TestAtomicFailClosedController(unittest.IsolatedAsyncioTestCase):
         self.assertIn("partial copy", message)
         manager._async_dispatch_to_scheduler.assert_not_called()
 
+    async def test_legacy_update_waits_for_atomic_transaction_lock(self):
+        manager, _ = self.make_manager()
+        manager.is_pause = True
+        manager.update_weights_from_tensor_communicator = AsyncMock(
+            return_value=[
+                UpdateWeightsFromTensorReqOutput(success=True, message="applied")
+            ]
+        )
+        request = UpdateWeightsFromTensorReqInput(
+            serialized_named_tensors=[b"payload"],
+            draft_only=True,
+        )
+
+        await manager.atomic_tensor_update_lock.acquire()
+        task = asyncio.create_task(manager.update_weights_from_tensor_detailed(request))
+        try:
+            await asyncio.sleep(0)
+            manager.update_weights_from_tensor_communicator.assert_not_awaited()
+        finally:
+            manager.atomic_tensor_update_lock.release()
+
+        result = await task
+        self.assertTrue(result.success)
+        manager.update_weights_from_tensor_communicator.assert_awaited_once()
+
 
 if __name__ == "__main__":
     unittest.main()
