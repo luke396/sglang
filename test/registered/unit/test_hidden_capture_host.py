@@ -7,23 +7,32 @@ without a GPU.
 
 import os
 import tempfile
+import threading
 import time
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
 from sglang.srt.state_capturer.hidden_host import (
     HiddenCaptureBookkeeper,
+    HiddenCapturePressureController,
     HiddenCaptureStats,
     HiddenFinalizeWorker,
     HiddenHostSidecar,
     HiddenStagingRing,
+    HiddenVerifyD2HLauncher,
+    HiddenWallSpanRecorder,
+    SidecarCapacityError,
 )
 from sglang.srt.state_capturer.hidden_sink import (
     HiddenExportJob,
+    HiddenExportTrace,
     HiddenExportWorker,
     HiddenFileSink,
 )
+from sglang.srt.state_capturer.hidden_states import HiddenStatesCapturer
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -35,7 +44,7 @@ NUM_SIDECAR_SLOTS = 64
 DTYPE = torch.float32
 
 
-def _make_ring(num_slots=2, slot_tokens=4):
+def _make_ring(num_slots=2, slot_tokens=4, stats=None, stats_prefix="prefill"):
     return HiddenStagingRing(
         num_slots=num_slots,
         slot_tokens=slot_tokens,
@@ -44,15 +53,18 @@ def _make_ring(num_slots=2, slot_tokens=4):
         dtype=DTYPE,
         pin_memory=False,
         use_cuda_events=False,
+        stats=stats,
+        stats_prefix=stats_prefix,
     )
 
 
-def _make_sidecar():
+def _make_sidecar(stats=None):
     return HiddenHostSidecar(
         num_slots=NUM_SIDECAR_SLOTS,
         aux_width=AUX_WIDTH,
         last_width=LAST_WIDTH,
         dtype=DTYPE,
+        stats=stats,
     )
 
 
@@ -62,6 +74,17 @@ def _rows(num_rows, seed=0):
         torch.randn(num_rows, AUX_WIDTH, generator=g, dtype=DTYPE),
         torch.randn(num_rows, LAST_WIDTH, generator=g, dtype=DTYPE),
     )
+
+
+class _GateEvent:
+    def __init__(self):
+        self.ready = threading.Event()
+
+    def record(self):
+        pass
+
+    def query(self):
+        return self.ready.is_set()
 
 
 class TestStagingRing(CustomTestCase):
@@ -169,7 +192,15 @@ class TestSplitRingFinalizeOrder(CustomTestCase):
             fence_event=_NullEvent(),
         )
         (slot,) = ring.try_acquire(1)
-        ring.enqueue_verify_segment(slot, twin=twin, rids=[rid], stride=2, num_reqs=1)
+        ring.reserve_verify_compact(
+            slot,
+            twin=twin,
+            rids=[rid],
+            stride=2,
+            num_reqs=1,
+            header_submitted_ns=time.monotonic_ns(),
+        )
+        ring.mark_verify_payload_enqueued(slot, num_rows=2)
 
     def test_finalize_merges_rings_in_global_seq_order(self):
         prefill_ring, verify_ring = self._make_pair()
@@ -193,16 +224,6 @@ class TestSplitRingFinalizeOrder(CustomTestCase):
             source.release(slot)
         self.assertEqual(order, [0, 1, 2, 3])
 
-    def test_verify_ring_unaffected_by_full_prefill_ring(self):
-        """The regression this split exists for: with the prefill ring
-        exhausted (finalize stalled on a big memcpy), verify staging must
-        still find slots instead of dropping the whole decode batch."""
-        prefill_ring, verify_ring = self._make_pair()
-        self._enqueue_prefill(prefill_ring, "p0")
-        self._enqueue_prefill(prefill_ring, "p1")
-        self.assertIsNone(prefill_ring.try_acquire(1))  # prefill exhausted
-        self.assertIsNotNone(verify_ring.try_acquire(1))  # verify unaffected
-
 
 class TestSidecarSeqlock(CustomTestCase):
     def test_write_then_validated_read(self):
@@ -225,6 +246,83 @@ class TestSidecarSeqlock(CustomTestCase):
         aux_out, last_out = out
         self.assertTrue(torch.equal(aux_out, aux))
         self.assertTrue(torch.equal(last_out, last))
+
+    def test_direct_gather_writes_exact_preallocated_views(self):
+        stats = HiddenCaptureStats()
+        sidecar = _make_sidecar(stats=stats)
+        slots = torch.tensor([3, 5, 7], dtype=torch.long)
+        tokens = torch.tensor([100, 101, 102], dtype=torch.long)
+        aux, last = _rows(3)
+        gens = sidecar.write_rows(
+            slots=slots, aux_rows=aux, last_rows=last, tokens=tokens
+        )
+        arena = torch.empty(3 * (AUX_WIDTH + LAST_WIDTH), dtype=DTYPE)
+        aux_dst = arena[: 3 * AUX_WIDTH].view(3, AUX_WIDTH)
+        last_dst = arena[3 * AUX_WIDTH :].view(3, LAST_WIDTH)
+        aux_ptr = aux_dst.data_ptr()
+        last_ptr = last_dst.data_ptr()
+
+        self.assertTrue(
+            sidecar.read_rows_validated_into(
+                slots=slots,
+                expected_tokens=tokens,
+                own_slot_gens=dict(zip(slots.tolist(), gens.tolist())),
+                aux_dst=aux_dst,
+                last_dst=last_dst,
+            )
+        )
+        self.assertEqual(aux_dst.data_ptr(), aux_ptr)
+        self.assertEqual(last_dst.data_ptr(), last_ptr)
+        self.assertTrue(torch.equal(aux_dst, aux))
+        self.assertTrue(torch.equal(last_dst, last))
+        self.assertEqual(stats.sidecar_direct_gather_rows_ct, 3)
+
+    def test_direct_gather_validates_before_touching_destination(self):
+        stats = HiddenCaptureStats()
+        sidecar = _make_sidecar(stats=stats)
+        slots = torch.tensor([3], dtype=torch.long)
+        aux, last = _rows(1)
+        sidecar.write_rows(
+            slots=slots,
+            aux_rows=aux,
+            last_rows=last,
+            tokens=torch.tensor([100]),
+        )
+        aux_dst = torch.full((1, AUX_WIDTH), -7.0, dtype=DTYPE)
+        last_dst = torch.full((1, LAST_WIDTH), -9.0, dtype=DTYPE)
+
+        self.assertFalse(
+            sidecar.read_rows_validated_into(
+                slots=slots,
+                expected_tokens=torch.tensor([999]),
+                own_slot_gens={},
+                aux_dst=aux_dst,
+                last_dst=last_dst,
+            )
+        )
+        self.assertTrue(torch.equal(aux_dst, torch.full_like(aux_dst, -7.0)))
+        self.assertTrue(torch.equal(last_dst, torch.full_like(last_dst, -9.0)))
+        self.assertEqual(stats.sidecar_direct_gather_rows_ct, 0)
+
+    def test_direct_gather_rejects_resizable_or_mistyped_destinations(self):
+        sidecar = _make_sidecar()
+        slots = torch.tensor([1, 2], dtype=torch.long)
+        with self.assertRaisesRegex(ValueError, "aux_dst must have shape"):
+            sidecar.read_rows_validated_into(
+                slots=slots,
+                expected_tokens=torch.tensor([1, 2]),
+                own_slot_gens={},
+                aux_dst=torch.empty((1, AUX_WIDTH), dtype=DTYPE),
+                last_dst=torch.empty((2, LAST_WIDTH), dtype=DTYPE),
+            )
+        with self.assertRaisesRegex(ValueError, "last_dst must have shape"):
+            sidecar.read_rows_validated_into(
+                slots=slots,
+                expected_tokens=torch.tensor([1, 2]),
+                own_slot_gens={},
+                aux_dst=torch.empty((2, AUX_WIDTH), dtype=DTYPE),
+                last_dst=torch.empty((2, LAST_WIDTH), dtype=torch.float64),
+            )
 
     def test_own_row_gen_mismatch_fails(self):
         sidecar = _make_sidecar()
@@ -340,11 +438,324 @@ class TestSidecarSeqlock(CustomTestCase):
         self.assertEqual(torn, [])
 
 
+class TestSparseSidecarV7(CustomTestCase):
+    def test_leased_old_generation_survives_slot_reuse_until_settled(self):
+        sidecar = HiddenHostSidecar(
+            num_slots=4,
+            capacity_tokens=2,
+            aux_width=AUX_WIDTH,
+            last_width=LAST_WIDTH,
+            dtype=DTYPE,
+        )
+        old_aux, old_last = _rows(1, seed=58)
+        old_gen = sidecar.write_rows(
+            slots=torch.tensor([0]),
+            aux_rows=old_aux,
+            last_rows=old_last,
+            tokens=torch.tensor([9]),
+        )
+        own = {0: int(old_gen[0])}
+        self.assertEqual(sidecar.lease_rows(own), 1)
+
+        new_aux, new_last = _rows(1, seed=59)
+        sidecar.write_rows(
+            slots=torch.tensor([0]),
+            aux_rows=new_aux,
+            last_rows=new_last,
+            tokens=torch.tensor([10]),
+        )
+        old = sidecar.read_rows_validated(
+            slots=torch.tensor([0]),
+            expected_tokens=torch.tensor([9]),
+            own_slot_gens=own,
+        )
+        current = sidecar.read_rows_validated(
+            slots=torch.tensor([0]),
+            expected_tokens=torch.tensor([10]),
+            own_slot_gens={},
+        )
+        self.assertTrue(torch.equal(old[0], old_aux))
+        self.assertTrue(torch.equal(old[1], old_last))
+        self.assertTrue(torch.equal(current[0], new_aux))
+        self.assertEqual(sidecar.release_rows(own, discard=False), 1)
+        self.assertEqual(sidecar.state_snapshot()["leased_rows"], 0)
+
+    def test_leased_capacity_fails_immediately_then_recovers(self):
+        stats = HiddenCaptureStats()
+        sidecar = HiddenHostSidecar(
+            num_slots=2,
+            capacity_tokens=1,
+            aux_width=AUX_WIDTH,
+            last_width=LAST_WIDTH,
+            dtype=DTYPE,
+            stats=stats,
+        )
+        aux, last = _rows(1, seed=57)
+        gen = sidecar.write_rows(
+            slots=torch.tensor([0]),
+            aux_rows=aux,
+            last_rows=last,
+            tokens=torch.tensor([1]),
+        )
+        own = {0: int(gen[0])}
+        sidecar.lease_rows(own)
+        self.assertEqual(sidecar.pressure_ratio, 1.0)
+        with self.assertRaises(SidecarCapacityError):
+            sidecar.write_rows(
+                slots=torch.tensor([1]),
+                aux_rows=aux,
+                last_rows=last,
+                tokens=torch.tensor([2]),
+            )
+        self.assertEqual(stats.sidecar_lease_conflict_miss_ct, 1)
+        sidecar.release_rows(own, discard=False)
+        sidecar.write_rows(
+            slots=torch.tensor([1]),
+            aux_rows=aux,
+            last_rows=last,
+            tokens=torch.tensor([2]),
+        )
+
+    def test_multirow_eviction_reserves_distinct_physical_rows(self):
+        sidecar = HiddenHostSidecar(
+            num_slots=8,
+            capacity_tokens=2,
+            aux_width=AUX_WIDTH,
+            last_width=LAST_WIDTH,
+            dtype=DTYPE,
+        )
+        first_aux, first_last = _rows(2, seed=60)
+        sidecar.write_rows(
+            slots=torch.tensor([0, 1]),
+            aux_rows=first_aux,
+            last_rows=first_last,
+            tokens=torch.tensor([10, 11]),
+        )
+        second_aux, second_last = _rows(2, seed=61)
+        gens = sidecar.write_rows(
+            slots=torch.tensor([2, 3]),
+            aux_rows=second_aux,
+            last_rows=second_last,
+            tokens=torch.tensor([12, 13]),
+        )
+        rows = sidecar.read_rows_validated(
+            slots=torch.tensor([2, 3]),
+            expected_tokens=torch.tensor([12, 13]),
+            own_slot_gens={2: int(gens[0]), 3: int(gens[1])},
+        )
+        self.assertTrue(torch.equal(rows[0], second_aux))
+        self.assertTrue(torch.equal(rows[1], second_last))
+
+    def test_capacity_evicts_old_identity_and_exact_release_recycles(self):
+        stats = HiddenCaptureStats()
+        sidecar = HiddenHostSidecar(
+            num_slots=8,
+            capacity_tokens=2,
+            aux_width=AUX_WIDTH,
+            last_width=LAST_WIDTH,
+            dtype=DTYPE,
+            stats=stats,
+        )
+        aux, last = _rows(2, seed=70)
+        gens = sidecar.write_rows(
+            slots=torch.tensor([0, 1]),
+            aux_rows=aux,
+            last_rows=last,
+            tokens=torch.tensor([10, 11]),
+        )
+        aux2, last2 = _rows(1, seed=71)
+        sidecar.write_rows(
+            slots=torch.tensor([2]),
+            aux_rows=aux2,
+            last_rows=last2,
+            tokens=torch.tensor([12]),
+        )
+        self.assertIsNone(
+            sidecar.read_rows_validated(
+                slots=torch.tensor([0]),
+                expected_tokens=torch.tensor([10]),
+                own_slot_gens={0: int(gens[0])},
+            )
+        )
+        state = sidecar.state_snapshot()
+        self.assertEqual(state["capacity_tokens"], 2)
+        self.assertEqual(state["resident_rows"], 2)
+        self.assertEqual(stats.sidecar_evicted_rows_ct, 1)
+
+        slot2_gen = int(sidecar.slot_gen[2])
+        self.assertEqual(sidecar.release_rows({2: slot2_gen}), 1)
+        self.assertEqual(sidecar.state_snapshot()["free_rows"], 1)
+        self.assertEqual(stats.sidecar_released_rows_ct, 1)
+
+    def test_reader_copy_runs_outside_lock_and_same_slot_writer_uses_cow(self):
+        sidecar = HiddenHostSidecar(
+            num_slots=4,
+            capacity_tokens=2,
+            aux_width=AUX_WIDTH,
+            last_width=LAST_WIDTH,
+            dtype=DTYPE,
+        )
+        old_aux = torch.full((1, AUX_WIDTH), 1.0)
+        old_last = torch.full((1, LAST_WIDTH), 1.0)
+        old_gen = sidecar.write_rows(
+            slots=torch.tensor([0]),
+            aux_rows=old_aux,
+            last_rows=old_last,
+            tokens=torch.tensor([9]),
+        )
+
+        copy_entered = threading.Event()
+        release_copy = threading.Event()
+        real_index_select = torch.index_select
+
+        def blocking_index_select(*args, **kwargs):
+            copy_entered.set()
+            release_copy.wait(timeout=5.0)
+            return real_index_select(*args, **kwargs)
+
+        reader_result = []
+        with mock.patch("torch.index_select", side_effect=blocking_index_select):
+            reader = threading.Thread(
+                target=lambda: reader_result.append(
+                    sidecar.read_rows_validated(
+                        slots=torch.tensor([0]),
+                        expected_tokens=torch.tensor([9]),
+                        own_slot_gens={0: int(old_gen[0])},
+                    )
+                )
+            )
+            reader.start()
+            self.assertTrue(copy_entered.wait(timeout=2.0))
+
+            new_aux = torch.full((1, AUX_WIDTH), 2.0)
+            new_last = torch.full((1, LAST_WIDTH), 2.0)
+            writer = threading.Thread(
+                target=lambda: sidecar.write_rows(
+                    slots=torch.tensor([0]),
+                    aux_rows=new_aux,
+                    last_rows=new_last,
+                    tokens=torch.tensor([9]),
+                )
+            )
+            writer.start()
+            writer.join(timeout=1.0)
+            self.assertFalse(writer.is_alive(), "writer waited on gather copy")
+            release_copy.set()
+            reader.join(timeout=2.0)
+        self.assertTrue(torch.equal(reader_result[0][0], old_aux))
+        current = sidecar.read_rows_validated(
+            slots=torch.tensor([0]),
+            expected_tokens=torch.tensor([9]),
+            own_slot_gens={},
+        )
+        self.assertTrue(torch.equal(current[0], new_aux))
+
+    def test_leased_reader_pressure_counts_physical_row_once(self):
+        sidecar = HiddenHostSidecar(
+            num_slots=4,
+            capacity_tokens=2,
+            aux_width=AUX_WIDTH,
+            last_width=LAST_WIDTH,
+            dtype=DTYPE,
+        )
+        aux, last = _rows(1, seed=62)
+        gen = sidecar.write_rows(
+            slots=torch.tensor([0]),
+            aux_rows=aux,
+            last_rows=last,
+            tokens=torch.tensor([9]),
+        )
+        own = {0: int(gen[0])}
+        self.assertEqual(sidecar.lease_rows(own), 1)
+        self.assertEqual(sidecar.pressure_ratio, 0.5)
+
+        entered = threading.Event()
+        release = threading.Event()
+        real_index_select = torch.index_select
+
+        def block(*args, **kwargs):
+            entered.set()
+            release.wait(timeout=5.0)
+            return real_index_select(*args, **kwargs)
+
+        with mock.patch("torch.index_select", side_effect=block):
+            reader = threading.Thread(
+                target=lambda: sidecar.read_rows_validated(
+                    slots=torch.tensor([0]),
+                    expected_tokens=torch.tensor([9]),
+                    own_slot_gens=own,
+                )
+            )
+            reader.start()
+            self.assertTrue(entered.wait(timeout=2.0))
+            state = sidecar.state_snapshot()
+            self.assertEqual(state["leased_rows"], 1)
+            self.assertEqual(state["reader_rows"], 1)
+            self.assertEqual(state["unavailable_rows"], 1)
+            self.assertEqual(state["pressure_ratio"], 0.5)
+            release.set()
+            reader.join(timeout=2.0)
+            self.assertFalse(reader.is_alive())
+        self.assertEqual(sidecar.pressure_ratio, 0.5)
+        sidecar.release_rows(own, discard=False)
+        self.assertEqual(sidecar.pressure_ratio, 0.0)
+
+    def test_all_rows_reader_pinned_fails_immediately(self):
+        stats = HiddenCaptureStats()
+        sidecar = HiddenHostSidecar(
+            num_slots=2,
+            capacity_tokens=1,
+            aux_width=AUX_WIDTH,
+            last_width=LAST_WIDTH,
+            dtype=DTYPE,
+            stats=stats,
+        )
+        aux, last = _rows(1)
+        gen = sidecar.write_rows(
+            slots=torch.tensor([0]),
+            aux_rows=aux,
+            last_rows=last,
+            tokens=torch.tensor([1]),
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        real_index_select = torch.index_select
+
+        def block(*args, **kwargs):
+            entered.set()
+            release.wait(timeout=5.0)
+            return real_index_select(*args, **kwargs)
+
+        with mock.patch("torch.index_select", side_effect=block):
+            reader = threading.Thread(
+                target=lambda: sidecar.read_rows_validated(
+                    slots=torch.tensor([0]),
+                    expected_tokens=torch.tensor([1]),
+                    own_slot_gens={0: int(gen[0])},
+                )
+            )
+            reader.start()
+            self.assertTrue(entered.wait(timeout=2.0))
+            started = time.monotonic()
+            with self.assertRaises(SidecarCapacityError):
+                sidecar.write_rows(
+                    slots=torch.tensor([0]),
+                    aux_rows=aux,
+                    last_rows=last,
+                    tokens=torch.tensor([1]),
+                )
+            self.assertLess(time.monotonic() - started, 0.1)
+            release.set()
+            reader.join(timeout=2.0)
+        self.assertEqual(stats.sidecar_capacity_miss_ct, 1)
+
+
 class TestBookkeeper(CustomTestCase):
     def test_miss_propagation_and_pop(self):
         bk = HiddenCaptureBookkeeper()
         bk.record_rows("r1", [1, 2], [2, 2])
-        bk.mark_miss(["r1"])
+        self.assertEqual(bk.mark_miss(["r1"]), 1)
+        self.assertEqual(bk.mark_miss(["r1"]), 0)
         self.assertTrue(bk.is_missed("r1"))
         records = bk.pop("r1")
         self.assertEqual(records, {1: 2, 2: 2})
@@ -364,12 +775,595 @@ class TestBookkeeper(CustomTestCase):
         self.assertEqual(bk.sweep_orphans(ttl_s=-1.0), 1)
         self.assertEqual(bk.pop("r_orphan"), {})
 
+    def test_invalidate_rejects_late_old_sequence_rows(self):
+        bk = HiddenCaptureBookkeeper()
+        bk.record_enqueued(["r"], 7)
+        self.assertEqual(bk.invalidate("r"), {})
+        self.assertFalse(bk.record_rows("r", [1], [2], ring_seq=7))
+        bk.record_enqueued(["r"], 8)
+        self.assertTrue(bk.record_rows("r", [2], [2], ring_seq=8))
+        self.assertEqual(bk.pop("r"), {2: 2})
+
+    def test_per_request_barrier_ignores_younger_enqueue(self):
+        bk = HiddenCaptureBookkeeper()
+        bk.record_enqueued(["a"], 3)
+        bk.record_enqueued(["b"], 4)
+        self.assertEqual(bk.export_barrier("a", global_seq=4), (3, True))
+        self.assertEqual(bk.export_barrier("b", global_seq=4), (4, True))
+
+    def test_barrier_tracks_max_seq_and_fully_warm_falls_back_global(self):
+        bk = HiddenCaptureBookkeeper()
+        bk.record_enqueued(["split"], 2)
+        bk.record_enqueued(["split"], 7)
+        self.assertEqual(bk.export_barrier("split", global_seq=9), (7, True))
+        self.assertEqual(bk.export_barrier("warm", global_seq=9), (9, False))
+        bk.invalidate("split")
+        self.assertEqual(bk.export_barrier("split", global_seq=9), (9, False))
+
+
+class TestObservability(CustomTestCase):
+    def test_export_critical_path_buckets_are_disjoint_and_close(self):
+        recorder = HiddenWallSpanRecorder()
+        recorder.record_finalize(150, 175)
+        trace = HiddenExportTrace(100, dequeued_ns=150)
+        trace.record("gather", 200, 400)
+        trace.record("put", 300, 500)
+        components = trace.attribute(
+            barrier_end_ns=200,
+            end_ns=600,
+            span_recorder=recorder,
+        )
+        self.assertEqual(
+            components,
+            {
+                "wall_ns": 500,
+                "queue": 50,
+                "finalize": 25,
+                "barrier": 25,
+                "gather": 100,
+                "put": 100,
+                "gather_put_overlap": 100,
+                "other": 100,
+            },
+        )
+        stats = HiddenCaptureStats()
+        stats.record_export_critical_path(components)
+        snapshot = stats.critical_path_snapshot()
+        self.assertEqual(snapshot["wall_ns"], 500)
+        self.assertAlmostEqual(sum(snapshot["components_fraction"].values()), 1.0)
+
+    def test_export_critical_path_attribution_is_fail_soft(self):
+        stats = HiddenCaptureStats()
+        stats.record_export_critical_path({"wall_ns": 10, "queue": 3})
+        snapshot = stats.critical_path_snapshot()
+        self.assertEqual(snapshot["components_ns"]["queue"], 3)
+        self.assertEqual(snapshot["components_ns"]["other"], 7)
+        self.assertEqual(stats.export_critical_attribution_mismatch_ct, 1)
+
+    def test_pressure_hysteresis_records_degraded_window(self):
+        stats = HiddenCaptureStats()
+        pressure = HiddenCapturePressureController(
+            stats=stats,
+            high_watermark=0.8,
+            recover_watermark=0.5,
+            min_degraded_s=0.0,
+        )
+        self.assertFalse(
+            pressure.refresh({"sink": 0.0, "export_queue": 0.8, "prefill_ring": 0.0})
+        )
+        pressure.record_drop(phase="finish", requests=3, rows=30, sample_misses=3)
+        self.assertTrue(
+            pressure.refresh({"sink": 0.0, "export_queue": 0.5, "prefill_ring": 0.0})
+        )
+        snapshot = pressure.snapshot()
+        self.assertFalse(snapshot["degraded"])
+        self.assertEqual(len(snapshot["recent_windows"]), 1)
+        window = snapshot["recent_windows"][0]
+        self.assertEqual(window["reasons"], ["export_queue"])
+        self.assertEqual(window["dropped_requests"], 3)
+        self.assertEqual(window["dropped_rows"], 30)
+        self.assertEqual(stats.capture_degraded_ct, 1)
+        self.assertEqual(stats.capture_recovered_ct, 1)
+        self.assertEqual(stats.capture_degraded_sample_miss_ct, 3)
+
+    def test_ring_sidecar_and_finalize_counters_close(self):
+        stats = HiddenCaptureStats()
+        ring = _make_ring(num_slots=2, slot_tokens=4, stats=stats)
+        sidecar = _make_sidecar(stats=stats)
+        bookkeeper = HiddenCaptureBookkeeper()
+        finalize = HiddenFinalizeWorker(
+            ring=ring, sidecar=sidecar, bookkeeper=bookkeeper, stats=stats
+        )
+        aux, last = _rows(3)
+        (slot,) = ring.try_acquire(1)
+        ring.enqueue_segment(
+            slot,
+            aux_rows=aux,
+            last_rows=last,
+            cache_locs=torch.tensor([1, 2, 3]),
+            tokens=torch.tensor([11, 12, 13]),
+            req_ranges=[("r", 0, 3)],
+        )
+        ready = ring.pop_ready()
+        finalize.finalize_slot(ready)
+        ring.release(ready)
+        out = sidecar.read_rows_validated(
+            slots=torch.tensor([1, 2, 3]),
+            expected_tokens=torch.tensor([11, 12, 13]),
+            own_slot_gens={},
+        )
+        self.assertIsNotNone(out)
+        snapshot = stats.snapshot()
+        self.assertEqual(snapshot["prefill_ring_high_water_ct"], 1)
+        self.assertEqual(snapshot["prefill_rows_finalized_ct"], 3)
+        self.assertEqual(snapshot["sidecar_write_rows_ct"], 3)
+        self.assertEqual(snapshot["sidecar_gather_rows_ct"], 3)
+        self.assertGreater(snapshot["sidecar_write_bytes_ct"], 0)
+        self.assertGreater(snapshot["sidecar_gather_bytes_ct"], 0)
+        self.assertGreater(snapshot["finalize_prefill_busy_ns_ct"], 0)
+
+    def test_prefill_finalize_writes_only_sampled_request_ranges(self):
+        stats = HiddenCaptureStats()
+        ring = _make_ring(num_slots=1, slot_tokens=4, stats=stats)
+        sidecar = _make_sidecar(stats=stats)
+        bookkeeper = HiddenCaptureBookkeeper()
+        finalize = HiddenFinalizeWorker(
+            ring=ring, sidecar=sidecar, bookkeeper=bookkeeper, stats=stats
+        )
+        aux, last = _rows(4, seed=99)
+        (slot,) = ring.try_acquire(1)
+        ring.enqueue_segment(
+            slot,
+            aux_rows=aux,
+            last_rows=last,
+            cache_locs=torch.tensor([10, 11, 12, 13]),
+            tokens=torch.tensor([20, 21, 22, 23]),
+            req_ranges=[("sampled-a", 0, 1), ("sampled-b", 3, 4)],
+        )
+        finalize.finalize_slot(ring.pop_ready())
+        self.assertEqual(int(sidecar.slot_gen[10]), 2)
+        self.assertEqual(int(sidecar.slot_gen[11]), 0)
+        self.assertEqual(int(sidecar.slot_gen[12]), 0)
+        self.assertEqual(int(sidecar.slot_gen[13]), 2)
+        self.assertEqual(set(bookkeeper.pop("sampled-a")), {10})
+        self.assertEqual(set(bookkeeper.pop("sampled-b")), {13})
+        self.assertEqual(stats.prefill_rows_finalized_ct, 2)
+
+
+class TestWorkerShutdown(CustomTestCase):
+    def test_capture_initialization_failure_disables_only_capture(self):
+        server_args = SimpleNamespace(
+            enable_hidden_state_capture=True,
+            enable_dp_attention=False,
+            attn_cp_size=1,
+            pp_size=1,
+            disaggregation_mode="null",
+            enable_hierarchical_cache=False,
+            disable_overlap_schedule=False,
+            dllm_algorithm=None,
+            enable_mixed_chunk=False,
+            model_path="model",
+            revision=None,
+            speculative_num_draft_tokens=8,
+            chunked_prefill_size=8192,
+            max_prefill_tokens=16384,
+        )
+        model_config = SimpleNamespace(
+            hf_text_config=SimpleNamespace(hidden_size=4), dtype=torch.float32
+        )
+        spec_aux_config = SimpleNamespace(
+            dflash_use_aux_hidden_state=True,
+            dflash_target_layer_ids=[1],
+            eagle_use_aux_hidden_state=False,
+        )
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "SGLANG_HIDDEN_CAPTURE_SINK": "file",
+                    "SGLANG_HIDDEN_CAPTURE_DIR": "/tmp",
+                },
+            ),
+            mock.patch(
+                "sglang.srt.state_capturer.hidden_states.get_parallel",
+                return_value=SimpleNamespace(attn_tp_rank=0),
+            ),
+            mock.patch.object(
+                HiddenStatesCapturer,
+                "__init__",
+                side_effect=RuntimeError("sink unavailable"),
+            ),
+        ):
+            capturer = HiddenStatesCapturer.create(
+                server_args=server_args,
+                model_config=model_config,
+                spec_aux_config=spec_aux_config,
+                num_tokens=16,
+                max_running_requests=4,
+            )
+        self.assertIsNone(capturer)
+
+    def test_finalize_stop_waits_for_inflight_d2h_then_drains(self):
+        stats = HiddenCaptureStats()
+        bookkeeper = HiddenCaptureBookkeeper()
+        ring = _make_ring(num_slots=1, slot_tokens=4)
+        finalize = HiddenFinalizeWorker(
+            ring=ring,
+            sidecar=_make_sidecar(),
+            bookkeeper=bookkeeper,
+            stats=stats,
+            poll_interval_s=0.0001,
+        )
+        aux, last = _rows(2)
+        (slot,) = ring.try_acquire(1)
+        gate = _GateEvent()
+        slot.event = gate
+        ring.enqueue_segment(
+            slot,
+            aux_rows=aux,
+            last_rows=last,
+            cache_locs=torch.tensor([4, 5]),
+            tokens=torch.tensor([14, 15]),
+            req_ranges=[("d2h", 0, 2)],
+        )
+        finalize.start()
+        finalize.stop()
+        self.addCleanup(gate.ready.set)
+        self.assertFalse(finalize.join(timeout_s=0.02))
+        self.assertEqual(finalize.pending_count, 1)
+        gate.ready.set()
+        self.assertTrue(finalize.join(timeout_s=2.0))
+        self.assertEqual(finalize.pending_count, 0)
+        self.assertEqual(set(bookkeeper.pop("d2h")), {4, 5})
+
+    def test_export_stop_drains_queue_and_rejects_new_admission(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stats = HiddenCaptureStats()
+            bookkeeper = HiddenCaptureBookkeeper()
+            sidecar = _make_sidecar()
+            slots = torch.tensor([7])
+            tokens = torch.tensor([17])
+            aux, last = _rows(1)
+            gens = sidecar.write_rows(
+                slots=slots, aux_rows=aux, last_rows=last, tokens=tokens
+            )
+            bookkeeper.record_rows("queued", [7], gens.tolist())
+            finalize = HiddenFinalizeWorker(
+                ring=_make_ring(),
+                sidecar=sidecar,
+                bookkeeper=bookkeeper,
+                stats=stats,
+            )
+            finalize.last_finalized_seq = 0
+            export = HiddenExportWorker(
+                sidecar=sidecar,
+                bookkeeper=bookkeeper,
+                finalize_worker=finalize,
+                stats=stats,
+                sink=HiddenFileSink(tmpdir),
+                queue_size=2,
+            )
+            queued = HiddenExportJob(
+                rid="queued",
+                sample_id="queued",
+                tokens=tokens,
+                slots=slots,
+                ring_seq_barrier=0,
+            )
+            self.assertTrue(export.submit(queued))
+            export.start()
+            export.stop()
+            self.assertTrue(export.join(timeout_s=2.0))
+            self.assertTrue(os.path.exists(os.path.join(tmpdir, "queued.ckpt")))
+
+            rejected = HiddenExportJob(
+                rid="rejected",
+                sample_id="rejected",
+                tokens=tokens,
+                slots=slots,
+                ring_seq_barrier=0,
+            )
+            self.assertFalse(export.submit(rejected))
+            self.assertEqual(stats.shutdown_admission_miss_ct, 1)
+
+    def test_finalize_stop_waits_for_inflight_sidecar_write(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingWriteSidecar(HiddenHostSidecar):
+            def write_rows(self, **kwargs):
+                entered.set()
+                release.wait(timeout=5.0)
+                return super().write_rows(**kwargs)
+
+        stats = HiddenCaptureStats()
+        bookkeeper = HiddenCaptureBookkeeper()
+        ring = _make_ring(num_slots=1, slot_tokens=4)
+        sidecar = BlockingWriteSidecar(
+            num_slots=NUM_SIDECAR_SLOTS,
+            aux_width=AUX_WIDTH,
+            last_width=LAST_WIDTH,
+            dtype=DTYPE,
+            stats=stats,
+        )
+        finalize = HiddenFinalizeWorker(
+            ring=ring,
+            sidecar=sidecar,
+            bookkeeper=bookkeeper,
+            stats=stats,
+            poll_interval_s=0.0001,
+        )
+        aux, last = _rows(2)
+        (slot,) = ring.try_acquire(1)
+        ring.enqueue_segment(
+            slot,
+            aux_rows=aux,
+            last_rows=last,
+            cache_locs=torch.tensor([6, 7]),
+            tokens=torch.tensor([16, 17]),
+            req_ranges=[("finalize", 0, 2)],
+        )
+        finalize.start()
+        self.assertTrue(entered.wait(timeout=2.0))
+        finalize.stop()
+        self.addCleanup(release.set)
+        self.assertFalse(finalize.join(timeout_s=0.02))
+        release.set()
+        self.assertTrue(finalize.join(timeout_s=2.0))
+        self.assertEqual(set(bookkeeper.pop("finalize")), {6, 7})
+
+    def test_export_stop_waits_for_inflight_gather_then_drains(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingGatherSidecar(HiddenHostSidecar):
+            def read_rows_validated(self, **kwargs):
+                entered.set()
+                release.wait(timeout=5.0)
+                return super().read_rows_validated(**kwargs)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stats = HiddenCaptureStats()
+            bookkeeper = HiddenCaptureBookkeeper()
+            sidecar = BlockingGatherSidecar(
+                num_slots=NUM_SIDECAR_SLOTS,
+                aux_width=AUX_WIDTH,
+                last_width=LAST_WIDTH,
+                dtype=DTYPE,
+                stats=stats,
+            )
+            slots = torch.tensor([8])
+            tokens = torch.tensor([18])
+            aux, last = _rows(1)
+            gens = sidecar.write_rows(
+                slots=slots, aux_rows=aux, last_rows=last, tokens=tokens
+            )
+            bookkeeper.record_rows("gather", [8], gens.tolist())
+            finalize = HiddenFinalizeWorker(
+                ring=_make_ring(),
+                sidecar=sidecar,
+                bookkeeper=bookkeeper,
+                stats=stats,
+            )
+            finalize.last_finalized_seq = 0
+            export = HiddenExportWorker(
+                sidecar=sidecar,
+                bookkeeper=bookkeeper,
+                finalize_worker=finalize,
+                stats=stats,
+                sink=HiddenFileSink(tmpdir),
+                queue_size=1,
+            )
+            self.assertTrue(
+                export.submit(
+                    HiddenExportJob(
+                        rid="gather",
+                        sample_id="gather",
+                        tokens=tokens,
+                        slots=slots,
+                        ring_seq_barrier=0,
+                    )
+                )
+            )
+            export.start()
+            self.assertTrue(entered.wait(timeout=2.0))
+            export.stop()
+            self.addCleanup(release.set)
+            self.assertFalse(export.join(timeout_s=0.02))
+            release.set()
+            self.assertTrue(export.join(timeout_s=2.0))
+            self.assertTrue(os.path.exists(os.path.join(tmpdir, "gather.ckpt")))
+
+    def test_export_stop_waits_for_slow_put_and_submit_never_blocks(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingSink:
+            prefix_enabled = False
+
+            def put(self, sample_id, record):
+                entered.set()
+                release.wait(timeout=5.0)
+                return True
+
+        stats = HiddenCaptureStats()
+        bookkeeper = HiddenCaptureBookkeeper()
+        sidecar = _make_sidecar()
+        slots = torch.tensor([9])
+        tokens = torch.tensor([19])
+        aux, last = _rows(1)
+        gens = sidecar.write_rows(
+            slots=slots, aux_rows=aux, last_rows=last, tokens=tokens
+        )
+        for rid in ("put-a", "put-b", "put-c"):
+            bookkeeper.record_rows(rid, [9], gens.tolist())
+        finalize = HiddenFinalizeWorker(
+            ring=_make_ring(), sidecar=sidecar, bookkeeper=bookkeeper, stats=stats
+        )
+        finalize.last_finalized_seq = 0
+        export = HiddenExportWorker(
+            sidecar=sidecar,
+            bookkeeper=bookkeeper,
+            finalize_worker=finalize,
+            stats=stats,
+            sink=BlockingSink(),
+            queue_size=1,
+        )
+
+        def _job(rid):
+            return HiddenExportJob(
+                rid=rid,
+                sample_id=rid,
+                tokens=tokens,
+                slots=slots,
+                ring_seq_barrier=0,
+            )
+
+        self.assertTrue(export.submit(_job("put-a")))
+        export.start()
+        self.assertTrue(entered.wait(timeout=2.0))
+        started = time.monotonic()
+        self.assertTrue(export.submit(_job("put-b")))
+        self.assertFalse(export.submit(_job("put-c")))
+        self.assertLess(time.monotonic() - started, 0.05)
+        export.stop()
+        self.addCleanup(release.set)
+        self.assertFalse(export.join(timeout_s=0.02))
+        release.set()
+        self.assertTrue(export.join(timeout_s=2.0))
+        self.assertEqual(stats.export_queue_full_miss_ct, 1)
+
+    def test_verify_launcher_stop_drains_header_wait(self):
+        gate = _GateEvent()
+        launched = []
+        launcher = HiddenVerifyD2HLauncher(
+            ring=SimpleNamespace(),
+            twin_pool=SimpleNamespace(),
+            bookkeeper=HiddenCaptureBookkeeper(),
+            stats=HiddenCaptureStats(),
+            capture_stream=None,
+            capture_launch_lock=threading.Lock(),
+            row_bytes=1,
+            poll_interval_s=0.0001,
+        )
+        launcher._launch_payload = lambda slot: launched.append(slot)
+        slot = SimpleNamespace(header_event=gate)
+        launcher.start()
+        launcher.submit(slot)
+        launcher.stop()
+        self.addCleanup(gate.ready.set)
+        self.assertFalse(launcher.join(timeout_s=0.02))
+        self.assertEqual(launcher.pending_count, 1)
+        gate.ready.set()
+        self.assertTrue(launcher.join(timeout_s=2.0))
+        self.assertEqual(launched, [slot])
+
+    def test_capturer_close_never_releases_sink_before_export_join(self):
+        events = []
+        export_join_entered = threading.Event()
+        release_export = threading.Event()
+
+        class Worker:
+            pending_count = 0
+
+            def __init__(self, name, block_join=False):
+                self.name = name
+                self.block_join = block_join
+
+            def stop(self):
+                events.append((self.name, "stop"))
+
+            def join(self, timeout_s):
+                events.append((self.name, "join"))
+                if self.block_join:
+                    export_join_entered.set()
+                    release_export.wait(timeout=5.0)
+                return True
+
+        class ExportWorker(Worker):
+            def stop_admission(self):
+                events.append((self.name, "stop_admission"))
+
+        class Sink:
+            def __init__(self):
+                self.registered = True
+
+            def close(self):
+                events.append(("sink", "close"))
+                self.registered = False
+
+        capturer = object.__new__(HiddenStatesCapturer)
+        capturer._close_lock = threading.Lock()
+        capturer._closed = False
+        capturer._accepting = threading.Event()
+        capturer._accepting.set()
+        capturer.verify_launcher = Worker("launcher")
+        capturer.finalize_worker = Worker("finalize")
+        capturer.export_worker = ExportWorker("export", block_join=True)
+        capturer.sink = Sink()
+        capturer.stats = HiddenCaptureStats()
+
+        result = []
+        closer = threading.Thread(target=lambda: result.append(capturer.close(2.0)))
+        closer.start()
+        self.assertTrue(export_join_entered.wait(timeout=2.0))
+        self.addCleanup(release_export.set)
+        self.assertTrue(capturer.sink.registered)
+        self.assertNotIn(("sink", "close"), events)
+        release_export.set()
+        closer.join(timeout=2.0)
+        self.assertFalse(closer.is_alive())
+        self.assertEqual(result, [True])
+        self.assertFalse(capturer.sink.registered)
+        self.assertLess(
+            events.index(("export", "join")), events.index(("sink", "close"))
+        )
+
+    def test_capturer_close_timeout_keeps_sink_registered(self):
+        class Worker:
+            pending_count = 2
+
+            def stop(self):
+                pass
+
+            def join(self, timeout_s):
+                return True
+
+        class ExportWorker(Worker):
+            def stop_admission(self):
+                pass
+
+            def join(self, timeout_s):
+                return False
+
+        class Sink:
+            registered = True
+
+            def close(self):
+                self.registered = False
+
+        capturer = object.__new__(HiddenStatesCapturer)
+        capturer._close_lock = threading.Lock()
+        capturer._closed = False
+        capturer._accepting = threading.Event()
+        capturer._accepting.set()
+        capturer.verify_launcher = Worker()
+        capturer.finalize_worker = Worker()
+        capturer.export_worker = ExportWorker()
+        capturer.sink = Sink()
+        capturer.stats = HiddenCaptureStats()
+
+        self.assertFalse(capturer.close(0.01))
+        self.assertTrue(capturer.sink.registered)
+        self.assertEqual(capturer.stats.shutdown_export_timeout_miss_ct, 2)
+
 
 class TestVerifyCommittedRows(CustomTestCase):
-    """Verify-window finalize: only rows [i*stride, i*stride+commit_lens[i])
-    per request enter the sidecar. Rejected drafts entering the sidecar would
-    poison warm-prefix reuse (their kv slots are freed and reused while the
-    stale row still carries a plausible token id)."""
+    """Verify-window finalize: the compact payload holds exactly the
+    committed prefix of every request (request i's rows contiguous at
+    [sum(commit_lens[:i]), sum(commit_lens[:i+1]))). Rejected drafts entering
+    the sidecar would poison warm-prefix reuse (their kv slots are freed and
+    reused while the stale row still carries a plausible token id)."""
 
     def _make_verify_slot(self, ring, commit_lens, stride, seed=0):
         from sglang.srt.state_capturer.hidden_host import _DeviceTwin, _NullEvent
@@ -387,13 +1381,29 @@ class TestVerifyCommittedRows(CustomTestCase):
             fence_event=_NullEvent(),
         )
         (slot,) = ring.try_acquire(1)
-        ring.enqueue_verify_segment(
+        ring.reserve_verify_compact(
             slot,
             twin=twin,
             rids=[f"r{i}" for i in range(num_reqs)],
             stride=stride,
             num_reqs=num_reqs,
+            header_submitted_ns=time.monotonic_ns(),
         )
+        # Emulate the payload launcher: contiguous committed rows only.
+        keep = []
+        for i, commit_len in enumerate(commit_lens):
+            keep.extend(range(i * stride, i * stride + commit_len))
+        keep_idx = torch.tensor(keep, dtype=torch.long)
+        packed = len(keep)
+        slot.aux[:packed].copy_(aux[keep_idx])
+        slot.last[:packed].copy_(last[keep_idx])
+        slot.cache_loc[:packed].copy_(twin.cache_loc[keep_idx])
+        slot.tokens[:packed].copy_(twin.tokens[keep_idx])
+        if slot.commit_lens is None:
+            slot.commit_lens = torch.tensor(commit_lens, dtype=torch.int32)
+        else:
+            slot.commit_lens[:num_reqs].copy_(twin.commit_lens[:num_reqs])
+        ring.mark_verify_payload_enqueued(slot, num_rows=packed)
         return ring.pop_ready(), aux, last
 
     def test_only_committed_prefix_enters_sidecar(self):
@@ -428,43 +1438,6 @@ class TestVerifyCommittedRows(CustomTestCase):
         self.assertEqual(set(bookkeeper.pop("r0")), {0, 1})
         self.assertEqual(set(bookkeeper.pop("r1")), {4, 5, 6, 7})
 
-    def test_twin_released_after_finalize(self):
-        from sglang.srt.state_capturer.hidden_host import DeviceTwinPool
-
-        pool = DeviceTwinPool(
-            num_twins=1,
-            twin_tokens=16,
-            max_reqs=4,
-            aux_width=AUX_WIDTH,
-            last_width=LAST_WIDTH,
-            dtype=DTYPE,
-            device="cpu",
-            use_cuda_events=False,
-        )
-        ring = _make_ring(num_slots=1, slot_tokens=16)
-        sidecar = _make_sidecar()
-        finalize = HiddenFinalizeWorker(
-            ring=ring,
-            sidecar=sidecar,
-            bookkeeper=HiddenCaptureBookkeeper(),
-            stats=HiddenCaptureStats(),
-            twin_pool=pool,
-        )
-        twin = pool.try_acquire()
-        self.assertIsNone(pool.try_acquire())  # pool exhausted
-        twin.cache_loc[:2] = torch.tensor([10, 11], dtype=torch.int64)
-        twin.tokens[:2] = torch.tensor([5, 6], dtype=torch.int64)
-        twin.commit_lens[:1] = torch.tensor([1], dtype=torch.int32)
-        (slot,) = ring.try_acquire(1)
-        ring.enqueue_verify_segment(slot, twin=twin, rids=["r0"], stride=2, num_reqs=1)
-        # Drive one loop iteration inline (the daemon path).
-        ready = ring.pop_ready()
-        finalize.finalize_slot(ready)
-        if ready.twin is not None:
-            pool.release(ready.twin)
-        ring.release(ready)
-        self.assertIsNotNone(pool.try_acquire())  # twin back in the pool
-
     def test_twin_reaped_before_finalize(self):
         """Coverage regression (matrix probe: 2x2048 -> 8x512 lifted baseline
         coverage 0.52 -> 0.87 with twin_miss 63 -> 0): a twin is dead the
@@ -489,7 +1462,15 @@ class TestVerifyCommittedRows(CustomTestCase):
         twin.tokens[:2] = torch.tensor([5, 6], dtype=torch.int64)
         twin.commit_lens[:1] = torch.tensor([1], dtype=torch.int32)
         (slot,) = ring.try_acquire(1)
-        ring.enqueue_verify_segment(slot, twin=twin, rids=["r0"], stride=2, num_reqs=1)
+        ring.reserve_verify_compact(
+            slot,
+            twin=twin,
+            rids=["r0"],
+            stride=2,
+            num_reqs=1,
+            header_submitted_ns=time.monotonic_ns(),
+        )
+        ring.mark_verify_payload_enqueued(slot, num_rows=1)
         self.assertIsNone(pool.try_acquire())
 
         # D2H done (_NullEvent queries True); slot NOT yet finalized.
@@ -502,14 +1483,390 @@ class TestVerifyCommittedRows(CustomTestCase):
         self.assertIsNone(ready.twin)
 
 
+class TestVerifyCommittedPack(CustomTestCase):
+    @staticmethod
+    def _case(device="cpu", compact_last=False):
+        from sglang.srt.state_capturer.hidden_pack import (
+            pack_committed_verify_rows_into,
+        )
+
+        bs, stride = 3, 4
+        n = bs * stride
+        aux = torch.arange(n * AUX_WIDTH, dtype=DTYPE, device=device).view(n, AUX_WIDTH)
+        last_dense = (
+            torch.arange(n * LAST_WIDTH, dtype=DTYPE, device=device).view(n, LAST_WIDTH)
+            + 1000
+        )
+        cache_loc = torch.arange(20, 20 + n, dtype=torch.int64, device=device)
+        tokens = torch.arange(200, 200 + n, dtype=torch.int64, device=device)
+        verify_lens = torch.tensor([4, 3, 2], dtype=torch.int32, device=device)
+        commit_lens = torch.tensor([1, 3, 2], dtype=torch.int32, device=device)
+        if compact_last:
+            last = torch.cat(
+                [
+                    last_dense[i * stride : i * stride + int(length)]
+                    for i, length in enumerate(verify_lens.cpu().tolist())
+                ]
+            )
+            last_strided = None
+            last_compact = last
+        else:
+            last_strided = last_dense
+            last_compact = None
+
+        out_aux = torch.empty_like(aux)
+        out_last = torch.empty_like(last_dense)
+        out_cache = torch.empty_like(cache_loc)
+        out_tokens = torch.empty_like(tokens)
+        out_lens = torch.empty(bs, dtype=torch.int32, device=device)
+        out_offsets = torch.empty(bs, dtype=torch.int32, device=device)
+        out_total = torch.empty(1, dtype=torch.int32, device=device)
+        out_verify_offsets = torch.empty(bs, dtype=torch.int32, device=device)
+        pack_committed_verify_rows_into(
+            aux_strided=aux,
+            last_strided=last_strided,
+            last_compact=last_compact,
+            verify_lens=verify_lens if compact_last else None,
+            verify_cache_loc=cache_loc,
+            verify_tokens=tokens,
+            commit_lens=commit_lens,
+            bs=bs,
+            stride=stride,
+            out_aux=out_aux,
+            out_last=out_last,
+            out_cache_loc=out_cache,
+            out_tokens=out_tokens,
+            out_commit_lens=out_lens,
+            out_commit_offsets=out_offsets,
+            out_total_rows=out_total,
+            out_verify_offsets=out_verify_offsets,
+        )
+        keep = torch.tensor([0, 4, 5, 6, 8, 9], dtype=torch.long, device=device)
+        return {
+            "aux": aux,
+            "last": last_dense,
+            "cache": cache_loc,
+            "tokens": tokens,
+            "keep": keep,
+            "out_aux": out_aux,
+            "out_last": out_last,
+            "out_cache": out_cache,
+            "out_tokens": out_tokens,
+            "out_lens": out_lens,
+            "out_offsets": out_offsets,
+            "out_total": out_total,
+        }
+
+    def _assert_case(self, case):
+        total = int(case["out_total"].cpu()[0])
+        self.assertEqual(total, 6)
+        self.assertEqual(case["out_lens"].cpu().tolist(), [1, 3, 2])
+        self.assertEqual(case["out_offsets"].cpu().tolist(), [0, 1, 4])
+        keep = case["keep"]
+        self.assertTrue(
+            torch.equal(case["out_aux"][:total], case["aux"].index_select(0, keep))
+        )
+        self.assertTrue(
+            torch.equal(case["out_last"][:total], case["last"].index_select(0, keep))
+        )
+        self.assertTrue(
+            torch.equal(case["out_cache"][:total], case["cache"].index_select(0, keep))
+        )
+        self.assertTrue(
+            torch.equal(
+                case["out_tokens"][:total], case["tokens"].index_select(0, keep)
+            )
+        )
+
+    def test_cpu_dense_and_compact_source_parity(self):
+        for compact in (False, True):
+            with self.subTest(compact=compact):
+                self._assert_case(self._case(compact_last=compact))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_cuda_dense_and_compact_source_parity(self):
+        # Exercises the Triton kernels, including commit_len=1 and mixed/full
+        # request prefixes. Tensor reads below are the test-only sync.
+        for compact in (False, True):
+            with self.subTest(compact=compact):
+                self._assert_case(self._case(device="cuda", compact_last=compact))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_cuda_graph_replay_cannot_overwrite_packed_twin(self):
+        """The capture pack is queued on the replay stream before the next
+        graph replay. Even though the graph writes the same static sources,
+        the first capture-owned twin must retain step one's values."""
+        from sglang.srt.state_capturer.hidden_pack import (
+            pack_committed_verify_rows_into,
+        )
+
+        bs, stride = 2, 4
+        n = bs * stride
+        aux_width, last_width = 8, 4
+        graph_input = torch.ones((n, aux_width), device="cuda")
+        aux_static = torch.empty_like(graph_input)
+        last_static = torch.empty((n, last_width), device="cuda")
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(capture_stream):
+            for _ in range(3):
+                aux_static.copy_(graph_input)
+                last_static.copy_(graph_input[:, :last_width] + 100)
+            capture_stream.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                aux_static.copy_(graph_input)
+                last_static.copy_(graph_input[:, :last_width] + 100)
+
+        def alloc(width, dtype=DTYPE):
+            return torch.empty((n, width), dtype=dtype, device="cuda")
+
+        out_aux = alloc(aux_width)
+        out_last = alloc(last_width)
+        out_cache = torch.empty(n, dtype=torch.int64, device="cuda")
+        out_tokens = torch.empty(n, dtype=torch.int64, device="cuda")
+        out_lens = torch.empty(bs, dtype=torch.int32, device="cuda")
+        out_offsets = torch.empty(bs, dtype=torch.int32, device="cuda")
+        out_total = torch.empty(1, dtype=torch.int32, device="cuda")
+        out_verify_offsets = torch.empty(bs, dtype=torch.int32, device="cuda")
+        cache = torch.arange(n, dtype=torch.int64, device="cuda")
+        tokens = cache + 1000
+        lens = torch.tensor([1, 4], dtype=torch.int32, device="cuda")
+
+        with torch.cuda.stream(capture_stream):
+            graph_input.fill_(3)
+            graph.replay()
+            pack_committed_verify_rows_into(
+                aux_strided=aux_static,
+                last_strided=last_static,
+                last_compact=None,
+                verify_lens=None,
+                verify_cache_loc=cache,
+                verify_tokens=tokens,
+                commit_lens=lens,
+                bs=bs,
+                stride=stride,
+                out_aux=out_aux,
+                out_last=out_last,
+                out_cache_loc=out_cache,
+                out_tokens=out_tokens,
+                out_commit_lens=out_lens,
+                out_commit_offsets=out_offsets,
+                out_total_rows=out_total,
+                out_verify_offsets=out_verify_offsets,
+            )
+            # This replay overwrites aux_static/last_static in place, but is
+            # ordered after the pack on the same forward stream.
+            graph_input.fill_(9)
+            graph.replay()
+        capture_stream.synchronize()
+        self.assertTrue(torch.equal(out_aux[:5].cpu(), torch.full((5, 8), 3.0)))
+        self.assertTrue(torch.equal(out_last[:5].cpu(), torch.full((5, 4), 103.0)))
+
+    def test_two_phase_launcher_writes_contiguous_payload(self):
+        from sglang.srt.state_capturer.hidden_host import (
+            DeviceTwinPool,
+            HiddenVerifyD2HLauncher,
+        )
+        from sglang.srt.state_capturer.hidden_pack import (
+            pack_committed_verify_rows_into,
+        )
+
+        stats = HiddenCaptureStats()
+        bookkeeper = HiddenCaptureBookkeeper()
+        pool = DeviceTwinPool(
+            num_twins=1,
+            twin_tokens=8,
+            max_reqs=2,
+            aux_width=AUX_WIDTH,
+            last_width=LAST_WIDTH,
+            dtype=DTYPE,
+            device="cpu",
+            use_cuda_events=False,
+            stats=stats,
+        )
+        ring = HiddenStagingRing(
+            num_slots=1,
+            slot_tokens=8,
+            aux_width=AUX_WIDTH,
+            last_width=LAST_WIDTH,
+            dtype=DTYPE,
+            pin_memory=False,
+            use_cuda_events=False,
+            stats=stats,
+            stats_prefix="verify",
+            max_verify_reqs=2,
+        )
+        twin = pool.try_acquire()
+        aux, last = _rows(8, seed=19)
+        cache = torch.arange(10, 18, dtype=torch.int64)
+        tokens = torch.arange(110, 118, dtype=torch.int64)
+        lens = torch.tensor([1, 3], dtype=torch.int32)
+        pack_committed_verify_rows_into(
+            aux_strided=aux,
+            last_strided=last,
+            last_compact=None,
+            verify_lens=None,
+            verify_cache_loc=cache,
+            verify_tokens=tokens,
+            commit_lens=lens,
+            bs=2,
+            stride=4,
+            out_aux=twin.aux,
+            out_last=twin.last,
+            out_cache_loc=twin.cache_loc,
+            out_tokens=twin.tokens,
+            out_commit_lens=twin.commit_lens,
+            out_commit_offsets=twin.commit_offsets,
+            out_total_rows=twin.total_rows,
+            out_verify_offsets=twin.verify_offsets,
+        )
+        twin.pack_start_event.record()
+        twin.fence_event.record()
+        (slot,) = ring.try_acquire(1)
+        slot.commit_lens[:2].copy_(twin.commit_lens[:2])
+        slot.total_rows.copy_(twin.total_rows)
+        slot.header_event.record()
+        seq = ring.reserve_verify_compact(
+            slot,
+            twin=twin,
+            rids=["r0", "r1"],
+            stride=4,
+            num_reqs=2,
+            header_submitted_ns=time.monotonic_ns(),
+        )
+        bookkeeper.record_enqueued(["r0", "r1"], seq)
+        launcher = HiddenVerifyD2HLauncher(
+            ring=ring,
+            twin_pool=pool,
+            bookkeeper=bookkeeper,
+            stats=stats,
+            capture_stream=None,
+            capture_launch_lock=threading.Lock(),
+            row_bytes=(AUX_WIDTH + LAST_WIDTH) * DTYPE.itemsize + 16,
+        )
+        launcher.start()
+        launcher.submit(slot)
+        deadline = time.monotonic() + 2
+        ready = None
+        while ready is None and time.monotonic() < deadline:
+            ready = ring.pop_ready()
+            time.sleep(0.001)
+        launcher.stop()
+        self.assertTrue(launcher.join(timeout_s=2))
+        self.assertIsNotNone(ready)
+
+        sidecar = _make_sidecar()
+        finalize = HiddenFinalizeWorker(
+            ring=ring,
+            sidecar=sidecar,
+            bookkeeper=bookkeeper,
+            stats=stats,
+            twin_pool=pool,
+        )
+        finalize.finalize_slot(ready)
+        pool.release(ready.twin)
+        ring.release(ready)
+        self.assertEqual(set(bookkeeper.pop("r0")), {10})
+        self.assertEqual(set(bookkeeper.pop("r1")), {14, 15, 16})
+        self.assertEqual(stats.verify_candidate_rows_staged_ct, 0)
+        self.assertEqual(stats.verify_payload_rows_staged_ct, 4)
+        self.assertEqual(stats.verify_rows_committed_ct, 4)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_cuda_two_phase_launcher_events_and_timing(self):
+        from sglang.srt.state_capturer.hidden_host import (
+            DeviceTwinPool,
+            HiddenVerifyD2HLauncher,
+        )
+
+        stats = HiddenCaptureStats()
+        bookkeeper = HiddenCaptureBookkeeper()
+        pool = DeviceTwinPool(
+            num_twins=1,
+            twin_tokens=8,
+            max_reqs=2,
+            aux_width=AUX_WIDTH,
+            last_width=LAST_WIDTH,
+            dtype=DTYPE,
+            stats=stats,
+        )
+        ring = HiddenStagingRing(
+            num_slots=1,
+            slot_tokens=8,
+            aux_width=AUX_WIDTH,
+            last_width=LAST_WIDTH,
+            dtype=DTYPE,
+            stats=stats,
+            stats_prefix="verify",
+            max_verify_reqs=2,
+        )
+        twin = pool.try_acquire()
+        twin.pack_start_event.record()
+        twin.aux[:4].fill_(7)
+        twin.last[:4].fill_(8)
+        twin.cache_loc[:4].copy_(
+            torch.tensor([10, 14, 15, 16], dtype=torch.int64, device="cuda")
+        )
+        twin.tokens[:4].copy_(
+            torch.tensor([110, 114, 115, 116], dtype=torch.int64, device="cuda")
+        )
+        twin.commit_lens[:2].copy_(
+            torch.tensor([1, 3], dtype=torch.int32, device="cuda")
+        )
+        twin.total_rows.fill_(4)
+        twin.fence_event.record()
+
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_event(twin.fence_event)
+        (slot,) = ring.try_acquire(1)
+        with torch.cuda.stream(capture_stream):
+            slot.commit_lens[:2].copy_(twin.commit_lens[:2], non_blocking=True)
+            slot.total_rows.copy_(twin.total_rows, non_blocking=True)
+            slot.header_event.record()
+        seq = ring.reserve_verify_compact(
+            slot,
+            twin=twin,
+            rids=["r0", "r1"],
+            stride=4,
+            num_reqs=2,
+            header_submitted_ns=time.monotonic_ns(),
+        )
+        bookkeeper.record_enqueued(["r0", "r1"], seq)
+        launcher = HiddenVerifyD2HLauncher(
+            ring=ring,
+            twin_pool=pool,
+            bookkeeper=bookkeeper,
+            stats=stats,
+            capture_stream=capture_stream,
+            capture_launch_lock=threading.Lock(),
+            row_bytes=(AUX_WIDTH + LAST_WIDTH) * DTYPE.itemsize + 16,
+        )
+        launcher.start()
+        launcher.submit(slot)
+        deadline = time.monotonic() + 5
+        ready = None
+        while ready is None and time.monotonic() < deadline:
+            ready = ring.pop_ready()
+            time.sleep(0.001)
+        launcher.stop()
+        self.assertTrue(launcher.join(timeout_s=2))
+        self.assertIsNotNone(ready)
+        self.assertTrue(torch.equal(ready.aux[:4], torch.full_like(ready.aux[:4], 7)))
+        self.assertGreater(stats.verify_pack_ns_ct, 0)
+        self.assertGreater(stats.verify_payload_d2h_ns_ct, 0)
+        pool.release(ready.twin)
+        ring.release(ready)
+
+
 class TestEndToEndPipeline(CustomTestCase):
     """stage -> finalize -> export against a real temp-dir file sink."""
 
     def _build(self, tmpdir, ring_slots=2, slot_tokens=8, queue_size=8):
         stats = HiddenCaptureStats()
         bookkeeper = HiddenCaptureBookkeeper()
-        ring = _make_ring(num_slots=ring_slots, slot_tokens=slot_tokens)
-        sidecar = _make_sidecar()
+        ring = _make_ring(num_slots=ring_slots, slot_tokens=slot_tokens, stats=stats)
+        sidecar = _make_sidecar(stats=stats)
         finalize = HiddenFinalizeWorker(
             ring=ring, sidecar=sidecar, bookkeeper=bookkeeper, stats=stats
         )
@@ -595,12 +1952,13 @@ class TestEndToEndPipeline(CustomTestCase):
             self.assertEqual(stats.export_ok_ct, 0)
             self.assertEqual(os.listdir(tmpdir), [])
 
-    def test_slot_reuse_after_finish_fails_validation(self):
-        """ABA: r1 finishes, its slots are re-assigned to r2 and rewritten
-        before r1's export runs -> gen mismatch, whole-sample miss."""
+    def test_slot_reuse_after_finish_keeps_leased_generation(self):
+        """V7 COW keeps r1's exact generation while r2 reuses its KV slots."""
         with tempfile.TemporaryDirectory() as tmpdir:
             stats, bookkeeper, ring, sidecar, finalize, export = self._build(tmpdir)
-            self._stage_and_finalize(ring, finalize, "r1", [1, 2], [5, 6], seed=1)
+            aux1, last1 = self._stage_and_finalize(
+                ring, finalize, "r1", [1, 2], [5, 6], seed=1
+            )
             job = HiddenExportJob(
                 rid="r1",
                 sample_id="r1",
@@ -612,8 +1970,12 @@ class TestEndToEndPipeline(CustomTestCase):
             self._stage_and_finalize(ring, finalize, "r2", [1, 2], [5, 6], seed=2)
 
             export.export_one(job)
-            self.assertEqual(stats.prefix_invalid_miss_ct, 1)
-            self.assertEqual(os.listdir(tmpdir), [])
+            self.assertEqual(stats.prefix_invalid_miss_ct, 0)
+            self.assertEqual(stats.export_ok_ct, 1)
+            record = torch.load(os.path.join(tmpdir, "r1.ckpt"), weights_only=True)
+            self.assertTrue(torch.equal(record["aux_hidden_state"][0], aux1))
+            self.assertTrue(torch.equal(record["hidden_state"][0], last1))
+            self.assertEqual(sidecar.state_snapshot()["leased_rows"], 2)
 
     def test_warm_prefix_rows_from_other_request(self):
         """r2 shares a prefix written by r1; token-id validation admits it."""
@@ -622,7 +1984,9 @@ class TestEndToEndPipeline(CustomTestCase):
             aux1, last1 = self._stage_and_finalize(
                 ring, finalize, "r1", [1, 2], [5, 6], seed=1
             )
-            bookkeeper.pop("r1")  # r1 finished unsampled
+            sidecar.release_rows(
+                bookkeeper.pop("r1"), discard=False
+            )  # file-sink row becomes an evictable warm cache entry
             # r2: prefix slots 1,2 (cached; no rows of its own) + new slot 3.
             aux2, last2 = self._stage_and_finalize(
                 ring, finalize, "r2", [3], [7], seed=2
@@ -641,19 +2005,55 @@ class TestEndToEndPipeline(CustomTestCase):
             self.assertTrue(torch.equal(record["aux_hidden_state"][0, 2:], aux2))
             self.assertTrue(torch.equal(record["hidden_state"][0, :2], last1))
 
-    def test_export_queue_full_is_miss(self):
+    def test_prefix_sink_owns_direct_gather_path(self):
+        """Prefix mode must not first allocate/gather a whole sample in the
+        export worker; the sink gathers only its planned suffix into a
+        registered segment lane."""
+
+        class PrefixSinkStub:
+            prefix_enabled = True
+
+            def __init__(self):
+                self.calls = []
+
+            def put_prefix_sample(self, **kwargs):
+                rows = int(kwargs["slots"].numel())
+                aux_dst = torch.empty((rows, AUX_WIDTH), dtype=DTYPE)
+                last_dst = torch.empty((rows, LAST_WIDTH), dtype=DTYPE)
+                ok = kwargs["sidecar"].read_rows_validated_into(
+                    slots=kwargs["slots"],
+                    expected_tokens=kwargs["tokens"],
+                    own_slot_gens=kwargs["own_slot_gens"],
+                    aux_dst=aux_dst,
+                    last_dst=last_dst,
+                )
+                self.calls.append((kwargs, aux_dst, last_dst))
+                return True if ok else None
+
         with tempfile.TemporaryDirectory() as tmpdir:
-            stats, _, _, _, _, export = self._build(tmpdir, queue_size=1)
-            job = HiddenExportJob(
-                rid="rx",
-                sample_id="rx",
-                tokens=torch.tensor([1], dtype=torch.long),
-                slots=torch.tensor([1], dtype=torch.long),
-                ring_seq_barrier=0,
+            stats, bookkeeper, ring, sidecar, finalize, export = self._build(tmpdir)
+            sink = PrefixSinkStub()
+            export.sink = sink
+            aux, last = self._stage_and_finalize(
+                ring, finalize, "r1", [1, 2, 3], [5, 6, 7], seed=21
             )
-            self.assertTrue(export.submit(job))
-            self.assertFalse(export.submit(job))  # queue full -> miss, no block
-            self.assertEqual(stats.export_queue_full_miss_ct, 1)
+            export.export_one(
+                HiddenExportJob(
+                    rid="r1",
+                    sample_id="s1",
+                    tokens=torch.tensor([5, 6, 7], dtype=torch.long),
+                    slots=torch.tensor([1, 2, 3], dtype=torch.long),
+                    ring_seq_barrier=0,
+                    prompt_len=2,
+                )
+            )
+            self.assertEqual(stats.export_ok_ct, 1)
+            self.assertEqual(stats.sidecar_direct_gather_rows_ct, 3)
+            self.assertEqual(len(sink.calls), 1)
+            kwargs, aux_back, last_back = sink.calls[0]
+            self.assertEqual(kwargs["prompt_len"], 2)
+            self.assertTrue(torch.equal(aux_back, aux))
+            self.assertTrue(torch.equal(last_back, last))
 
     def test_barrier_timeout_is_miss(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -672,13 +2072,6 @@ class TestEndToEndPipeline(CustomTestCase):
 
 
 class TestFileSink(CustomTestCase):
-    def test_atomic_write_no_partial_files(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            sink = HiddenFileSink(tmpdir)
-            sink.put("s1", {"input_ids": torch.tensor([1, 2])})
-            files = os.listdir(tmpdir)
-            self.assertEqual(files, ["s1.ckpt"])  # no .tmp left behind
-
     def test_fingerprint_idempotent(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             sink = HiddenFileSink(tmpdir)
@@ -752,22 +2145,156 @@ class TestSnapshotKvSlots(CustomTestCase):
 
         class _Host:
             _snapshot_kv_slots = HiddenStatesCapturer._snapshot_kv_slots
+            _snapshot_kv_slots_batch = HiddenStatesCapturer._snapshot_kv_slots_batch
 
         host = _Host()
         cuda = torch.cuda.is_available()
         host.snapshot_stream = torch.cuda.Stream() if cuda else None
         host._snapshot_buf = (
-            torch.empty((num_tokens,), dtype=torch.int64, pin_memory=True)
+            torch.empty((num_tokens,), dtype=torch.int32, pin_memory=True)
             if cuda
             else None
         )
         host._snapshot_event = torch.cuda.Event() if cuda else None
+        host.stats = HiddenCaptureStats()
         return host
+
+    def test_cpu_batched_snapshot_values_and_independence(self):
+        host = self._make_host(num_tokens=4)
+        first, second = host._snapshot_kv_slots_batch(
+            [
+                torch.tensor([2, 4, 6], dtype=torch.int32),
+                torch.tensor([11, 13], dtype=torch.int32),
+            ]
+        )
+        self.assertEqual(first.tolist(), [2, 4, 6])
+        self.assertEqual(second.tolist(), [11, 13])
+        self.assertEqual(first.dtype, torch.int64)
+        self.assertEqual(host.stats.finish_snapshot_batches_ct, 1)
+        self.assertEqual(host.stats.finish_snapshot_requests_ct, 2)
+        self.assertEqual(host.stats.finish_snapshot_rows_ct, 5)
+
+    def test_collect_batch_builds_jobs_from_one_snapshot_batch(self):
+        from sglang.srt.state_capturer.hidden_states import HiddenStatesCapturer
+
+        capturer = object.__new__(HiddenStatesCapturer)
+        capturer._accepting = threading.Event()
+        capturer._accepting.set()
+        capturer.stats = HiddenCaptureStats()
+        capturer.bookkeeper = HiddenCaptureBookkeeper()
+        capturer.sample_rate = 1.0
+        capturer.sink = SimpleNamespace(prefix_enabled=False)
+        capturer.snapshot_stream = None
+        capturer._snapshot_buf = None
+        capturer._snapshot_event = None
+        capturer.ring = SimpleNamespace(last_enqueued_seq=-1)
+        jobs = []
+        capturer.export_worker = SimpleNamespace(
+            submit=lambda job: jobs.append(job) or True
+        )
+        reqs = [
+            SimpleNamespace(
+                rid="finish-a",
+                req_pool_idx=0,
+                origin_input_ids=[1, 2, 3],
+                output_ids_through_stop=[4, 5],
+                extra_key=None,
+                lora_id=None,
+                input_embeds=None,
+                multimodal_inputs=None,
+                positional_embed_overrides=None,
+            ),
+            SimpleNamespace(
+                rid="finish-b",
+                req_pool_idx=1,
+                origin_input_ids=[7, 8],
+                output_ids_through_stop=[9, 10, 11],
+                extra_key=None,
+                lora_id=None,
+                input_embeds=None,
+                multimodal_inputs=None,
+                positional_embed_overrides=None,
+            ),
+        ]
+        pool = SimpleNamespace(
+            req_to_token=torch.tensor(
+                [[20, 21, 22, 23, -1], [30, 31, 32, 33, -1]],
+                dtype=torch.int32,
+            )
+        )
+        capturer.collect_batch_at_finish(reqs, pool)
+        self.assertEqual(len(jobs), 2)
+        # Both sequences have 5 tokens, hence forwarded rows [0, 4).
+        self.assertEqual(jobs[0].slots.tolist(), [20, 21, 22, 23])
+        self.assertEqual(jobs[1].slots.tolist(), [30, 31, 32, 33])
+        self.assertEqual(jobs[0].tokens.tolist(), [1, 2, 3, 4])
+        self.assertEqual(jobs[1].tokens.tolist(), [7, 8, 9, 10])
+        self.assertEqual(capturer.stats.finish_snapshot_batches_ct, 1)
+        self.assertEqual(capturer.stats.finish_snapshot_requests_ct, 2)
+
+    def test_collect_batch_snapshot_failure_is_fail_soft(self):
+        from sglang.srt.state_capturer.hidden_states import HiddenStatesCapturer
+
+        capturer = object.__new__(HiddenStatesCapturer)
+        capturer._accepting = threading.Event()
+        capturer._accepting.set()
+        capturer.stats = HiddenCaptureStats()
+        capturer.bookkeeper = HiddenCaptureBookkeeper()
+        capturer.sample_rate = 1.0
+        capturer.sink = SimpleNamespace(prefix_enabled=False)
+        capturer.ring = SimpleNamespace(last_enqueued_seq=-1)
+        jobs = []
+        capturer.export_worker = SimpleNamespace(submit=jobs.append)
+        capturer._snapshot_kv_slots_batch = lambda _ranges: (_ for _ in ()).throw(
+            RuntimeError("injected snapshot failure")
+        )
+        req = SimpleNamespace(
+            rid="finish-fail-soft",
+            req_pool_idx=0,
+            origin_input_ids=[1, 2],
+            output_ids_through_stop=[3],
+            extra_key=None,
+            lora_id=None,
+            input_embeds=None,
+            multimodal_inputs=None,
+            positional_embed_overrides=None,
+        )
+        pool = SimpleNamespace(
+            req_to_token=torch.tensor([[20, 21, -1]], dtype=torch.int32)
+        )
+
+        # No exception reaches the scheduler, which remains free to release
+        # the request's KV slots after this hook returns.
+        capturer.collect_batch_at_finish([req], pool)
+
+        self.assertEqual(capturer.stats.finish_snapshot_failed_miss_ct, 1)
+        self.assertTrue(capturer.bookkeeper.is_missed(req.rid))
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0].rid, req.rid)
+        self.assertEqual(jobs[0].tokens.numel(), 0)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_gpu_batched_snapshot_single_wait_and_buffer_growth(self):
+        host = self._make_host(num_tokens=4)
+        snapshots = host._snapshot_kv_slots_batch(
+            [
+                torch.arange(5, dtype=torch.int32, device="cuda"),
+                torch.arange(20, 26, dtype=torch.int32, device="cuda"),
+            ]
+        )
+        self.assertEqual(snapshots[0].tolist(), list(range(5)))
+        self.assertEqual(snapshots[1].tolist(), list(range(20, 26)))
+        self.assertGreaterEqual(host._snapshot_buf.numel(), 11)
+        self.assertEqual(host.stats.finish_snapshot_batches_ct, 1)
+        self.assertEqual(host.stats.finish_snapshot_requests_ct, 2)
+        self.assertEqual(host.stats.finish_snapshot_d2h_bytes_ct, 11 * 4)
+        self.assertEqual(host.stats.finish_snapshot_grow_ct, 1)
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_gpu_snapshot_values_and_buffer_reuse(self):
         host = self._make_host()
-        # int32 source mirrors req_to_token; the pinned buf is int64.
+        # int32 source mirrors req_to_token and lands into same-dtype pinned
+        # memory; the returned independent CPU snapshot is converted to long.
         first = host._snapshot_kv_slots(
             torch.arange(10, dtype=torch.int32, device="cuda")
         )

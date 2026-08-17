@@ -1622,6 +1622,25 @@ class Scheduler(
     def release_host_resources(self) -> None:
         # Release pinned host buffers in userspace on graceful shutdown; see
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
+        from sglang.srt.state_capturer.hidden_states import (
+            get_global_hidden_capturer,
+            set_global_hidden_capturer,
+        )
+
+        hidden_capturer = get_global_hidden_capturer()
+        if hidden_capturer is not None:
+            try:
+                if not hidden_capturer.close():
+                    logger.warning(
+                        "hidden capture did not fully drain before the "
+                        "graceful-shutdown deadline"
+                    )
+            except Exception:
+                # Shutdown cleanup must not prevent the scheduler from
+                # releasing the rest of its host/GPU resources.
+                logger.exception("hidden capture graceful shutdown failed")
+            finally:
+                set_global_hidden_capturer(None)
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.destroy()
         self.tree_cache.release_host_resources()
@@ -4236,6 +4255,17 @@ class Scheduler(
         )
         ret["startup_time"] = self.startup_time
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+
+        # Characterization reads this at warmup/measurement boundaries and
+        # during bounded soak runs.  It is intentionally query-only: capture
+        # counters and queue depths never enter the scheduler hot path.
+        from sglang.srt.state_capturer.hidden_states import (
+            get_global_hidden_capturer,
+        )
+
+        hidden_capturer = get_global_hidden_capturer()
+        if hidden_capturer is not None:
+            ret["hidden_capture"] = hidden_capturer.observability_snapshot()
 
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager

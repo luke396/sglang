@@ -19,6 +19,7 @@ import os
 import tempfile
 import time
 import unittest
+from contextlib import contextmanager
 
 import requests
 import torch
@@ -36,6 +37,20 @@ register_cuda_ci(est_time=900, stage="base-b", runner_config="1-gpu-large")
 
 TARGET_MODEL = "Qwen/Qwen3-8B"
 DRAFT_MODEL = "deepseek-ai/dspark_qwen3_8b_block7"
+
+
+def _default_mooncake_master():
+    try:
+        import mooncake
+
+        return os.path.join(os.path.dirname(mooncake.__file__), "mooncake_master")
+    except Exception:
+        return "mooncake_master"
+
+
+MOONCAKE_MASTER_BIN = (
+    os.environ.get("MOONCAKE_MASTER_BIN") or _default_mooncake_master()
+)
 
 if is_sm100_supported():
     ATTENTION_BACKEND = "trtllm_mha"
@@ -97,6 +112,140 @@ def _wait_for_ckpt(capture_dir, rid, timeout_s=_EXPORT_POLL_TIMEOUT_S):
             return torch.load(path, weights_only=True)
         time.sleep(0.2)
     return None
+
+
+@contextmanager
+def _registered_tensors(store, *tensors):
+    registered = []
+    try:
+        for tensor in tensors:
+            nbytes = tensor.numel() * tensor.element_size()
+            store.register_buffer(tensor.data_ptr(), nbytes)
+            registered.append(tensor)
+        yield
+    finally:
+        for tensor in reversed(registered):
+            store.unregister_buffer(tensor.data_ptr())
+
+
+def _torch_dtype(name):
+    return getattr(torch, str(name).split(".")[-1])
+
+
+def _consume_mooncake_sample(store, store_id, sample_id, timeout_s=30):
+    """Read either the default V6 sample-view format or the legacy fallback.
+
+    The V6 branch deliberately reconstructs one contiguous sample from
+    immutable segment refs, mirroring the registered ``batch_get_into`` data
+    path owned by SpecLoop without importing that separate repository here.
+    """
+    prefix_meta_key = f"{store_id}/_samples/{sample_id}/meta"
+    legacy_meta_key = f"{store_id}/{sample_id}/g0/meta"
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if int(store.is_exist(prefix_meta_key)) == 1:
+            break
+        if int(store.is_exist(legacy_meta_key)) == 1:
+            break
+        time.sleep(0.2)
+
+    if int(store.is_exist(prefix_meta_key)) == 1:
+        sample = json.loads(bytes(store.get(prefix_meta_key)))
+        assert sample["schema"] == "hidden-sample-view-v1"
+        assert sample["sample_id"] == sample_id
+        num_rows = int(sample["num_rows"])
+        refs = sample["segments"]
+        assert refs and sum(int(ref["rows"]) for ref in refs) == num_rows
+
+        segment_metas = []
+        expected_offset = 0
+        for ref in refs:
+            assert int(ref["sample_offset"]) == expected_offset
+            rows = int(ref["rows"])
+            assert rows > 0
+            expected_offset += rows
+            base = (
+                f"{store_id}/_segments/{sample['writer_epoch']}/" f"{ref['segment_id']}"
+            )
+            segment_meta = json.loads(bytes(store.get(f"{base}/meta")))
+            assert segment_meta["schema"] == "hidden-segment-v1"
+            assert int(segment_meta["num_rows"]) == rows
+            segment_metas.append((ref, base, segment_meta))
+        assert expected_offset == num_rows
+
+        first_meta = segment_metas[0][2]
+        aux_spec = first_meta["tensors"]["aux"]
+        last_spec = first_meta["tensors"]["last_hidden"]
+        input_ids = torch.empty(
+            num_rows, dtype=_torch_dtype(sample["input_ids"]["dtype"])
+        )
+        aux = torch.empty(
+            (num_rows, int(aux_spec["shape"][1])), dtype=_torch_dtype(aux_spec["dtype"])
+        )
+        last_hidden = torch.empty(
+            (num_rows, int(last_spec["shape"][1])),
+            dtype=_torch_dtype(last_spec["dtype"]),
+        )
+
+        keys = [sample["input_ids"]["key"]]
+        pointers = [input_ids.data_ptr()]
+        sizes = [input_ids.numel() * input_ids.element_size()]
+        for ref, base, segment_meta in segment_metas:
+            offset = int(ref["sample_offset"])
+            rows = int(ref["rows"])
+            assert segment_meta["tensors"]["aux"]["dtype"] == aux_spec["dtype"]
+            assert segment_meta["tensors"]["last_hidden"]["dtype"] == last_spec["dtype"]
+            aux_view = aux.narrow(0, offset, rows)
+            last_view = last_hidden.narrow(0, offset, rows)
+            keys.extend([f"{base}/aux", f"{base}/last_hidden"])
+            pointers.extend([aux_view.data_ptr(), last_view.data_ptr()])
+            sizes.extend(
+                [
+                    aux_view.numel() * aux_view.element_size(),
+                    last_view.numel() * last_view.element_size(),
+                ]
+            )
+        with _registered_tensors(store, input_ids, aux, last_hidden):
+            actual = store.batch_get_into(keys, pointers, sizes)
+        assert len(actual) == len(sizes)
+        assert all(int(got) == want for got, want in zip(actual, sizes))
+        return {
+            "meta": {
+                **sample,
+                "num_tokens": num_rows,
+            },
+            "input_ids": input_ids,
+            "aux": aux.unsqueeze(0),
+            "last_hidden": last_hidden.unsqueeze(0),
+        }
+
+    assert int(store.is_exist(legacy_meta_key)) == 1, f"meta missing: {sample_id}"
+    meta = json.loads(bytes(store.get(legacy_meta_key)))
+    out = {"meta": meta}
+    tensors = []
+    keys = []
+    pointers = []
+    sizes = []
+    for name in ("aux", "last_hidden", "input_ids"):
+        spec = meta["tensors"][name]
+        tensor = torch.empty(
+            [int(value) for value in spec["shape"]], dtype=_torch_dtype(spec["dtype"])
+        )
+        tensors.append(tensor)
+        keys.append(f"{store_id}/{sample_id}/g0/{name}")
+        pointers.append(tensor.data_ptr())
+        sizes.append(tensor.numel() * tensor.element_size())
+        out[name] = tensor
+    with _registered_tensors(store, *tensors):
+        if callable(getattr(store, "batch_get_into", None)):
+            actual = store.batch_get_into(keys, pointers, sizes)
+        else:
+            actual = [
+                store.get_into(key, pointer, size)
+                for key, pointer, size in zip(keys, pointers, sizes)
+            ]
+    assert all(int(got) == want for got, want in zip(actual, sizes))
+    return out
 
 
 def _row_cosine(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -344,7 +493,7 @@ class TestHiddenCaptureGraphOnMooncake(CustomTestCase):
 
     MASTER_PORT = 50056
     STORE_ID = "graphon_acceptance"
-    MASTER_BIN = "/usr/local/lib/python3.12/dist-packages/mooncake/mooncake_master"
+    MASTER_BIN = MOONCAKE_MASTER_BIN
 
     @classmethod
     def setUpClass(cls):
@@ -411,26 +560,7 @@ class TestHiddenCaptureGraphOnMooncake(CustomTestCase):
         return store
 
     def _consume_sample(self, store, rid, timeout_s=30):
-        meta_key = f"{self.STORE_ID}/{rid}/g0/meta"
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline and int(store.is_exist(meta_key)) != 1:
-            time.sleep(0.2)
-        self.assertEqual(int(store.is_exist(meta_key)), 1, f"meta missing: {rid}")
-        meta = json.loads(bytes(store.get(meta_key)))
-        out = {"meta": meta}
-        for name in ("aux", "last_hidden", "input_ids"):
-            spec = meta["tensors"][name]
-            t = torch.empty(
-                [int(x) for x in spec["shape"]],
-                dtype=getattr(torch, spec["dtype"].split(".")[-1]),
-            )
-            nb = t.numel() * t.element_size()
-            store.register_buffer(t.data_ptr(), nb)
-            n = store.get_into(f"{self.STORE_ID}/{rid}/g0/{name}", t.data_ptr(), nb)
-            store.unregister_buffer(t.data_ptr())
-            self.assertEqual(n, nb)
-            out[name] = t
-        return out
+        return _consume_mooncake_sample(store, self.STORE_ID, rid, timeout_s)
 
     @staticmethod
     def _load_lm_head():
@@ -693,7 +823,7 @@ class TestHiddenCaptureDPReplicas(CustomTestCase):
 
     MASTER_PORT = 50055
     STORE_ID = "dp_ownership"
-    MASTER_BIN = "/usr/local/lib/python3.12/dist-packages/mooncake/mooncake_master"
+    MASTER_BIN = MOONCAKE_MASTER_BIN
 
     @classmethod
     def setUpClass(cls):
@@ -813,7 +943,7 @@ class TestHiddenCaptureDPReplicas(CustomTestCase):
                 missing = {
                     rid
                     for rid in missing
-                    if int(store.is_exist(f"{self.STORE_ID}/{rid}/g0/meta")) != 1
+                    if int(store.is_exist(f"{self.STORE_ID}/_samples/{rid}/meta")) != 1
                 }
                 if missing:
                     time.sleep(0.5)
@@ -828,14 +958,13 @@ class TestHiddenCaptureDPReplicas(CustomTestCase):
             # request (a cross-replica mixup or kv-slot bleed would surface
             # here), with decode rows covered on both ranks.
             for rid, expected in zip(rids, expected_ids):
-                meta = json.loads(bytes(store.get(f"{self.STORE_ID}/{rid}/g0/meta")))
+                sample = _consume_mooncake_sample(
+                    store, self.STORE_ID, rid, timeout_s=5
+                )
+                meta = sample["meta"]
                 self.assertEqual(meta["rid"], rid)
                 self.assertEqual(meta["num_tokens"], len(expected))
-                ids_back = self._consume_tensor(
-                    store,
-                    f"{self.STORE_ID}/{rid}/g0/input_ids",
-                    meta["tensors"]["input_ids"],
-                )
+                ids_back = sample["input_ids"]
                 self.assertEqual(ids_back.tolist(), expected, f"rid {rid}")
             # Fingerprint written once, coherent across two replica writers.
             fp = json.loads(bytes(store.get(f"{self.STORE_ID}/_fingerprint")))

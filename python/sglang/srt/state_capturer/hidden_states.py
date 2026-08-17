@@ -13,9 +13,9 @@ host-side capture pipeline (see ``hidden_host.py`` / ``hidden_sink.py``):
 - ``HiddenCaptureOutput.stage`` / ``HiddenVerifyCaptureOutput.stage``
   (scheduler, copy stream): async D2H into the pinned staging ring on a
   dedicated capture stream.
-- ``collect_at_finish`` (scheduler, before ``release_kv_cache``): sampling
-  decision, kv-slot snapshot over prompt + committed decode rows, export job
-  enqueue.
+- ``collect_batch_at_finish`` (scheduler, before ``release_kv_cache``): repeat
+  the deterministic sampling gate, snapshot KV slots over prompt + committed
+  decode rows, and enqueue the export job.
 
 Coverage is every forwarded token: prompt rows (prefill capture) plus
 verify-committed decode rows (the final sampled token has no hidden row).
@@ -26,10 +26,14 @@ matrix in ``create``.
 from __future__ import annotations
 
 import contextlib
+import functools
 import hashlib
 import logging
+import math
 import re
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+import threading
+import time
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import msgspec
 import torch
@@ -42,10 +46,12 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.state_capturer.hidden_host import (
     DeviceTwinPool,
     HiddenCaptureBookkeeper,
+    HiddenCapturePressureController,
     HiddenCaptureStats,
     HiddenFinalizeWorker,
     HiddenHostSidecar,
     HiddenStagingRing,
+    HiddenVerifyD2HLauncher,
     _StagingSeqCounter,
 )
 from sglang.srt.state_capturer.hidden_sink import (
@@ -71,9 +77,15 @@ _SAFE_RID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
 # HBM token-slot budget for the verify twin pool when the geometry is not
 # pinned via env vars: slots = budget / verify_window_tokens (min 2). At
-# 4096 total slots and Qwen3-8B widths (K=5 aux + last, bf16) this is the
-# same ~200MB the old fixed 2x2048 default used.
-_VERIFY_TWIN_BUDGET_TOKENS = 4096
+# 16384 total slots and Qwen3-8B widths (K=5 aux + last, bf16) is ~800MB.
+# Warm/high-concurrency profiling exhausted the former 4096-token (8x512)
+# pool even after ready twins were reaped independently of sidecar finalize.
+# 8192 (16x512) covered that burst, but long-chunked prefill (16K inputs)
+# queues large staging D2H ahead of twin D2H on the copy path, delaying twin
+# recycling: the V6vsV7 formal matrix measured 13/16 in use — over the 0.80
+# degrade watermark with the pool never actually empty. 32x512 keeps that
+# measured burst under 0.45 occupancy.
+_VERIFY_TWIN_BUDGET_TOKENS = 16384
 
 # Pinned-host token-slot budget for the staging ring when its geometry is not
 # pinned via env vars: slots = budget / slot_tokens (min 2). 32768 total slots
@@ -122,6 +134,51 @@ def _resolve_staging_slot_tokens(*, server_args: ServerArgs) -> int:
     return (bound + 255) // 256 * 256
 
 
+def _resolve_sidecar_capacity_tokens(
+    *,
+    num_tokens: int,
+    sample_rate: float,
+    staging_slot_tokens: int,
+    verify_window_tokens: int,
+) -> int:
+    """V7 compact sidecar capacity, sized by sampling/in-flight volume.
+
+    The full-rate token budget scales linearly with deterministic request
+    sampling. A floor keeps one maximum export or staging/verify window
+    representable; saturation beyond the budget is an attributable miss and
+    pressure-degraded window, never a reason to allocate the whole KV pool.
+    """
+    scaled_budget = math.ceil(
+        envs.SGLANG_HIDDEN_CAPTURE_SIDECAR_TOKEN_BUDGET.get() * sample_rate
+    )
+    floor = max(
+        1,
+        envs.SGLANG_HIDDEN_CAPTURE_MAX_EXPORT_TOKENS.get(),
+        staging_slot_tokens,
+        verify_window_tokens,
+    )
+    return min(num_tokens, max(floor, scaled_budget))
+
+
+def _serving_span(name: str):
+    """Record one serving-side capture hook without changing its returns."""
+
+    def decorate(method):
+        @functools.wraps(method)
+        def wrapped(self, *args, **kwargs):
+            started_ns = time.monotonic_ns()
+            try:
+                return method(self, *args, **kwargs)
+            finally:
+                stats = getattr(self, "stats", None)
+                if stats is not None:
+                    stats.observe_duration(name, time.monotonic_ns() - started_ns)
+
+        return wrapped
+
+    return decorate
+
+
 def _disabled(reason: str) -> None:
     logger.warning("hidden state capture disabled: %s", reason)
 
@@ -163,6 +220,7 @@ class HiddenVerifyCaptureOutput(msgspec.Struct):
 
     twin: Any
     rids: List[str]
+    admitted_rids: List[str]
     stride: int
     num_reqs: int
     capturer: HiddenStatesCapturer
@@ -182,7 +240,6 @@ class HiddenStatesCapturer:
         spec_aux_config: SpecAuxHiddenStateConfig,
         num_tokens: int,
         max_running_requests: int,
-        device: str,
         dp_rank: Optional[int] = None,
     ) -> Optional[HiddenStatesCapturer]:
         if not server_args.enable_hidden_state_capture:
@@ -199,9 +256,23 @@ class HiddenStatesCapturer:
         if sink_kind not in ("file", "mooncake"):
             _disabled(f"unknown SGLANG_HIDDEN_CAPTURE_SINK={sink_kind!r}")
             return None
-
+        sample_rate = envs.SGLANG_HIDDEN_CAPTURE_SAMPLE_RATE.get()
+        if not 0.0 < sample_rate <= 1.0:
+            _disabled(
+                "SGLANG_HIDDEN_CAPTURE_SAMPLE_RATE must be in (0, 1], got "
+                f"{sample_rate}"
+            )
+            return None
+        pressure_high = envs.SGLANG_HIDDEN_CAPTURE_DEGRADE_HIGH_WATERMARK.get()
+        pressure_recover = envs.SGLANG_HIDDEN_CAPTURE_DEGRADE_RECOVER_WATERMARK.get()
+        if not 0.0 <= pressure_recover < pressure_high <= 1.0:
+            _disabled(
+                "capture pressure watermarks require 0 <= recover < high <= 1, "
+                f"got recover={pressure_recover}, high={pressure_high}"
+            )
+            return None
         aux_layer_ids = _resolve_aux_layer_ids(spec_aux_config)
-        # M1 support matrix; anything outside fails closed (no partial data).
+        # Current support matrix; anything outside fails closed (no partial data).
         gates = [
             (
                 not aux_layer_ids,
@@ -210,7 +281,7 @@ class HiddenStatesCapturer:
             ),
             (
                 server_args.enable_dp_attention,
-                "DP attention captures per-rank shards (M2+)",
+                "DP attention would capture per-rank shards",
             ),
             (server_args.attn_cp_size > 1, "context parallelism is unsupported"),
             (server_args.pp_size > 1, "pipeline parallelism is unsupported"),
@@ -243,38 +314,66 @@ class HiddenStatesCapturer:
         if get_parallel().attn_tp_rank != 0:
             return None
 
-        # Host memory gate: the sidecar scales with the KV pool. Estimate
-        # before allocating so an oversized config disables capture instead
-        # of silently committing tens of GB per scheduler (x N under DP).
-        hidden_size = model_config.hf_text_config.hidden_size
-        row_bytes = (len(aux_layer_ids) + 1) * hidden_size * model_config.dtype.itemsize
-        sidecar_gb = num_tokens * row_bytes / 1024**3
-        max_gb = envs.SGLANG_HIDDEN_CAPTURE_MAX_HOST_GB.get()
-        if sidecar_gb > max_gb:
-            _disabled(
-                f"host sidecar would need {sidecar_gb:.1f} GB "
-                f"(max_total_num_tokens={num_tokens} x {row_bytes} B/row) > "
-                f"SGLANG_HIDDEN_CAPTURE_MAX_HOST_GB={max_gb}. Raise the limit "
-                "or reduce the KV pool"
+        if getattr(server_args, "disable_cuda_graph", False):
+            logger.warning(
+                "hidden state capture with CUDA graph disabled is unsupported/"
+                "experimental in V7; production capture must use graph-on"
             )
-            return None
 
         verify_window_tokens = _resolve_verify_window_tokens(
             server_args=server_args, max_running_requests=max_running_requests
         )
-        return HiddenStatesCapturer(
-            model_config=model_config,
-            num_aux_layers=len(aux_layer_ids),
+        staging_slot_tokens = _resolve_staging_slot_tokens(server_args=server_args)
+        sidecar_capacity_tokens = _resolve_sidecar_capacity_tokens(
             num_tokens=num_tokens,
+            sample_rate=sample_rate,
+            staging_slot_tokens=staging_slot_tokens,
             verify_window_tokens=verify_window_tokens,
-            staging_slot_tokens=_resolve_staging_slot_tokens(server_args=server_args),
-            sink_kind=sink_kind,
-            sink_dir=sink_dir,
-            dp_rank=dp_rank if dp_rank is not None else 0,
-            aux_layer_ids=list(aux_layer_ids),
-            model_path=server_args.model_path,
-            model_revision=server_args.revision,
         )
+        # Host memory gate: hidden payload follows the compact sampled/inflight
+        # budget. Only the small generation/token identity maps retain KV-pool
+        # cardinality.
+        hidden_size = model_config.hf_text_config.hidden_size
+        row_bytes = (len(aux_layer_ids) + 1) * hidden_size * model_config.dtype.itemsize
+        sidecar_bytes = sidecar_capacity_tokens * row_bytes + num_tokens * (
+            torch.int32.itemsize + torch.int64.itemsize
+        )
+        sidecar_gb = sidecar_bytes / 1024**3
+        max_gb = envs.SGLANG_HIDDEN_CAPTURE_MAX_HOST_GB.get()
+        if sidecar_gb > max_gb:
+            _disabled(
+                f"host sidecar would need {sidecar_gb:.1f} GB "
+                f"(compact_capacity={sidecar_capacity_tokens} rows, "
+                f"logical_slots={num_tokens}, payload={row_bytes} B/row) > "
+                f"SGLANG_HIDDEN_CAPTURE_MAX_HOST_GB={max_gb}. Raise the limit "
+                "or reduce SGLANG_HIDDEN_CAPTURE_SIDECAR_TOKEN_BUDGET"
+            )
+            return None
+
+        try:
+            return HiddenStatesCapturer(
+                model_config=model_config,
+                num_aux_layers=len(aux_layer_ids),
+                num_tokens=num_tokens,
+                sidecar_capacity_tokens=sidecar_capacity_tokens,
+                verify_window_tokens=verify_window_tokens,
+                staging_slot_tokens=staging_slot_tokens,
+                sink_kind=sink_kind,
+                sink_dir=sink_dir,
+                dp_rank=dp_rank if dp_rank is not None else 0,
+                aux_layer_ids=list(aux_layer_ids),
+                model_path=server_args.model_path,
+                model_revision=server_args.revision,
+            )
+        except Exception as error:
+            # Capture is a best-effort side channel. A missing/unhealthy sink
+            # at startup must disable capture, not make the serving worker
+            # unavailable. The constructor starts workers only after sink and
+            # fingerprint initialization succeed, and each failure path
+            # releases any sink-owned registered/client resources.
+            logger.exception("hidden state capture initialization failed")
+            _disabled(f"initialization failed: {error}")
+            return None
 
     def __init__(
         self,
@@ -282,6 +381,7 @@ class HiddenStatesCapturer:
         model_config: ModelConfig,
         num_aux_layers: int,
         num_tokens: int,
+        sidecar_capacity_tokens: int,
         verify_window_tokens: int,
         staging_slot_tokens: int,
         sink_kind: str,
@@ -296,6 +396,10 @@ class HiddenStatesCapturer:
         self.last_width = hidden_size
         self.dtype = model_config.dtype
         self.sample_rate = envs.SGLANG_HIDDEN_CAPTURE_SAMPLE_RATE.get()
+        self._accepting = threading.Event()
+        self._accepting.set()
+        self._close_lock = threading.Lock()
+        self._closed = False
 
         self.stats = HiddenCaptureStats()
         self.bookkeeper = HiddenCaptureBookkeeper()
@@ -304,6 +408,10 @@ class HiddenStatesCapturer:
         # step's (tiny) result copies — and thus its copy_done — wait behind
         # them, leaking capture cost into serving tail latency.
         self.capture_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        # PyTorch stream submission is thread-local. Serialize the scheduler's
+        # header/prefill submissions with the compact verify launch worker so
+        # host enqueue order on the shared capture stream is explicit.
+        self._capture_launch_lock = threading.Lock()
         # Finish-hook kv-slot snapshots: a dedicated stream + reusable pinned
         # buffer. A plain .cpu() on the scheduler thread is a synchronous
         # PAGEABLE D2H that serializes behind whatever the copy engine is
@@ -314,7 +422,7 @@ class HiddenStatesCapturer:
             torch.cuda.Stream() if torch.cuda.is_available() else None
         )
         self._snapshot_buf = (
-            torch.empty((num_tokens,), dtype=torch.int64, pin_memory=True)
+            torch.empty((num_tokens,), dtype=torch.int32, pin_memory=True)
             if torch.cuda.is_available()
             else None
         )
@@ -322,8 +430,8 @@ class HiddenStatesCapturer:
         # Staging ring geometry adapts like the twin pool's: slot size = one
         # forward's staged-row bound (chunked_prefill_size, or
         # max_prefill_tokens when chunking is disabled; floored to the verify
-        # window, which shares this ring), slot count = pinned budget / slot
-        # size. A chunk-128 deployment thus gets 64 slots of 512 instead of
+        # window), slot count = pinned budget / slot size. A chunk-128
+        # deployment thus gets 64 slots of 512 instead of
         # 4x8192 (98% dead capacity, concurrency capped at 4); the 8192-chunk
         # default reproduces the old 4x8192. Env vars pin either dimension.
         ring_slot_tokens = (
@@ -347,12 +455,16 @@ class HiddenStatesCapturer:
             last_width=self.last_width,
             dtype=self.dtype,
             seq_counter=self.staging_seq,
+            stats=self.stats,
+            stats_prefix="prefill",
         )
         self.sidecar = HiddenHostSidecar(
             num_slots=num_tokens,
+            capacity_tokens=sidecar_capacity_tokens,
             aux_width=self.aux_width,
             last_width=self.last_width,
             dtype=self.dtype,
+            stats=self.stats,
         )
         # Verify capture: device twins are the overwrite fence for graph/
         # persistent buffers (packed on the forward stream; see _DeviceTwin).
@@ -381,6 +493,7 @@ class HiddenStatesCapturer:
                 aux_width=self.aux_width,
                 last_width=self.last_width,
                 dtype=self.dtype,
+                stats=self.stats,
             )
             if torch.cuda.is_available()
             else None
@@ -403,6 +516,23 @@ class HiddenStatesCapturer:
             last_width=self.last_width,
             dtype=self.dtype,
             seq_counter=self.staging_seq,
+            stats=self.stats,
+            stats_prefix="verify",
+            max_verify_reqs=512,
+        )
+        row_bytes = (self.aux_width + self.last_width) * self.dtype.itemsize + 16
+        self.verify_launcher = (
+            HiddenVerifyD2HLauncher(
+                ring=self.verify_ring,
+                twin_pool=self.twin_pool,
+                bookkeeper=self.bookkeeper,
+                stats=self.stats,
+                capture_stream=self.capture_stream,
+                capture_launch_lock=self._capture_launch_lock,
+                row_bytes=row_bytes,
+            )
+            if self.twin_pool is not None
+            else None
         )
         self.finalize_worker = HiddenFinalizeWorker(
             ring=self.ring,
@@ -413,24 +543,44 @@ class HiddenStatesCapturer:
             twin_pool=self.twin_pool,
         )
         self.sink = self._build_sink(sink_kind, sink_dir, dp_rank)
-        self.sink.write_fingerprint(
-            {
-                "model_path": model_path,
-                "model_revision": model_revision,
-                "dtype": str(self.dtype),
-                "aux_layer_ids": aux_layer_ids,
-                "hidden_size": hidden_size,
-                "num_aux_layers": num_aux_layers,
-                "norm_contract": "post_final_norm_pre_lm_head",
-                "aux_layout": "packed_last_dim",  # [T, K*H], serving layout
-                # Rows cover the prompt region plus verify-committed decode
-                # tokens (the final sampled token has no hidden row).
-                # loss_mask is a placeholder — recompute offline before
-                # feeding a training recipe that masks on role boundaries.
-                "coverage": "prefill_and_verify_commit",
-                "loss_mask": "all_ones_placeholder",
-            }
-        )
+        fingerprint = {
+            "model_path": model_path,
+            "model_revision": model_revision,
+            "dtype": str(self.dtype),
+            "aux_layer_ids": aux_layer_ids,
+            "hidden_size": hidden_size,
+            "num_aux_layers": num_aux_layers,
+            "norm_contract": "post_final_norm_pre_lm_head",
+            "aux_layout": "packed_last_dim",  # [T, K*H], serving layout
+            # Rows cover the prompt region plus verify-committed decode tokens
+            # (the final sampled token has no hidden row).
+            "coverage": "prefill_and_verify_commit",
+            "coverage_semantics": (
+                "full_below_pressure_threshold; fail_closed_degraded_windows"
+            ),
+            "degradation_observability": (
+                "/server_info internal_states[].hidden_capture.degradation"
+            ),
+            # Recompute the real role-aware mask offline before training.
+            "loss_mask": "all_ones_placeholder",
+            "storage_schema": (
+                "hidden-sample-view-v1"
+                if getattr(self.sink, "prefix_enabled", False)
+                else "hidden-whole-sample-v0"
+            ),
+        }
+        try:
+            self.sink.write_fingerprint(fingerprint)
+        except BaseException:
+            close_sink = getattr(self.sink, "close", None)
+            if callable(close_sink):
+                try:
+                    close_sink()
+                except Exception:
+                    logger.exception(
+                        "hidden capture sink cleanup failed after fingerprint error"
+                    )
+            raise
         self.export_worker = HiddenExportWorker(
             sidecar=self.sidecar,
             bookkeeper=self.bookkeeper,
@@ -439,6 +589,19 @@ class HiddenStatesCapturer:
             sink=self.sink,
             queue_size=envs.SGLANG_HIDDEN_CAPTURE_EXPORT_QUEUE_SIZE.get(),
         )
+        self.pressure_controller = HiddenCapturePressureController(
+            stats=self.stats,
+            high_watermark=(envs.SGLANG_HIDDEN_CAPTURE_DEGRADE_HIGH_WATERMARK.get()),
+            recover_watermark=(
+                envs.SGLANG_HIDDEN_CAPTURE_DEGRADE_RECOVER_WATERMARK.get()
+            ),
+            min_degraded_s=envs.SGLANG_HIDDEN_CAPTURE_MIN_DEGRADED_S.get(),
+        )
+        # Start an unavailable-Mooncake window during initialization rather
+        # than waiting for the first request hook to notice it.
+        self.pressure_controller.refresh(self._pressure_signals())
+        if self.verify_launcher is not None:
+            self.verify_launcher.start()
         self.finalize_worker.start()
         self.export_worker.start()
         logger.info(
@@ -452,21 +615,220 @@ class HiddenStatesCapturer:
 
     def _build_sink(self, sink_kind: str, sink_dir: Optional[str], dp_rank: int):
         if sink_kind == "mooncake":
-            from sglang.srt.state_capturer.hidden_mooncake import MooncakeHiddenSink
+            from sglang.srt.state_capturer.hidden_mooncake import (
+                AsyncMooncakeHiddenSink,
+            )
 
             # +8 bytes/row: input_ids ride the same registered staging buffer.
-            row_bytes = (self.aux_width + self.last_width) * self.dtype.itemsize + 8
-            return MooncakeHiddenSink(
+            return AsyncMooncakeHiddenSink(
+                initial_probe_timeout_s=(
+                    envs.SGLANG_HIDDEN_CAPTURE_MOONCAKE_PROBE_TIMEOUT_S.get()
+                ),
+                reconnect_interval_s=(
+                    envs.SGLANG_HIDDEN_CAPTURE_MOONCAKE_RECONNECT_INTERVAL_S.get()
+                ),
                 store_id=envs.SGLANG_HIDDEN_CAPTURE_STORE_ID.get(),
-                row_bytes=row_bytes,
                 max_export_tokens=envs.SGLANG_HIDDEN_CAPTURE_MAX_EXPORT_TOKENS.get(),
                 dp_rank=dp_rank,
                 stats=self.stats,
+                max_segment_rows=(
+                    envs.SGLANG_HIDDEN_CAPTURE_PREFIX_MAX_SEGMENT_ROWS.get()
+                ),
+                prefix_lanes=envs.SGLANG_HIDDEN_CAPTURE_PREFIX_LANES.get(),
+                aux_width=self.aux_width,
+                last_width=self.last_width,
+                dtype=self.dtype,
             )
         return HiddenFileSink(sink_dir)
 
+    def close(self, timeout_s: Optional[float] = None) -> bool:
+        """Stop admission, drain both workers, then release sink resources.
+
+        The registered Mooncake arena is unregistered only after the export
+        thread has exited. A timeout leaves the sink registered and returns
+        False, keeping shutdown bounded without a use-after-unregister.
+        """
+        if timeout_s is None:
+            timeout_s = envs.SGLANG_HIDDEN_CAPTURE_SHUTDOWN_TIMEOUT_S.get()
+        with self._close_lock:
+            if self._closed:
+                return True
+
+            self._accepting.clear()
+            self.export_worker.stop_admission()
+            if self.verify_launcher is not None:
+                self.verify_launcher.stop()
+            self.finalize_worker.stop()
+            self.export_worker.stop()
+            deadline = time.monotonic() + max(0.0, timeout_s)
+
+            launcher_done = True
+            if self.verify_launcher is not None:
+                launcher_done = self.verify_launcher.join(
+                    max(0.0, deadline - time.monotonic())
+                )
+                if not launcher_done:
+                    self.stats.bump(
+                        "shutdown_verify_launcher_timeout_miss_ct",
+                        max(1, self.verify_launcher.pending_count),
+                    )
+
+            finalize_done = self.finalize_worker.join(
+                max(0.0, deadline - time.monotonic())
+            )
+            if not finalize_done:
+                self.stats.bump(
+                    "shutdown_finalize_timeout_miss_ct",
+                    max(1, self.finalize_worker.pending_count),
+                )
+
+            export_done = self.export_worker.join(max(0.0, deadline - time.monotonic()))
+            if not export_done:
+                self.stats.bump(
+                    "shutdown_export_timeout_miss_ct",
+                    max(1, self.export_worker.pending_count),
+                )
+
+            if launcher_done and finalize_done and export_done:
+                close_sink = getattr(self.sink, "close", None)
+                if callable(close_sink):
+                    close_sink()
+                self._closed = True
+            pressure_controller = getattr(self, "pressure_controller", None)
+            if pressure_controller is not None:
+                pressure_controller.close()
+            self.stats.log("hidden capture final stats:")
+            return self._closed
+
+    def _pressure_signals(self) -> Dict[str, float]:
+        sink_ready = bool(getattr(self.sink, "ready", True))
+        return {
+            "sink": 0.0 if sink_ready else 1.0,
+            "export_queue": self.export_worker.pending_count
+            / max(1, self.export_worker.capacity),
+            "prefill_ring": self.ring.inflight_count / max(1, self.ring.num_slots),
+            "verify_ring": self.verify_ring.inflight_count
+            / max(1, self.verify_ring.num_slots),
+            "verify_twin": (
+                self.twin_pool.in_use_count / max(1, self.twin_pool.num_twins)
+                if self.twin_pool is not None
+                else 0.0
+            ),
+            "sidecar": self.sidecar.pressure_ratio,
+        }
+
+    def _capture_allowed(
+        self,
+        *,
+        rids: Sequence[str],
+        rows: int,
+        phase: str,
+    ) -> bool:
+        controller = getattr(self, "pressure_controller", None)
+        if controller is None or controller.refresh(self._pressure_signals()):
+            return True
+        sample_misses = self.bookkeeper.mark_miss(rids)
+        controller.record_drop(
+            phase=phase,
+            requests=len(rids),
+            rows=rows,
+            sample_misses=sample_misses,
+        )
+        return False
+
+    def _settle_captured_rows(self, own_slot_gens: Dict[int, int]) -> None:
+        self.sidecar.release_rows(
+            own_slot_gens,
+            discard=bool(getattr(self.sink, "prefix_enabled", False)),
+        )
+
+    def _submit_cleanup_job(self, rid: str, global_barrier: int) -> None:
+        barrier, _has_own_rows = self.bookkeeper.export_barrier(rid, global_barrier)
+        self.export_worker.submit(
+            HiddenExportJob(
+                rid=rid,
+                sample_id=self._sample_id_for(rid),
+                tokens=torch.empty((0,), dtype=torch.long),
+                slots=torch.empty((0,), dtype=torch.long),
+                ring_seq_barrier=barrier,
+            )
+        )
+
+    def observability_snapshot(self) -> Dict[str, Any]:
+        """Return a read-only, point-in-time capture/resource snapshot.
+
+        This is called only by the internal-state endpoint.  It deliberately
+        avoids synchronizing CUDA or waiting for workers, so characterization
+        polling cannot become serving backpressure.
+        """
+
+        def _alive(worker: Any) -> bool:
+            thread = getattr(worker, "_thread", None)
+            return bool(thread is not None and thread.is_alive())
+
+        # Polling is also a non-blocking pressure refresh, so an idle server's
+        # startup-reconnect window closes at observation time instead of being
+        # left open until the next request.
+        self.pressure_controller.refresh(self._pressure_signals())
+        sink_state = getattr(self.sink, "state_snapshot", None)
+        snapshot_buf_bytes = (
+            self._snapshot_buf.numel() * self._snapshot_buf.element_size()
+            if self._snapshot_buf is not None
+            else 0
+        )
+        return {
+            "stats": self.stats.snapshot(),
+            "critical_path": self.stats.critical_path_snapshot(),
+            "serving_spans": self.stats.serving_span_snapshot(),
+            "degradation": self.pressure_controller.snapshot(),
+            "state": {
+                "accepting": self._accepting.is_set(),
+                "closed": self._closed,
+                "verify_launcher_pending": (
+                    self.verify_launcher.pending_count
+                    if self.verify_launcher is not None
+                    else 0
+                ),
+                "verify_launcher_active": (
+                    self.verify_launcher._active
+                    if self.verify_launcher is not None
+                    else 0
+                ),
+                "prefill_ring_inflight": self.ring.inflight_count,
+                "verify_ring_inflight": self.verify_ring.inflight_count,
+                "finalize_worker_active": self.finalize_worker._active,
+                "export_queue_pending": self.export_worker.pending_count,
+                "export_worker_active": self.export_worker._active,
+                "last_enqueued_seq": self.ring.last_enqueued_seq,
+                "last_finalized_seq": self.finalize_worker.last_finalized_seq,
+                "verify_launcher_alive": (
+                    _alive(self.verify_launcher)
+                    if self.verify_launcher is not None
+                    else False
+                ),
+                "finalize_worker_alive": _alive(self.finalize_worker),
+                "export_worker_alive": _alive(self.export_worker),
+                "bookkeeper": self.bookkeeper.state_snapshot(),
+                "sidecar": self.sidecar.state_snapshot(),
+                "sink": sink_state() if callable(sink_state) else None,
+            },
+            "resources": {
+                "prefill_ring_pinned_bytes": self.ring.allocated_bytes,
+                "verify_ring_pinned_bytes": self.verify_ring.allocated_bytes,
+                "finish_snapshot_pinned_bytes": snapshot_buf_bytes,
+                "sidecar_pageable_bytes": self.sidecar.allocated_bytes,
+                "verify_twin_hbm_bytes": (
+                    self.twin_pool.allocated_bytes if self.twin_pool is not None else 0
+                ),
+                "mooncake_registered_bytes": int(
+                    getattr(self.sink, "registered_bytes", 0)
+                ),
+            },
+        }
+
     # ---------------------------------------------------------------- forward
 
+    @_serving_span("serving_forward_hook")
     def on_forward_end(
         self,
         *,
@@ -479,6 +841,11 @@ class HiddenStatesCapturer:
         Runs on the forward thread before DSpark's worker consumes and clears
         ``logits_output.hidden_states``; only references are taken here.
         """
+        if not self._accepting.is_set():
+            rids = forward_batch.rids or []
+            self.stats.bump("shutdown_admission_miss_ct", len(rids) or 1)
+            self.bookkeeper.mark_miss(rids)
+            return None
         if not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             return None
         aux = logits_output.hidden_states
@@ -496,6 +863,28 @@ class HiddenStatesCapturer:
             self.stats.bump("skipped_forward_ct")
             self.bookkeeper.mark_miss(rids)
             return None
+        num_rows = aux.shape[0]
+        if sum(extend_lens) != num_rows or last.shape[0] != num_rows:
+            # Row attribution would be wrong; drop the whole forward.
+            self.stats.bump("attach_mismatch_miss_ct")
+            self.bookkeeper.mark_miss(rids)
+            return None
+
+        req_ranges = []
+        row = 0
+        for rid, extend_len in zip(rids, extend_lens):
+            if not rid.startswith(HEALTH_CHECK_RID_PREFIX) and self._sampled(rid):
+                req_ranges.append((rid, row, row + extend_len))
+            row += extend_len
+        if not req_ranges:
+            return None
+        admitted_rows = sum(end - start for _, start, end in req_ranges)
+        if not self._capture_allowed(
+            rids=[rid for rid, _, _ in req_ranges],
+            rows=admitted_rows,
+            phase="forward",
+        ):
+            return None
         if can_run_graph:
             # Prefill CUDA graph (BCG/Full): the graph captures only the
             # transformer body; the LM-head/logits tail runs eagerly. The
@@ -508,19 +897,6 @@ class HiddenStatesCapturer:
             # ordering is the overwrite fence (the next replay queues behind
             # the clone), identical in principle to the verify device twin.
             last = last.clone()
-
-        num_rows = aux.shape[0]
-        if sum(extend_lens) != num_rows or last.shape[0] != num_rows:
-            # Row attribution would be wrong; drop the whole forward.
-            self.stats.bump("attach_mismatch_miss_ct")
-            self.bookkeeper.mark_miss(rids)
-            return None
-
-        req_ranges = []
-        row = 0
-        for rid, extend_len in zip(rids, extend_lens):
-            req_ranges.append((rid, row, row + extend_len))
-            row += extend_len
         return HiddenCaptureOutput(
             aux_hidden_states=aux,
             last_hidden_states=last,
@@ -532,6 +908,7 @@ class HiddenStatesCapturer:
 
     # ------------------------------------------------------------------ verify
 
+    @_serving_span("serving_verify_hook")
     def capture_verify_window(
         self,
         *,
@@ -557,21 +934,48 @@ class HiddenStatesCapturer:
         any D2H. The twin is then D2H'd off-stream by stage().
 
         The post-norm last hidden arrives strided on the dense verify path or
-        compact (ragged) on the compact path; the compact form is scattered
-        straight into the twin with the same kernel the epilogue uses for aux.
+        compact (ragged) on the compact path. Committed-row mode reads the
+        ragged source through verify-lens offsets directly into the compact
+        twin; the full-window fallback scatters it to the strided layout.
         """
+        if not self._accepting.is_set():
+            self.stats.bump("shutdown_admission_miss_ct", len(rids) or 1)
+            self.bookkeeper.mark_miss(rids)
+            return None
         if self.twin_pool is None:
             return None
         num_rows = bs * stride
+        admitted_mask = [
+            not rid.startswith(HEALTH_CHECK_RID_PREFIX) and self._sampled(rid)
+            for rid in rids
+        ]
+        admitted_rids = [rid for rid, admitted in zip(rids, admitted_mask) if admitted]
+        if not admitted_rids:
+            return None
+        if not self._capture_allowed(
+            rids=admitted_rids,
+            rows=len(admitted_rids) * stride,
+            phase="verify",
+        ):
+            return None
+        if all(admitted_mask):
+            capture_commit_lens = commit_lens
+        else:
+            mask = torch.tensor(
+                admitted_mask,
+                dtype=commit_lens.dtype,
+                device=commit_lens.device,
+            )
+            capture_commit_lens = commit_lens * mask
         if num_rows > self.twin_pool.twin_tokens or bs > self.twin_pool.max_reqs:
             self.stats.bump("verify_oversize_miss_ct")
-            self.bookkeeper.mark_miss(rids)
+            self.bookkeeper.mark_miss(admitted_rids)
             return None
         if last_strided is None and last_compact is None:
             # Post-norm hidden unavailable (e.g. a graph captured before the
             # capturer was installed): fail closed with attribution.
             self.stats.bump("skipped_forward_ct")
-            self.bookkeeper.mark_miss(rids)
+            self.bookkeeper.mark_miss(admitted_rids)
             return None
         # Twins whose D2H already finished are recyclable right now — reap
         # them on this thread instead of waiting for the finalize thread to
@@ -583,74 +987,116 @@ class HiddenStatesCapturer:
             twin = self.twin_pool.try_acquire()
         if twin is None:
             self.stats.bump("verify_twin_full_miss_ct")
-            self.bookkeeper.mark_miss(rids)
+            self.bookkeeper.mark_miss(admitted_rids)
             return None
 
-        # Pack on the caller's (forward) stream: this is the fence.
-        twin.aux[:num_rows].copy_(aux_strided[:num_rows], non_blocking=True)
-        if last_strided is not None:
-            twin.last[:num_rows].copy_(last_strided[:num_rows], non_blocking=True)
-        else:
-            from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
-                scatter_compact_to_strided_into,
+        try:
+            # Pack on the caller's (forward) stream: this is the overwrite
+            # fence. Timing events are consumed only after fence completion by
+            # the background/reap path, never synchronized here.
+            twin.pack_start_event.record()
+            from sglang.srt.state_capturer.hidden_pack import (
+                pack_committed_verify_rows_into,
             )
 
-            scatter_compact_to_strided_into(
-                compact=last_compact.contiguous(),
+            pack_committed_verify_rows_into(
+                aux_strided=aux_strided,
+                last_strided=last_strided,
+                last_compact=last_compact,
                 verify_lens=verify_lens,
-                out=twin.last[:num_rows],
+                verify_cache_loc=verify_cache_loc,
+                verify_tokens=verify_tokens,
+                commit_lens=capture_commit_lens,
+                bs=bs,
                 stride=stride,
-                fill_value=0.0,
+                out_aux=twin.aux,
+                out_last=twin.last,
+                out_cache_loc=twin.cache_loc,
+                out_tokens=twin.tokens,
+                out_commit_lens=twin.commit_lens,
+                out_commit_offsets=twin.commit_offsets,
+                out_total_rows=twin.total_rows,
+                out_verify_offsets=twin.verify_offsets,
             )
-        twin.cache_loc[:num_rows].copy_(
-            verify_cache_loc[:num_rows].to(torch.int64), non_blocking=True
-        )
-        twin.tokens[:num_rows].copy_(
-            verify_tokens[:num_rows].to(torch.int64), non_blocking=True
-        )
-        twin.commit_lens[:bs].copy_(commit_lens.to(torch.int32), non_blocking=True)
-        twin.fence_event.record()
+            twin.fence_event.record()
+        except Exception:
+            # Capture is best-effort and must never take down serving. Return
+            # the borrowed twin immediately: all attempted work was submitted
+            # on the current stream, so same-stream ordering keeps reuse safe.
+            logger.exception("hidden verify pack failed; dropping capture step")
+            self.stats.bump("skipped_forward_ct")
+            self.bookkeeper.mark_miss(admitted_rids)
+            self.twin_pool.release(twin)
+            return None
 
         return HiddenVerifyCaptureOutput(
-            twin=twin, rids=list(rids), stride=stride, num_reqs=bs, capturer=self
+            twin=twin,
+            rids=list(rids),
+            admitted_rids=admitted_rids,
+            stride=stride,
+            num_reqs=bs,
+            capturer=self,
         )
 
+    @_serving_span("serving_verify_stage")
     def stage_verify(self, output: HiddenVerifyCaptureOutput) -> None:
         """D2H a packed verify twin into the pinned verify ring (copy-stream
         context). Verify has its own ring: see the verify_ring construction
         comment for why sharing the prefill ring dropped whole decode batches
         at saturation."""
+        if not self._accepting.is_set():
+            self.stats.bump(
+                "shutdown_admission_miss_ct", len(output.admitted_rids) or 1
+            )
+            self.bookkeeper.mark_miss(output.admitted_rids)
+            self.twin_pool.release(output.twin)
+            return
+        if not self._capture_allowed(
+            rids=output.admitted_rids,
+            rows=len(output.admitted_rids) * output.stride,
+            phase="verify_stage",
+        ):
+            self.twin_pool.release(output.twin)
+            return
         slots = self.verify_ring.try_acquire(1)
         if slots is None:
             self.stats.bump("stage_full_miss_ct")
-            self.bookkeeper.mark_miss(output.rids)
+            self.stats.bump("verify_stage_full_miss_ct")
+            self.bookkeeper.mark_miss(output.admitted_rids)
             self.twin_pool.release(output.twin)
             return
         (slot,) = slots
-        if output.num_reqs * output.stride > self.verify_ring.slot_tokens:
-            self.stats.bump("verify_oversize_miss_ct")
-            self.bookkeeper.mark_miss(output.rids)
-            self.twin_pool.release(output.twin)
-            self.verify_ring.release(slot)
-            return
 
-        if self.capture_stream is not None:
-            self.capture_stream.wait_event(output.twin.fence_event)
-            stream_ctx = torch.cuda.stream(self.capture_stream)
-        else:
-            stream_ctx = contextlib.nullcontext()
-        with stream_ctx:
-            self.verify_ring.enqueue_verify_segment(
-                slot,
-                twin=output.twin,
-                rids=output.rids,
-                stride=output.stride,
-                num_reqs=output.num_reqs,
-            )
-        self.stats.bump("rows_staged_ct", output.num_reqs * output.stride)
+        num_rows = output.num_reqs * output.stride
+        self.stats.bump("verify_candidate_rows_staged_ct", num_rows)
+        header_submitted_ns = time.monotonic_ns()
+        with self._capture_launch_lock:
+            if self.capture_stream is not None:
+                self.capture_stream.wait_event(output.twin.fence_event)
+                stream_ctx = torch.cuda.stream(self.capture_stream)
+            else:
+                stream_ctx = contextlib.nullcontext()
+            with stream_ctx:
+                slot.commit_lens[: output.num_reqs].copy_(
+                    output.twin.commit_lens[: output.num_reqs],
+                    non_blocking=True,
+                )
+                slot.total_rows.copy_(output.twin.total_rows, non_blocking=True)
+                slot.header_event.record()
+        ring_seq = self.verify_ring.reserve_verify_compact(
+            slot,
+            twin=output.twin,
+            rids=output.rids,
+            stride=output.stride,
+            num_reqs=output.num_reqs,
+            header_submitted_ns=header_submitted_ns,
+        )
+        self.bookkeeper.record_enqueued(output.admitted_rids, ring_seq)
+        self.verify_launcher.submit(slot)
 
     # ---------------------------------------------------------------- staging
 
+    @_serving_span("serving_prefill_stage")
     def stage(self, output: HiddenCaptureOutput) -> None:
         """Enqueue one forward's rows into the ring (copy-stream context).
 
@@ -662,40 +1108,74 @@ class HiddenStatesCapturer:
         past forward). The scheduler's copy stream stays free for the next
         step's small result copies; ring events gate the finalize thread.
         """
+        affected_rids = [rid for rid, _, _ in output.req_ranges]
+        if not self._accepting.is_set():
+            self.stats.bump("shutdown_admission_miss_ct", len(affected_rids) or 1)
+            self.bookkeeper.mark_miss(affected_rids)
+            return
         num_rows = output.aux_hidden_states.shape[0]
         if num_rows == 0:
             return
+        admitted_rows = sum(end - start for _, start, end in output.req_ranges)
+        if not self._capture_allowed(
+            rids=affected_rids,
+            rows=admitted_rows,
+            phase="prefill_stage",
+        ):
+            return
         slot_tokens = self.ring.slot_tokens
-        num_segments = (num_rows + slot_tokens - 1) // slot_tokens
-        slots = self.ring.try_acquire(num_segments)
+        segment_indexes = [
+            segment
+            for segment in range((num_rows + slot_tokens - 1) // slot_tokens)
+            if any(
+                start < min((segment + 1) * slot_tokens, num_rows)
+                and end > segment * slot_tokens
+                for _, start, end in output.req_ranges
+            )
+        ]
+        slots = self.ring.try_acquire(len(segment_indexes))
         if slots is None:
             self.stats.bump("stage_full_miss_ct")
-            self.bookkeeper.mark_miss([rid for rid, _, _ in output.req_ranges])
+            self.stats.bump("prefill_stage_full_miss_ct")
+            self.bookkeeper.mark_miss(affected_rids)
             return
 
-        if self.capture_stream is not None:
-            self.capture_stream.wait_stream(torch.cuda.current_stream())
-            stream_ctx = torch.cuda.stream(self.capture_stream)
-        else:
-            stream_ctx = contextlib.nullcontext()
-        with stream_ctx:
-            for seg, slot in enumerate(slots):
-                seg_start = seg * slot_tokens
-                seg_end = min(seg_start + slot_tokens, num_rows)
-                seg_ranges = [
-                    (rid, max(r0, seg_start) - seg_start, min(r1, seg_end) - seg_start)
-                    for rid, r0, r1 in output.req_ranges
-                    if r0 < seg_end and r1 > seg_start
-                ]
-                self.ring.enqueue_segment(
-                    slot,
-                    aux_rows=output.aux_hidden_states[seg_start:seg_end],
-                    last_rows=output.last_hidden_states[seg_start:seg_end],
-                    cache_locs=output.out_cache_loc[seg_start:seg_end],
-                    tokens=output.input_tokens[seg_start:seg_end],
-                    req_ranges=seg_ranges,
-                )
-        self.stats.bump("rows_staged_ct", num_rows)
+        with self._capture_launch_lock:
+            if self.capture_stream is not None:
+                self.capture_stream.wait_stream(torch.cuda.current_stream())
+                stream_ctx = torch.cuda.stream(self.capture_stream)
+            else:
+                stream_ctx = contextlib.nullcontext()
+            with stream_ctx:
+                staged_rows = 0
+                for seg, slot in zip(segment_indexes, slots):
+                    seg_start = seg * slot_tokens
+                    seg_end = min(seg_start + slot_tokens, num_rows)
+                    staged_rows += seg_end - seg_start
+                    seg_ranges = [
+                        (
+                            rid,
+                            max(r0, seg_start) - seg_start,
+                            min(r1, seg_end) - seg_start,
+                        )
+                        for rid, r0, r1 in output.req_ranges
+                        if r0 < seg_end and r1 > seg_start
+                    ]
+                    ring_seq = self.ring.enqueue_segment(
+                        slot,
+                        aux_rows=output.aux_hidden_states[seg_start:seg_end],
+                        last_rows=output.last_hidden_states[seg_start:seg_end],
+                        cache_locs=output.out_cache_loc[seg_start:seg_end],
+                        tokens=output.input_tokens[seg_start:seg_end],
+                        req_ranges=seg_ranges,
+                    )
+                    self.bookkeeper.record_enqueued(
+                        [rid for rid, _, _ in seg_ranges], ring_seq
+                    )
+        self.stats.bump("rows_staged_ct", staged_rows)
+        self.stats.bump("prefill_rows_staged_ct", staged_rows)
+        row_bytes = (self.aux_width + self.last_width) * self.dtype.itemsize + 16
+        self.stats.bump("prefill_d2h_bytes_ct", staged_rows * row_bytes)
 
     # ----------------------------------------------------------------- finish
 
@@ -715,73 +1195,211 @@ class HiddenStatesCapturer:
             return rid
         return hashlib.sha1(rid.encode()).hexdigest()
 
-    def _snapshot_kv_slots(self, device_slots: torch.Tensor) -> torch.Tensor:
-        """Small D2H that must not ride the busy copy engine's pageable path.
+    def _snapshot_kv_slots_batch(
+        self, device_slot_ranges: Sequence[torch.Tensor]
+    ) -> List[torch.Tensor]:
+        """Snapshot one scheduler batch before any of its KV slots release.
 
-        A synchronous ``.cpu()`` here serializes the scheduler thread behind
-        in-flight capture staging transfers (~50MB each) — measured as the
-        entire capture-on p99 TPOT tail. Instead: async copy into a reusable
-        pinned buffer on a dedicated stream, then wait ONLY for that copy's
-        event (pinned async D2H can be scheduled independently; the wait is
-        the copy's own ~us, not the queue's ms).
+        Every source range is copied into a disjoint region of one reusable
+        same-dtype pinned buffer.  The dedicated stream is fenced once behind
+        the producer stream and a single event is synchronized after all
+        ranges, so a burst of N finishes pays one host wait instead of N.
         """
-        n = device_slots.shape[0]
-        if self.snapshot_stream is None or not device_slots.is_cuda:
-            return device_slots.cpu().clone().to(torch.long)
-        # Order after the producer: req_to_token rows are written on the
-        # scheduler's stream; without this fence the snapshot stream's copy
-        # can read the slots (or overwrite the pinned buf) before/after the
-        # wrong step. Reproduced as a deterministic stale read in the unit
-        # test; the wait is on an event of the producer stream, not a sync.
-        self.snapshot_stream.wait_stream(torch.cuda.current_stream(device_slots.device))
+        if not device_slot_ranges:
+            return []
+        lengths = [int(slots.shape[0]) for slots in device_slot_ranges]
+        total_rows = sum(lengths)
+        stats = getattr(self, "stats", None)
+        if stats is not None:
+            stats.bump("finish_snapshot_batches_ct")
+            stats.bump("finish_snapshot_requests_ct", len(lengths))
+            stats.bump("finish_snapshot_rows_ct", total_rows)
+            stats.observe_max("finish_snapshot_batch_high_water_ct", len(lengths))
+
+        first = device_slot_ranges[0]
+        if self.snapshot_stream is None or not first.is_cuda:
+            return [slots.cpu().clone().to(torch.long) for slots in device_slot_ranges]
+        if any(
+            not slots.is_cuda or slots.device != first.device
+            for slots in device_slot_ranges
+        ):
+            raise ValueError(
+                "all batched finish slot ranges must share one CUDA device"
+            )
+        if any(slots.dtype != first.dtype for slots in device_slot_ranges):
+            raise ValueError("all batched finish slot ranges must share one dtype")
+
+        if self._snapshot_buf is None or self._snapshot_buf.dtype != first.dtype:
+            capacity = max(1, total_rows)
+            self._snapshot_buf = torch.empty(
+                (capacity,), dtype=first.dtype, pin_memory=True
+            )
+            if stats is not None:
+                stats.bump("finish_snapshot_grow_ct")
+        elif total_rows > self._snapshot_buf.numel():
+            capacity = 1 << (total_rows - 1).bit_length()
+            self._snapshot_buf = torch.empty(
+                (capacity,), dtype=first.dtype, pin_memory=True
+            )
+            if stats is not None:
+                stats.bump("finish_snapshot_grow_ct")
+
+        wait_started_ns = time.monotonic_ns()
+        # req_to_token rows are produced on the scheduler's current stream.
+        # This dependency is load-bearing: without it, the independent
+        # snapshot stream can observe a stale block-table row.
+        self.snapshot_stream.wait_stream(torch.cuda.current_stream(first.device))
         with torch.cuda.stream(self.snapshot_stream):
-            self._snapshot_buf[:n].copy_(device_slots, non_blocking=True)
-            device_slots.record_stream(self.snapshot_stream)
+            offset = 0
+            for slots, length in zip(device_slot_ranges, lengths):
+                self._snapshot_buf[offset : offset + length].copy_(
+                    slots, non_blocking=True
+                )
+                slots.record_stream(self.snapshot_stream)
+                offset += length
             self._snapshot_event.record()
         self._snapshot_event.synchronize()
-        return self._snapshot_buf[:n].clone()
+        if stats is not None:
+            stats.bump(
+                "finish_snapshot_wait_ns_ct", time.monotonic_ns() - wait_started_ns
+            )
+            stats.bump(
+                "finish_snapshot_d2h_bytes_ct", total_rows * first.element_size()
+            )
 
-    def collect_at_finish(self, req: Req, req_to_token_pool: ReqToTokenPool) -> None:
-        """Finish hook (scheduler thread, before ``release_kv_cache``).
+        snapshots = []
+        offset = 0
+        for length in lengths:
+            # Convert only after D2H, on CPU, for tensor-indexing consumers.
+            snapshots.append(
+                self._snapshot_buf[offset : offset + length].clone().to(torch.long)
+            )
+            offset += length
+        return snapshots
+
+    def _snapshot_kv_slots(self, device_slots: torch.Tensor) -> torch.Tensor:
+        """Single-request compatibility wrapper around the batched path."""
+        return HiddenStatesCapturer._snapshot_kv_slots_batch(self, [device_slots])[0]
+
+    @_serving_span("serving_finish_hook")
+    def collect_batch_at_finish(
+        self, reqs: Sequence[Req], req_to_token_pool: ReqToTokenPool
+    ) -> None:
+        """Batch finish hook (scheduler thread, before any KV release).
 
         Snapshots CPU-side state and enqueues the export job; the row copies,
         validation, and file write happen on the export thread. The kv-slot
-        snapshot is one small synchronous D2H (same pattern as the
-        routed-experts finish hook).
+        snapshots for every eligible request share one event wait.
 
         Coverage is every forwarded token: prompt rows (prefill capture) plus
         verify-committed decode rows. The final sampled token was never
         forwarded, so rows span ``[0, seqlen - 1)``.
         """
-        rid = req.rid
-        if rid.startswith(HEALTH_CHECK_RID_PREFIX):
-            self.bookkeeper.pop(rid)
-            return
-        if not self._sampled(rid):
-            self.bookkeeper.pop(rid)
-            return
+        prepared = []
+        cleanup_rids = []
+        for req in reqs:
+            rid = req.rid
+            if not self._accepting.is_set():
+                self.stats.bump("shutdown_admission_miss_ct")
+                self._settle_captured_rows(self.bookkeeper.pop(rid))
+                continue
+            if rid.startswith(HEALTH_CHECK_RID_PREFIX) or not self._sampled(rid):
+                self._settle_captured_rows(self.bookkeeper.pop(rid))
+                continue
+            if getattr(
+                self.sink, "prefix_enabled", False
+            ) and not self._prefix_context_supported(req):
+                self.stats.bump("prefix_context_unsupported_miss_ct")
+                self.bookkeeper.mark_miss([rid])
+                cleanup_rids.append(rid)
+                continue
 
-        prompt_len = len(req.origin_input_ids)
-        seqlen = prompt_len + len(req.output_ids_through_stop)
-        num_rows = max(prompt_len, seqlen - 1)
-        slots = self._snapshot_kv_slots(
+            prompt_len = len(req.origin_input_ids)
+            seqlen = prompt_len + len(req.output_ids_through_stop)
+            num_rows = max(prompt_len, seqlen - 1)
+            tokens = list(req.origin_input_ids) + list(req.output_ids_through_stop)
+            prepared.append((req, prompt_len, num_rows, tokens))
+
+        if cleanup_rids:
+            global_barrier = self.ring.last_enqueued_seq
+            for rid in cleanup_rids:
+                self._submit_cleanup_job(rid, global_barrier)
+        if not prepared:
+            return
+        if not self._capture_allowed(
+            rids=[req.rid for req, _, _, _ in prepared],
+            rows=sum(num_rows for _, _, num_rows, _ in prepared),
+            phase="finish",
+        ):
+            # Avoid the synchronous finish-hook slot snapshot under pressure.
+            # Cleanup jobs still honor each request's finalize barrier before
+            # popping generations, so late D2H rows cannot become orphans.
+            global_barrier = self.ring.last_enqueued_seq
+            for req, _prompt_len, _num_rows, _tokens in prepared:
+                self._submit_cleanup_job(req.rid, global_barrier)
+            return
+        slot_ranges = [
             req_to_token_pool.req_to_token[req.req_pool_idx][:num_rows]
+            for req, _, num_rows, _ in prepared
+        ]
+        try:
+            snapshots = self._snapshot_kv_slots_batch(slot_ranges)
+        except Exception:
+            # Capture is best-effort. A snapshot failure must not prevent the
+            # scheduler from releasing this batch's KV slots and completing
+            # the serving requests. Keep the miss tombstones until the normal
+            # orphan sweep so any already-enqueued rows cannot later be
+            # mistaken for complete samples.
+            rids = [req.rid for req, _, _, _ in prepared]
+            logger.exception(
+                "hidden finish slot snapshot failed; dropping %d samples",
+                len(rids),
+            )
+            self.stats.bump("finish_snapshot_failed_miss_ct", len(rids))
+            self.bookkeeper.mark_miss(rids)
+            global_barrier = self.ring.last_enqueued_seq
+            for rid in rids:
+                self._submit_cleanup_job(rid, global_barrier)
+            return
+        global_barrier = self.ring.last_enqueued_seq
+        for (req, prompt_len, num_rows, tokens), slots in zip(prepared, snapshots):
+            rid = req.rid
+            ring_seq_barrier, has_own_rows = self.bookkeeper.export_barrier(
+                rid, global_barrier
+            )
+            if has_own_rows:
+                self.stats.bump("per_request_barrier_ct")
+                self.stats.bump(
+                    "barrier_younger_seq_avoided_ct",
+                    max(0, global_barrier - ring_seq_barrier),
+                )
+            else:
+                self.stats.bump("fully_warm_global_barrier_ct")
+            job = HiddenExportJob(
+                rid=rid,
+                sample_id=self._sample_id_for(rid),
+                tokens=torch.tensor(tokens[:num_rows], dtype=torch.long),
+                slots=slots,
+                ring_seq_barrier=ring_seq_barrier,
+                prompt_len=prompt_len,
+            )
+            self.export_worker.submit(job)
+
+    @staticmethod
+    def _prefix_context_supported(req: Req) -> bool:
+        """V1 shares only fixed-target, pure-text, unsalted requests."""
+        return (
+            req.extra_key is None
+            and req.lora_id is None
+            and req.input_embeds is None
+            and req.multimodal_inputs is None
+            and req.positional_embed_overrides is None
         )
-        tokens = list(req.origin_input_ids) + list(req.output_ids_through_stop)
-        job = HiddenExportJob(
-            rid=rid,
-            sample_id=self._sample_id_for(rid),
-            tokens=torch.tensor(tokens[:num_rows], dtype=torch.long),
-            slots=slots,
-            ring_seq_barrier=self.ring.last_enqueued_seq,
-            prompt_len=prompt_len,
-        )
-        self.export_worker.submit(job)
 
     def invalidate(self, rid: str) -> None:
         """Retract/abort: drop finalize records so a re-scheduled request's
         stale rows can't validate as its own."""
-        self.bookkeeper.invalidate(rid)
+        self._settle_captured_rows(self.bookkeeper.invalidate(rid))
 
 
 def get_global_hidden_capturer() -> Optional[HiddenStatesCapturer]:

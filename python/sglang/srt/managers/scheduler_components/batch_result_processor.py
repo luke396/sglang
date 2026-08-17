@@ -170,15 +170,6 @@ class SchedulerBatchResultProcessor:
             req_to_token_pool=self.req_to_token_pool,
         )
 
-    def _maybe_collect_hidden_capture(self, req: Req):
-        """Hidden-state capture finish hook. Must run before release_kv_cache
-        (the kv-slot snapshot inside relies on the request still owning its
-        slots); only snapshots and enqueues, never blocks the scheduler."""
-        capturer = get_global_hidden_capturer()
-        if capturer is None:
-            return
-        capturer.collect_at_finish(req, self.req_to_token_pool)
-
     def _maybe_collect_customized_info(
         self,
         i: int,
@@ -244,6 +235,8 @@ class SchedulerBatchResultProcessor:
 
             # Check finish conditions
             logprob_pt = 0
+            hidden_capturer = get_global_hidden_capturer()
+            hidden_capture_finished_reqs: List[Req] = []
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
                 if (
@@ -284,9 +277,13 @@ class SchedulerBatchResultProcessor:
                     if req.finished():
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
-                        self._maybe_collect_hidden_capture(req)
-                        release_kv_cache(req, self.tree_cache)
-                        req.time_stats.set_completion_time()
+                        if hidden_capturer is not None:
+                            # Defer every release in this finish burst until
+                            # one batched slot snapshot covers all requests.
+                            hidden_capture_finished_reqs.append(req)
+                        else:
+                            release_kv_cache(req, self.tree_cache)
+                            req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         maybe_cache_unfinished_req(req, self.tree_cache)
                         if get_memory().enable_hisparse:
@@ -335,6 +332,16 @@ class SchedulerBatchResultProcessor:
                         )
 
                     req.time_stats.set_last_chunked_prefill_finish_time()
+
+            if hidden_capture_finished_reqs:
+                hidden_capturer.collect_batch_at_finish(
+                    hidden_capture_finished_reqs, self.req_to_token_pool
+                )
+                # Lifecycle boundary: only now may any request in this batch
+                # surrender its ordered KV-slot row.
+                for req in hidden_capture_finished_reqs:
+                    release_kv_cache(req, self.tree_cache)
+                    req.time_stats.set_completion_time()
 
         else:  # embedding or reward model
             if result.copy_done is not None:
@@ -854,6 +861,10 @@ class SchedulerBatchResultProcessor:
             )
 
         self.token_to_kv_pool_allocator.free_group_begin()
+        hidden_capturer = get_global_hidden_capturer()
+        hidden_capture_finished_reqs: Optional[List[Req]] = (
+            [] if hidden_capturer is not None else None
+        )
 
         for i, req in enumerate(batch.reqs):
             req: Req
@@ -877,7 +888,14 @@ class SchedulerBatchResultProcessor:
             req.time_stats.set_last_decode_finish_time()
             req.update_finish_state(new_accept_len)
 
-            self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
+            self._handle_finish_state_updated_req(
+                req,
+                batch,
+                result,
+                i,
+                logits_output,
+                hidden_capture_finished_reqs=hidden_capture_finished_reqs,
+            )
 
             if req.return_logprob:
                 self._apply_decode_logprobs(
@@ -913,6 +931,16 @@ class SchedulerBatchResultProcessor:
                     # here; spec already advanced it in _resolve_spec_v2_tokens.
                     self._accept_grammar_tokens(req, next_token_id)
                 req.grammar.finished = req.finished()
+
+        if hidden_capture_finished_reqs:
+            hidden_capturer.collect_batch_at_finish(
+                hidden_capture_finished_reqs, self.req_to_token_pool
+            )
+            # All snapshots complete before the first request can release or
+            # offload its KV cache.
+            for req in hidden_capture_finished_reqs:
+                self._release_finished_decode_req(req)
+                req.time_stats.set_completion_time()
 
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
@@ -1026,6 +1054,7 @@ class SchedulerBatchResultProcessor:
         result: GenerationBatchResult,
         i: int,
         logits_output: LogitsProcessorOutput,
+        hidden_capture_finished_reqs: Optional[List[Req]] = None,
     ):
         known_mamba_boundary = None
         if batch.mamba_track_mask_cpu is not None:
@@ -1070,30 +1099,31 @@ class SchedulerBatchResultProcessor:
                 req.multimodal_inputs.release_features()
             self._maybe_collect_routed_experts(req)
             self._maybe_collect_indexer_topk(req)
-            self._maybe_collect_hidden_capture(req)
-
-            if get_disagg().disaggregation_decode_enable_offload_kvcache:
-                # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
-                if not self.decode_offload_manager.offload_kv_cache(req):
-                    self.decode_offload_manager.finalize_release_on_finish(req)
+            if hidden_capture_finished_reqs is not None:
+                hidden_capture_finished_reqs.append(req)
             else:
-                if get_memory().enable_hisparse:
-                    self.hisparse_coordinator.request_finished(req)
-                prepare_release = getattr(
-                    self.model_worker, "prepare_for_kv_cache_release", None
-                )
-                if callable(prepare_release):
-                    prepare_release(req)
-                is_insert = (
-                    req.mamba_lazy_is_insert
-                    if mamba_extra_buffer_lazy_enabled()
-                    else True
-                )
-                release_kv_cache(req, self.tree_cache, is_insert=is_insert)
-
-            req.time_stats.set_completion_time()
+                self._release_finished_decode_req(req)
+                req.time_stats.set_completion_time()
 
         self._maybe_collect_customized_info(i, req, logits_output)
+
+    def _release_finished_decode_req(self, req: Req) -> None:
+        if get_disagg().disaggregation_decode_enable_offload_kvcache:
+            # release_kv_cache runs after the asynchronous D2H completes.
+            if not self.decode_offload_manager.offload_kv_cache(req):
+                self.decode_offload_manager.finalize_release_on_finish(req)
+            return
+        if get_memory().enable_hisparse:
+            self.hisparse_coordinator.request_finished(req)
+        prepare_release = getattr(
+            self.model_worker, "prepare_for_kv_cache_release", None
+        )
+        if callable(prepare_release):
+            prepare_release(req)
+        is_insert = (
+            req.mamba_lazy_is_insert if mamba_extra_buffer_lazy_enabled() else True
+        )
+        release_kv_cache(req, self.tree_cache, is_insert=is_insert)
 
     def _maybe_update_reasoning_tokens(
         self,

@@ -120,7 +120,9 @@ def _count_mooncake_samples(port: int) -> int:
             # remove_by_regex returns the number of keys removed; counting by
             # removing meta keys AFTER the bench is acceptable (bench data is
             # disposable) and gives an exact produced-count lower bound.
-            return int(store.remove_by_regex("bench_capture/.*/g0/meta"))
+            prefix = int(store.remove_by_regex("bench_capture/_samples/.*/meta"))
+            legacy = int(store.remove_by_regex("bench_capture/.*/g0/meta"))
+            return prefix + legacy
         return -1
     finally:
         store.close()
