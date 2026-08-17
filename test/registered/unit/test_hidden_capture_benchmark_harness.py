@@ -47,15 +47,6 @@ class TestHiddenCaptureBenchmarkHarness(unittest.TestCase):
         self.assertEqual(tuple(by_name), versions.SUITE_CELLS)
         self.assertTrue(all(arms == {False, True} for arms in by_name.values()))
 
-    def test_crossed_schedule_balances_every_concurrent_step(self):
-        baseline = {"label": "v5"}
-        candidate = {"label": "v6"}
-        gpu_a, gpu_b = versions.crossed_schedules(baseline, candidate)
-        for step in range(4):
-            pair = (gpu_a[step], gpu_b[step])
-            self.assertEqual({revision["label"] for revision, _ in pair}, {"v5", "v6"})
-            self.assertEqual({capture for _, capture in pair}, {False, True})
-
     def test_default_schedule_keeps_each_cell_on_one_gpu(self):
         baseline = {"label": "v5"}
         candidate = {"label": "v6"}
@@ -413,7 +404,6 @@ class TestHiddenCaptureBenchmarkHarness(unittest.TestCase):
         cell = summary["cells"]["v1_short_low"]
         metric = cell["metrics"]["request_throughput"]
         self.assertTrue(cell["comparable"])
-        self.assertIsNone(metric["crossed_geomean"])
         self.assertAlmostEqual(
             metric["aggregate_geomean"]["baseline_capture_cost_pct"], -1.0
         )

@@ -18,13 +18,6 @@ re-gated from the supplied prior artifact and only baseline/off is launched:
     GPU A, cell X: baseline/off + referenced same-GPU candidate/off
     GPU B, cell Y: baseline/off + referenced same-GPU candidate/off
 
-Use ``--cross-gpu-repeat`` only when a material card-dependent discrepancy
-needs confirmation.  It uses the original two-GPU, eight-arm protocol for each
-cell::
-
-    GPU A: baseline/off, baseline/on, candidate/off, candidate/on
-    GPU B: candidate/on, candidate/off, baseline/on, baseline/off
-
 The frozen ``version-comparison-v1`` cells live in the matrix module.  Changing
 their workload is a protocol change and requires a new suite name.
 
@@ -198,48 +191,16 @@ def _schedule(baseline: dict, candidate: dict) -> tuple[tuple[dict, bool], ...]:
     )
 
 
-def crossed_schedules(
-    baseline: dict, candidate: dict
-) -> tuple[tuple[tuple[dict, bool], ...], tuple[tuple[dict, bool], ...]]:
-    return (
-        _schedule(baseline, candidate),
-        tuple(reversed(_schedule(baseline, candidate))),
-    )
-
-
 def comparison_waves(
     cells,
     gpus,
     baseline,
     candidate,
-    cross_gpu_repeat=False,
     scheduled_arms=None,
 ):
     """Build deterministic waves while keeping a default cell on one GPU."""
     if not gpus or len(set(gpus)) != len(gpus):
         raise ValueError("comparison waves require distinct GPUs")
-    if scheduled_arms is not None and cross_gpu_repeat:
-        raise ValueError("custom scheduled arms cannot use cross-GPU repetition")
-    if cross_gpu_repeat:
-        if len(gpus) != 2:
-            raise ValueError("cross-GPU repetition requires exactly two GPUs")
-        schedules = crossed_schedules(baseline, candidate)
-        return tuple(
-            tuple(
-                {
-                    "cell_index": cell_index,
-                    "cell": cell,
-                    "step": step,
-                    "worker": worker,
-                    "gpu": gpu,
-                    "revision": schedules[worker][step][0],
-                    "capture": schedules[worker][step][1],
-                }
-                for worker, gpu in enumerate(gpus)
-            )
-            for cell_index, cell in enumerate(cells)
-            for step in range(len(schedules[0]))
-        )
 
     forward = tuple(scheduled_arms or _schedule(baseline, candidate))
     if not forward:
@@ -855,9 +816,6 @@ def summarize_attempts(
             cell_summary["metrics"][metric] = {
                 "per_gpu": per_gpu,
                 "aggregate_geomean": aggregate_geomean,
-                "crossed_geomean": (
-                    aggregate_geomean if scheduling_mode == "cross-gpu-repeat" else None
-                ),
             }
 
         for gpu, label in sorted({(key[0], key[1]) for key in rows}):
@@ -925,14 +883,6 @@ def main() -> int:
         help="comma-separated diagnosis subset; omitted is the formal full suite",
     )
     parser.add_argument(
-        "--cross-gpu-repeat",
-        action="store_true",
-        help=(
-            "repeat each version on the other GPU; opt in only to investigate "
-            "a material card-dependent discrepancy"
-        ),
-    )
-    parser.add_argument(
         "--candidate-off-attempts",
         default=None,
         help=(
@@ -994,12 +944,6 @@ def main() -> int:
         or not all(gpu.isdigit() for gpu in gpus)
     ):
         raise SystemExit("--gpus must name one or more distinct physical GPU indices")
-    if opts.cross_gpu_repeat and len(gpus) != 2:
-        raise SystemExit("--cross-gpu-repeat requires exactly two GPUs")
-    if opts.candidate_off_attempts and opts.cross_gpu_repeat:
-        raise SystemExit(
-            "--candidate-off-attempts intentionally forbids cross-GPU repetition"
-        )
     labels = (opts.baseline_label, opts.candidate_label)
     if labels[0] == labels[1] or _safe_label(labels[0]) == _safe_label(labels[1]):
         raise SystemExit(
@@ -1027,7 +971,7 @@ def main() -> int:
     scheduling_mode = (
         "reused-candidate-off+baseline-off-only"
         if reference_mode
-        else ("cross-gpu-repeat" if opts.cross_gpu_repeat else "fixed-cell-gpu")
+        else "fixed-cell-gpu"
     )
     run_manifest = {
         "schema": "hidden-capture-version-comparison-v1",
@@ -1073,7 +1017,6 @@ def main() -> int:
         gpus,
         baseline,
         candidate,
-        cross_gpu_repeat=opts.cross_gpu_repeat,
         scheduled_arms=((baseline, False),) if reference_mode else None,
     )
     attempts = []
