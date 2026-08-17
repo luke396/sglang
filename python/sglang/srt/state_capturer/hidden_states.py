@@ -77,11 +77,15 @@ _SAFE_RID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
 # HBM token-slot budget for the verify twin pool when the geometry is not
 # pinned via env vars: slots = budget / verify_window_tokens (min 2). At
-# 8192 total slots and Qwen3-8B widths (K=5 aux + last, bf16) is ~400MB.
+# 16384 total slots and Qwen3-8B widths (K=5 aux + last, bf16) is ~800MB.
 # Warm/high-concurrency profiling exhausted the former 4096-token (8x512)
-# pool even after ready twins were reaped independently of sidecar finalize;
-# 16x512 covered the measured burst without changing serving synchronization.
-_VERIFY_TWIN_BUDGET_TOKENS = 8192
+# pool even after ready twins were reaped independently of sidecar finalize.
+# 8192 (16x512) covered that burst, but long-chunked prefill (16K inputs)
+# queues large staging D2H ahead of twin D2H on the copy path, delaying twin
+# recycling: the V6vsV7 formal matrix measured 13/16 in use — over the 0.80
+# degrade watermark with the pool never actually empty. 32x512 keeps that
+# measured burst under 0.45 occupancy.
+_VERIFY_TWIN_BUDGET_TOKENS = 16384
 
 # Pinned-host token-slot budget for the staging ring when its geometry is not
 # pinned via env vars: slots = budget / slot_tokens (min 2). 32768 total slots
