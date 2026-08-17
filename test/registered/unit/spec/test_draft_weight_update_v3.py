@@ -87,6 +87,50 @@ class TestDraftTensorPreshard(unittest.TestCase):
                 4 * 4 * down.element_size(),
             )
 
+    def test_auxiliary_head_projections_are_never_sharded(self):
+        # GatedMarkovHead/RNNHead params contain ".gate_proj."/".up_proj."-like
+        # substrings but are replicated plain Linear modules; sharding them
+        # would corrupt every rank at tp>=2.
+        markov_gate = torch.arange(24, dtype=torch.float32).reshape(4, 6)
+        confidence = torch.arange(8, dtype=torch.float32).reshape(1, 8)
+        layer_gate = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+
+        ranks, info = preshard_dflash_named_tensors(
+            [
+                ("markov_head.gate_proj.weight", markov_gate),
+                ("confidence_head.proj.weight", confidence),
+                ("layers.0.mlp.gate_proj.weight", layer_gate),
+            ],
+            tp_size=2,
+        )
+
+        self.assertEqual(info["sharded_tensor_count"], 1)
+        self.assertEqual(info["replicated_tensor_count"], 2)
+        for rank, items in enumerate(ranks):
+            payload = dict(items)
+            torch.testing.assert_close(
+                payload["markov_head.gate_proj.weight"], markov_gate
+            )
+            torch.testing.assert_close(
+                payload["confidence_head.proj.weight"], confidence
+            )
+            torch.testing.assert_close(
+                payload["layers.0.mlp.gate_proj.weight"],
+                layer_gate.narrow(0, rank * 4, 4),
+            )
+
+    def test_model_prefixed_layer_projections_are_sharded(self):
+        q = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+        ranks, info = preshard_dflash_named_tensors(
+            [("model.layers.0.self_attn.q_proj.weight", q)], tp_size=2
+        )
+        self.assertEqual(info["sharded_tensor_count"], 1)
+        for rank, items in enumerate(ranks):
+            torch.testing.assert_close(
+                dict(items)["model.layers.0.self_attn.q_proj.weight"],
+                q.narrow(0, rank * 4, 4),
+            )
+
 
 class TestFailClosedLowLevelUpdate(unittest.TestCase):
     def test_validation_failure_touches_no_model_tensor(self):

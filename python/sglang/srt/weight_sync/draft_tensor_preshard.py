@@ -35,6 +35,12 @@ def _without_model_prefix(name: str) -> str:
 
 def _draft_tp_shard_dim(name: str) -> int | None:
     normalized = _without_model_prefix(name)
+    # Only decoder-layer projections are TP-sharded. Auxiliary heads
+    # (markov gate/joint, confidence) are replicated plain Linear modules,
+    # and their names can collide with projection substrings
+    # (markov_head.gate_proj matches ".gate_proj.").
+    if not normalized.startswith("layers."):
+        return None
     if any(token in normalized for token in _COLUMN_PARALLEL_NAMES):
         return 0
     if any(normalized.endswith(token) for token in _ROW_PARALLEL_WEIGHT_NAMES):
