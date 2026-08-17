@@ -13,8 +13,8 @@ host-side capture pipeline (see ``hidden_host.py`` / ``hidden_sink.py``):
 - ``HiddenCaptureOutput.stage`` / ``HiddenVerifyCaptureOutput.stage``
   (scheduler, copy stream): async D2H into the pinned staging ring on a
   dedicated capture stream.
-- ``collect_at_finish`` (scheduler, before ``release_kv_cache``): repeat the
-  deterministic sampling gate, snapshot KV slots over prompt + committed
+- ``collect_batch_at_finish`` (scheduler, before ``release_kv_cache``): repeat
+  the deterministic sampling gate, snapshot KV slots over prompt + committed
   decode rows, and enqueue the export job.
 
 Coverage is every forwarded token: prompt rows (prefill capture) plus
@@ -241,7 +241,6 @@ class HiddenStatesCapturer:
         spec_aux_config: SpecAuxHiddenStateConfig,
         num_tokens: int,
         max_running_requests: int,
-        device: str,
         dp_rank: Optional[int] = None,
     ) -> Optional[HiddenStatesCapturer]:
         if not server_args.enable_hidden_state_capture:
@@ -732,14 +731,11 @@ class HiddenStatesCapturer:
         rids: Sequence[str],
         rows: int,
         phase: str,
-        mark_miss: bool = True,
     ) -> bool:
         controller = getattr(self, "pressure_controller", None)
         if controller is None or controller.refresh(self._pressure_signals()):
             return True
-        sample_misses = 0
-        if mark_miss and rids:
-            sample_misses = self.bookkeeper.mark_miss(rids)
+        sample_misses = self.bookkeeper.mark_miss(rids)
         controller.record_drop(
             phase=phase,
             requests=len(rids),
@@ -1107,29 +1103,10 @@ class HiddenStatesCapturer:
             self.twin_pool.release(output.twin)
             return
         (slot,) = slots
-        if output.num_reqs * output.stride > self.verify_ring.slot_tokens:
-            self.stats.bump("verify_oversize_miss_ct")
-            self.bookkeeper.mark_miss(output.admitted_rids)
-            self.twin_pool.release(output.twin)
-            self.verify_ring.release(slot)
-            return
 
         num_rows = output.num_reqs * output.stride
-        row_bytes = (self.aux_width + self.last_width) * self.dtype.itemsize + 16
         self.stats.bump("verify_candidate_rows_staged_ct", num_rows)
         if output.compact_d2h:
-            if self.verify_launcher is None:
-                self.stats.bump("verify_launch_failed_miss_ct")
-                self.bookkeeper.mark_miss(output.admitted_rids)
-                self.twin_pool.release(output.twin)
-                self.verify_ring.release(slot)
-                return
-            if slot.commit_lens is None or slot.total_rows is None:
-                self.stats.bump("verify_launch_failed_miss_ct")
-                self.bookkeeper.mark_miss(output.admitted_rids)
-                self.twin_pool.release(output.twin)
-                self.verify_ring.release(slot)
-                return
             header_submitted_ns = time.monotonic_ns()
             with self._capture_launch_lock:
                 if self.capture_stream is not None:
@@ -1171,6 +1148,7 @@ class HiddenStatesCapturer:
                     num_reqs=output.num_reqs,
                 )
         self.bookkeeper.record_enqueued(output.admitted_rids, ring_seq)
+        row_bytes = (self.aux_width + self.last_width) * self.dtype.itemsize + 16
         self.stats.bump("rows_staged_ct", num_rows)
         self.stats.bump("verify_payload_rows_staged_ct", num_rows)
         self.stats.bump(
@@ -1364,10 +1342,6 @@ class HiddenStatesCapturer:
     def _snapshot_kv_slots(self, device_slots: torch.Tensor) -> torch.Tensor:
         """Single-request compatibility wrapper around the batched path."""
         return HiddenStatesCapturer._snapshot_kv_slots_batch(self, [device_slots])[0]
-
-    def collect_at_finish(self, req: Req, req_to_token_pool: ReqToTokenPool) -> None:
-        """Single-request compatibility wrapper for the scheduler hook."""
-        self.collect_batch_at_finish([req], req_to_token_pool)
 
     @_serving_span("serving_finish_hook")
     def collect_batch_at_finish(

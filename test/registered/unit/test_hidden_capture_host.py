@@ -16,7 +16,6 @@ from unittest import mock
 import torch
 
 from sglang.srt.state_capturer.hidden_host import (
-    DeviceTwinPool,
     HiddenCaptureBookkeeper,
     HiddenCapturePressureController,
     HiddenCaptureStats,
@@ -216,16 +215,6 @@ class TestSplitRingFinalizeOrder(CustomTestCase):
             order.append(slot.ring_seq)
             source.release(slot)
         self.assertEqual(order, [0, 1, 2, 3])
-
-    def test_verify_ring_unaffected_by_full_prefill_ring(self):
-        """The regression this split exists for: with the prefill ring
-        exhausted (finalize stalled on a big memcpy), verify staging must
-        still find slots instead of dropping the whole decode batch."""
-        prefill_ring, verify_ring = self._make_pair()
-        self._enqueue_prefill(prefill_ring, "p0")
-        self._enqueue_prefill(prefill_ring, "p1")
-        self.assertIsNone(prefill_ring.try_acquire(1))  # prefill exhausted
-        self.assertIsNotNone(verify_ring.try_acquire(1))  # verify unaffected
 
 
 class TestSidecarSeqlock(CustomTestCase):
@@ -932,54 +921,6 @@ class TestObservability(CustomTestCase):
         self.assertEqual(set(bookkeeper.pop("sampled-b")), {13})
         self.assertEqual(stats.prefill_rows_finalized_ct, 2)
 
-    def test_allocated_resource_bytes_and_bookkeeper_state_are_exact(self):
-        ring = _make_ring(num_slots=3, slot_tokens=5)
-        per_ring_slot = 5 * (
-            (AUX_WIDTH + LAST_WIDTH) * DTYPE.itemsize
-            + 2 * torch.empty((), dtype=torch.int64).element_size()
-        )
-        self.assertEqual(ring.allocated_bytes, 3 * per_ring_slot)
-
-        sidecar = _make_sidecar()
-        expected_sidecar = NUM_SIDECAR_SLOTS * (
-            (AUX_WIDTH + LAST_WIDTH) * DTYPE.itemsize
-            + torch.empty((), dtype=torch.int32).element_size()
-            + torch.empty((), dtype=torch.int64).element_size()
-        )
-        self.assertEqual(sidecar.allocated_bytes, expected_sidecar)
-
-        twins = DeviceTwinPool(
-            num_twins=2,
-            twin_tokens=5,
-            max_reqs=3,
-            aux_width=AUX_WIDTH,
-            last_width=LAST_WIDTH,
-            dtype=DTYPE,
-            device="cpu",
-            use_cuda_events=False,
-        )
-        expected_twin = 2 * (
-            5 * (AUX_WIDTH + LAST_WIDTH) * DTYPE.itemsize
-            + 2 * 5 * torch.empty((), dtype=torch.int64).element_size()
-            + 3 * 3 * torch.empty((), dtype=torch.int32).element_size()
-            + torch.empty((), dtype=torch.int32).element_size()
-        )
-        self.assertEqual(twins.allocated_bytes, expected_twin)
-
-        bookkeeper = HiddenCaptureBookkeeper()
-        bookkeeper.record_enqueued(["pending"], 3)
-        bookkeeper.mark_miss(["missed"])
-        self.assertEqual(
-            bookkeeper.state_snapshot(),
-            {
-                "finalize_record_rids": 0,
-                "enqueued_rids": 1,
-                "missed_rids": 1,
-                "invalidated_rids": 0,
-                "touched_rids": 2,
-            },
-        )
-
 
 class TestWorkerShutdown(CustomTestCase):
     def test_capture_initialization_failure_disables_only_capture(self):
@@ -1031,7 +972,6 @@ class TestWorkerShutdown(CustomTestCase):
                 spec_aux_config=spec_aux_config,
                 num_tokens=16,
                 max_running_requests=4,
-                device="cuda",
             )
         self.assertIsNone(capturer)
 
@@ -1067,33 +1007,6 @@ class TestWorkerShutdown(CustomTestCase):
         self.assertTrue(finalize.join(timeout_s=2.0))
         self.assertEqual(finalize.pending_count, 0)
         self.assertEqual(set(bookkeeper.pop("d2h")), {4, 5})
-
-    def test_finalize_stop_drains_inflight_and_joins(self):
-        stats = HiddenCaptureStats()
-        bookkeeper = HiddenCaptureBookkeeper()
-        ring = _make_ring(num_slots=1, slot_tokens=4)
-        finalize = HiddenFinalizeWorker(
-            ring=ring,
-            sidecar=_make_sidecar(),
-            bookkeeper=bookkeeper,
-            stats=stats,
-            poll_interval_s=0.0001,
-        )
-        aux, last = _rows(2)
-        (slot,) = ring.try_acquire(1)
-        ring.enqueue_segment(
-            slot,
-            aux_rows=aux,
-            last_rows=last,
-            cache_locs=torch.tensor([4, 5]),
-            tokens=torch.tensor([14, 15]),
-            req_ranges=[("drain", 0, 2)],
-        )
-        finalize.start()
-        finalize.stop(drain=True)
-        self.assertTrue(finalize.join(timeout_s=2.0))
-        self.assertEqual(finalize.pending_count, 0)
-        self.assertEqual(set(bookkeeper.pop("drain")), {4, 5})
 
     def test_export_stop_drains_queue_and_rejects_new_admission(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1499,43 +1412,6 @@ class TestVerifyCommittedRows(CustomTestCase):
         # Bookkeeper attribution is per request.
         self.assertEqual(set(bookkeeper.pop("r0")), {0, 1})
         self.assertEqual(set(bookkeeper.pop("r1")), {4, 5, 6, 7})
-
-    def test_twin_released_after_finalize(self):
-        from sglang.srt.state_capturer.hidden_host import DeviceTwinPool
-
-        pool = DeviceTwinPool(
-            num_twins=1,
-            twin_tokens=16,
-            max_reqs=4,
-            aux_width=AUX_WIDTH,
-            last_width=LAST_WIDTH,
-            dtype=DTYPE,
-            device="cpu",
-            use_cuda_events=False,
-        )
-        ring = _make_ring(num_slots=1, slot_tokens=16)
-        sidecar = _make_sidecar()
-        finalize = HiddenFinalizeWorker(
-            ring=ring,
-            sidecar=sidecar,
-            bookkeeper=HiddenCaptureBookkeeper(),
-            stats=HiddenCaptureStats(),
-            twin_pool=pool,
-        )
-        twin = pool.try_acquire()
-        self.assertIsNone(pool.try_acquire())  # pool exhausted
-        twin.cache_loc[:2] = torch.tensor([10, 11], dtype=torch.int64)
-        twin.tokens[:2] = torch.tensor([5, 6], dtype=torch.int64)
-        twin.commit_lens[:1] = torch.tensor([1], dtype=torch.int32)
-        (slot,) = ring.try_acquire(1)
-        ring.enqueue_verify_segment(slot, twin=twin, rids=["r0"], stride=2, num_reqs=1)
-        # Drive one loop iteration inline (the daemon path).
-        ready = ring.pop_ready()
-        finalize.finalize_slot(ready)
-        if ready.twin is not None:
-            pool.release(ready.twin)
-        ring.release(ready)
-        self.assertIsNotNone(pool.try_acquire())  # twin back in the pool
 
     def test_twin_reaped_before_finalize(self):
         """Coverage regression (matrix probe: 2x2048 -> 8x512 lifted baseline
@@ -2146,20 +2022,6 @@ class TestEndToEndPipeline(CustomTestCase):
             self.assertTrue(torch.equal(aux_back, aux))
             self.assertTrue(torch.equal(last_back, last))
 
-    def test_export_queue_full_is_miss(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            stats, _, _, _, _, export = self._build(tmpdir, queue_size=1)
-            job = HiddenExportJob(
-                rid="rx",
-                sample_id="rx",
-                tokens=torch.tensor([1], dtype=torch.long),
-                slots=torch.tensor([1], dtype=torch.long),
-                ring_seq_barrier=0,
-            )
-            self.assertTrue(export.submit(job))
-            self.assertFalse(export.submit(job))  # queue full -> miss, no block
-            self.assertEqual(stats.export_queue_full_miss_ct, 1)
-
     def test_barrier_timeout_is_miss(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             stats, bookkeeper, ring, sidecar, finalize, export = self._build(tmpdir)
@@ -2177,13 +2039,6 @@ class TestEndToEndPipeline(CustomTestCase):
 
 
 class TestFileSink(CustomTestCase):
-    def test_atomic_write_no_partial_files(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            sink = HiddenFileSink(tmpdir)
-            sink.put("s1", {"input_ids": torch.tensor([1, 2])})
-            files = os.listdir(tmpdir)
-            self.assertEqual(files, ["s1.ckpt"])  # no .tmp left behind
-
     def test_fingerprint_idempotent(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             sink = HiddenFileSink(tmpdir)

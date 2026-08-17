@@ -170,16 +170,6 @@ class SchedulerBatchResultProcessor:
             req_to_token_pool=self.req_to_token_pool,
         )
 
-    def _maybe_collect_hidden_capture(self, req: Req):
-        """Hidden-state capture finish hook. Must run before release_kv_cache
-        (the kv-slot snapshot inside relies on the request still owning its
-        slots). It waits only for the small ordered-slot snapshot, then
-        enqueues; hidden gather and export stay off the scheduler thread."""
-        capturer = get_global_hidden_capturer()
-        if capturer is None:
-            return
-        capturer.collect_at_finish(req, self.req_to_token_pool)
-
     def _maybe_collect_customized_info(
         self,
         i: int,
@@ -1112,7 +1102,6 @@ class SchedulerBatchResultProcessor:
             if hidden_capture_finished_reqs is not None:
                 hidden_capture_finished_reqs.append(req)
             else:
-                self._maybe_collect_hidden_capture(req)
                 self._release_finished_decode_req(req)
                 req.time_stats.set_completion_time()
 

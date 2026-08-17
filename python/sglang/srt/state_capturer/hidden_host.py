@@ -52,7 +52,8 @@ logger = logging.getLogger(__name__)
 
 _GB = 1024**3
 
-# Finalize-side log cadence, in finalized slots.
+# Finalize-side stats log cadence, in seconds (time-based so short runs
+# still get attribution before shutdown).
 _STATS_LOG_INTERVAL_S = 30.0
 # Orphaned bookkeeping entries (aborted requests) older than this are swept.
 _BOOKKEEPING_TTL_S = 600.0
@@ -194,7 +195,6 @@ class HiddenCaptureStats:
         self.prefill_stage_full_miss_ct = 0
         self.verify_stage_full_miss_ct = 0
         self.attach_mismatch_miss_ct = 0
-        self.gen_mismatch_miss_ct = 0
         self.prefix_invalid_miss_ct = 0
         self.export_queue_full_miss_ct = 0
         self.export_timeout_miss_ct = 0
@@ -674,7 +674,6 @@ class DeviceTwinPool:
                 twin.verify_offsets,
                 twin.total_rows,
             )
-            if tensor is not None
         )
         size_mb = (
             num_twins * twin_tokens * (aux_width + last_width) * dtype.itemsize
@@ -999,17 +998,6 @@ class HiddenStagingRing:
         with self._lock:
             return len(self._inflight)
 
-    def pending_rids(self) -> List[str]:
-        """Best-effort request attribution for bounded shutdown failures."""
-        with self._lock:
-            pending = []
-            for slot in self._inflight:
-                if slot.kind.startswith("verify"):
-                    pending.extend(slot.rids)
-                else:
-                    pending.extend(rid for rid, _, _ in slot.req_ranges)
-            return pending
-
     def reap_ready_twins(self, twin_pool: DeviceTwinPool) -> int:
         """Release device twins whose D2H into pinned memory has completed.
 
@@ -1202,7 +1190,6 @@ class HiddenVerifyD2HLauncher:
         if (
             any(length < 0 or length > slot.stride for length in commit_lens)
             or sum(commit_lens) != total_rows
-            or total_rows < 0
             or total_rows > self.ring.slot_tokens
         ):
             raise RuntimeError(
@@ -1456,8 +1443,6 @@ class HiddenHostSidecar:
                 old_gens,
             ):
                 new_gen = old_gen + (1 if old_gen % 2 else 2)
-                if new_gen % 2:
-                    new_gen += 1
                 self._row_writing[physical_row] = True
                 if physical_row == old_row:
                     in_place_slots.append(slot)
@@ -1469,9 +1454,9 @@ class HiddenHostSidecar:
             self._writing_rows += rows
             self._unavailable_rows += rows
             if in_place_slots:
-                self.slot_gen[
-                    torch.tensor(in_place_slots, dtype=torch.long)
-                ] = torch.tensor(in_place_odd_gens, dtype=torch.int64)
+                self.slot_gen[torch.tensor(in_place_slots, dtype=torch.long)] = (
+                    torch.tensor(in_place_odd_gens, dtype=torch.int64)
+                )
         finally:
             reserve_hold_ns = time.monotonic_ns() - lock_started_ns
             self._lock.release()
@@ -1535,10 +1520,7 @@ class HiddenHostSidecar:
             self._stats.bump("sidecar_write_bytes_ct", payload_bytes)
             self._stats.bump(
                 "sidecar_cow_rows_ct",
-                sum(
-                    old >= 0 and physical != old
-                    for _, physical, old, *_ in plans
-                ),
+                sum(old >= 0 and physical != old for _, physical, old, *_ in plans),
             )
             self._stats.bump("sidecar_evicted_rows_ct", evicted_count)
             self._stats.observe_max("sidecar_resident_rows_high_water_ct", resident)
@@ -1571,7 +1553,6 @@ class HiddenHostSidecar:
             scanned += 1
             if (
                 row in selected
-                or row in self._free_rows
                 or self._row_leases[row]
                 or self._row_readers[row]
                 or self._row_writing[row]
@@ -1656,7 +1637,7 @@ class HiddenHostSidecar:
             last_dst=None,
             direct=False,
         )
-        return result if result is None else (result[0], result[1])
+        return result
 
     def read_rows_validated_into(
         self,

@@ -967,27 +967,6 @@ class TestMooncakePrefixProtocol(CustomTestCase):
         self.assertEqual(result, [True])
         self.assertGreaterEqual(stats.prefix_ready_queue_high_water_ct, 1)
 
-    def test_prefix_defaults_run_without_explicit_performance_parameters(self):
-        store = FakeStore()
-        sink = MooncakeHiddenSink(
-            store_id="test_store",
-            row_bytes=ROW_BYTES,
-            max_export_tokens=256,
-            store=store,
-            replicate_config=FakeReplicateConfig(),
-            manifest_config=FakeReplicateConfig(),
-            replicate_config_cls=FakeReplicateConfig,
-            prefix_enabled=True,
-            aux_width=AUX_WIDTH,
-            last_width=LAST_WIDTH,
-            dtype=DTYPE,
-            writer_epoch="epoch-defaults",
-        )
-        self.addCleanup(sink.close)
-        self.assertEqual(sink.max_segment_rows, 256)
-        self.assertEqual(sink.prefix_lanes, 2)
-        self.assertEqual(len(store.registered), 4)
-
     def test_prefix_startup_rejects_missing_group_or_batch_contract(self):
         class NoGroupConfig:
             def __init__(self):

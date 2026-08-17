@@ -11,12 +11,14 @@ configured sink::
         "aux_hidden_state": bf16 [1, T, K*H], # packed aux, serving layout
         "hidden_state":     bf16 [1, T, H],   # post-final-norm, pre-LM-head
         "rid":              str,              # original request id
+        "prompt_len":       int,              # prompt rows in [0, T)
     }
 
 Sinks share ``put(sample_id, record) -> bool`` / ``write_fingerprint(dict)``:
 ``HiddenFileSink`` (default) writes per-sample ``.ckpt`` files;
-``MooncakeHiddenSink`` (``SGLANG_HIDDEN_CAPTURE_SINK=mooncake``, in
-``hidden_mooncake.py``) publishes self-describing keys into a Mooncake store.
+``AsyncMooncakeHiddenSink`` (``SGLANG_HIDDEN_CAPTURE_SINK=mooncake``, in
+``hidden_mooncake.py``) publishes self-describing keys into a Mooncake store
+through a fail-soft background connection.
 """
 
 from __future__ import annotations
@@ -83,9 +85,9 @@ class HiddenExportTrace:
     finish-hook-to-export wall clock.
     """
 
-    def __init__(self, start_ns: int, dequeued_ns: Optional[int] = None) -> None:
+    def __init__(self, start_ns: int, dequeued_ns: int) -> None:
         self.start_ns = int(start_ns)
-        self.dequeued_ns = int(dequeued_ns if dequeued_ns is not None else start_ns)
+        self.dequeued_ns = int(dequeued_ns)
         self.barrier_end_ns = int(start_ns)
         self._lock = threading.Lock()
         self._intervals = []
@@ -327,7 +329,6 @@ class HiddenExportWorker:
                 logger.exception("hidden capture export failed for rid %s", job.rid)
             finally:
                 self._active = 0
-                self._queue.task_done()
             self._maybe_sweep_orphans()
 
     def _maybe_sweep_orphans(self) -> None:
@@ -438,6 +439,8 @@ class HiddenExportWorker:
                 "export_gather_busy_ns_ct", time.monotonic_ns() - gather_started_ns
             )
         if rows is None:
+            # Counter name is historical: this is the whole-sample export
+            # path's row-identity validation failure, not prefix-specific.
             self.stats.bump("prefix_invalid_miss_ct")
             logger.debug("hidden capture: identity validation failed, rid=%s", job.rid)
             return

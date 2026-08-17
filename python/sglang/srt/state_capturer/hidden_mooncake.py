@@ -186,7 +186,6 @@ class MooncakeHiddenSink:
         self.batch_put = bool(batch_put)
         self.writer_epoch = writer_epoch or uuid.uuid4().hex
         self._prefix_index = HiddenPrefixIndex()
-        self._fingerprint: Optional[Dict[str, Any]] = None
         self._context_id: Optional[str] = None
         self._boundary_staging: Optional[torch.Tensor] = None
         self._lanes: List[_PrefixLane] = []
@@ -344,8 +343,7 @@ class MooncakeHiddenSink:
                 self._bump("segment_exist_check_failed_miss_ct")
                 return None
 
-        reused_refs = list(plan.full_segments)
-        refs: List[HiddenSegmentRef] = list(reused_refs)
+        refs: List[HiddenSegmentRef] = list(plan.full_segments)
         self._bump("prefix_reused_rows_ct", plan.reused_rows)
         boundary_rows = plan.matched_rows - plan.reused_rows
         self._bump("prefix_boundary_republished_rows_ct", boundary_rows)
@@ -498,10 +496,9 @@ class MooncakeHiddenSink:
         return True
 
     def write_fingerprint(self, fingerprint: Dict[str, Any]) -> None:
-        self._fingerprint = dict(fingerprint)
         if self.prefix_enabled:
             self._context_id = context_id_for(
-                self._fingerprint, "plain-text-extra-key-none"
+                dict(fingerprint), "plain-text-extra-key-none"
             )
         key = f"{self.store_id}/_fingerprint"
         if not self._is_exist(key):
@@ -975,8 +972,6 @@ class MooncakeHiddenSink:
 
     def _publish_sample_input_ids(self, sample_id: str, tokens: torch.Tensor) -> None:
         nbytes = tokens.numel() * tokens.element_size()
-        if nbytes > self._staging.numel():
-            raise SampleTooLargeError(sample_id)
         self._staging[:nbytes].copy_(tokens.view(torch.uint8))
         self._put_batch_bytes(
             [
@@ -1035,7 +1030,6 @@ class MooncakeHiddenSink:
                 self._transition_lane(task.lane, "FREE")
                 self._free_lanes.put(task.lane)
                 task.done.set()
-                self._ready_tasks.task_done()
 
     def _execute_segment_put(self, task: _SegmentPutTask) -> None:
         keys = [key for key, _, _ in task.payload_objects]
@@ -1345,8 +1339,6 @@ class AsyncMooncakeHiddenSink:
         self._fingerprint: Optional[Dict[str, Any]] = None
         self._closed = False
         self.prefix_enabled = bool(sink_kwargs.get("prefix_enabled", True))
-        self.direct_gather = bool(sink_kwargs.get("direct_gather", True))
-        self.batch_put = bool(sink_kwargs.get("batch_put", True))
 
     @property
     def ready(self) -> bool:

@@ -422,11 +422,13 @@ def _fault_quiescent(snapshots):
             )
         ):
             return False
-        if int(sink.get("ready_tasks", 0)):
+        # V7 async proxy nests the real sink's state under "delegate".
+        sink_state = sink.get("delegate") or sink
+        if int(sink_state.get("ready_tasks", 0)):
             return False
         if any(
             state_name != "FREE" and count
-            for state_name, count in (sink.get("lane_states") or {}).items()
+            for state_name, count in (sink_state.get("lane_states") or {}).items()
         ):
             return False
     return True

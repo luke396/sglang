@@ -210,7 +210,6 @@ def _pack_committed_rows_cpu(
         out_verify_offsets[:bs].copy_(verify_offsets.to(out_verify_offsets.dtype))
     else:
         verify_offsets = None
-        out_verify_offsets[:bs].zero_()
     offsets = torch.cumsum(lens, dim=0) - lens
     out_commit_lens[:bs].copy_(lens.to(out_commit_lens.dtype))
     out_commit_offsets[:bs].copy_(offsets.to(out_commit_offsets.dtype))
@@ -340,8 +339,6 @@ def pack_committed_verify_rows_into(
             stride,
             BLOCK=block,
         )
-    else:
-        out_verify_offsets[:bs].zero_()
 
     last = last_compact if compact else last_strided
     block_d = 256
