@@ -21,6 +21,7 @@ from sglang.srt.state_capturer.hidden_host import (
     HiddenHostSidecar,
 )
 from sglang.srt.state_capturer.hidden_mooncake import (
+    AsyncMooncakeHiddenSink,
     MooncakeHiddenSink,
     SampleTooLargeError,
     _connect,
@@ -1060,6 +1061,67 @@ class TestMooncakePrefixProtocol(CustomTestCase):
                 dtype=DTYPE,
             )
         self.assertEqual(store.registered, [])
+
+
+class TestAsyncMooncakeStartup(CustomTestCase):
+    def test_initial_timeout_returns_then_background_probe_enables_sink(self):
+        allow_probe = threading.Event()
+        stats = HiddenCaptureStats()
+        created = []
+
+        class FakeSink:
+            registered_bytes = 123
+
+            def __init__(self, **kwargs):
+                self.fingerprint = None
+                self.closed = False
+                created.append((self, kwargs))
+
+            def write_fingerprint(self, fingerprint):
+                self.fingerprint = fingerprint
+
+            def put(self, sample_id, record):
+                return True
+
+            def put_prefix_sample(self, **kwargs):
+                return True
+
+            def state_snapshot(self):
+                return {"fake": True}
+
+            def close(self):
+                self.closed = True
+
+        proxy = AsyncMooncakeHiddenSink(
+            initial_probe_timeout_s=0.01,
+            reconnect_interval_s=0.01,
+            sink_factory=FakeSink,
+            probe_fn=lambda _address, _timeout: allow_probe.is_set(),
+            master_address="127.0.0.1:1",
+            store_id="async-test",
+            row_bytes=ROW_BYTES,
+            max_export_tokens=8,
+            stats=stats,
+            prefix_enabled=True,
+        )
+        started = time.monotonic()
+        proxy.write_fingerprint({"model": "test"})
+        self.assertLess(time.monotonic() - started, 0.1)
+        self.assertFalse(proxy.ready)
+        self.assertEqual(stats.sink_initial_probe_timeout_ct, 1)
+
+        allow_probe.set()
+        deadline = time.monotonic() + 2.0
+        while not proxy.ready and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertTrue(proxy.ready)
+        self.assertEqual(stats.sink_reconnect_success_ct, 1)
+        self.assertGreaterEqual(stats.sink_probe_failed_ct, 1)
+        self.assertEqual(created[0][0].fingerprint, {"model": "test"})
+        self.assertEqual(proxy.registered_bytes, 123)
+        self.assertTrue(proxy.put("sample", {}))
+        proxy.close()
+        self.assertTrue(created[0][0].closed)
 
 
 class _StatsStub:

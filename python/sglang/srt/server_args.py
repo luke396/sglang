@@ -3386,7 +3386,8 @@ class ServerArgs:
         "sidecar for draft-model training data export. Select the destination "
         "with SGLANG_HIDDEN_CAPTURE_SINK: the file sink requires "
         "SGLANG_HIDDEN_CAPTURE_DIR, while the Mooncake sink requires "
-        "MOONCAKE_MASTER and defaults to the V6 prefix-segment format.",
+        "MOONCAKE_MASTER and defaults to the prefix-segment format. CUDA "
+        "graph-off capture is unsupported/experimental.",
         NS("exec.features"),
     ] = False
     enable_return_indexer_topk: A[

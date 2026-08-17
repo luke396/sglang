@@ -55,14 +55,17 @@ arena, and a bounded set of segment lanes. Registration is never per sample.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import queue
+import socket
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import urlparse
 
 import torch
 
@@ -97,6 +100,10 @@ _RECORD_TO_KEY_NAME = {
 }
 
 
+def _trace_span(trace: Any, kind: str):
+    return trace.span(kind) if trace is not None else contextlib.nullcontext()
+
+
 @dataclass
 class _PrefixLane:
     index: int
@@ -112,6 +119,7 @@ class _SegmentPutTask:
     meta_key: str
     meta: Dict[str, Any]
     group_id: str
+    trace: Any = None
     done: threading.Event = field(default_factory=threading.Event)
     success: bool = False
     error: Optional[BaseException] = None
@@ -290,6 +298,7 @@ class MooncakeHiddenSink:
         prompt_len: int,
         own_slot_gens: Dict[int, int],
         sidecar: Any,
+        trace: Any = None,
     ) -> Optional[bool]:
         """Publish one complete sample as immutable segment references.
 
@@ -358,16 +367,26 @@ class MooncakeHiddenSink:
                 if start == plan.reused_rows and boundary_rows > 0
                 else None
             )
-            prepared = self._prepare_segment_publish(
-                segment=segment,
-                sample_start=start,
-                tokens=tokens,
-                slots=slots,
-                own_slot_gens=own_slot_gens,
-                sidecar=sidecar,
-                boundary_segment=boundary_segment,
-                boundary_rows=boundary_rows if boundary_segment is not None else 0,
-            )
+            try:
+                prepared = self._prepare_segment_publish(
+                    segment=segment,
+                    sample_start=start,
+                    tokens=tokens,
+                    slots=slots,
+                    own_slot_gens=own_slot_gens,
+                    sidecar=sidecar,
+                    boundary_segment=boundary_segment,
+                    boundary_rows=(
+                        boundary_rows if boundary_segment is not None else 0
+                    ),
+                    trace=trace,
+                )
+            except BaseException:
+                # Earlier segment tasks retain the same trace and registered
+                # lanes. Settle them before unwinding so attribution closes
+                # and no orphaned task writes into a later export's arena.
+                self._finish_failed_segment_tasks(segment_tasks)
+                raise
             if prepared is None:
                 self._finish_failed_segment_tasks(segment_tasks)
                 return None
@@ -387,7 +406,8 @@ class MooncakeHiddenSink:
 
         self._bump("suffix_published_rows_ct", max(0, num_rows - plan.matched_rows))
         try:
-            self._publish_sample_input_ids(sample_id, tokens)
+            with _trace_span(trace, "put"):
+                self._publish_sample_input_ids(sample_id, tokens)
         except Exception:
             self._bump("sample_publish_failed_miss_ct")
             if published_here:
@@ -453,7 +473,8 @@ class MooncakeHiddenSink:
             ],
         }
         try:
-            self._put_json(sample_meta_key, sample_meta)
+            with _trace_span(trace, "put"):
+                self._put_json(sample_meta_key, sample_meta)
         except Exception:
             self._bump("sample_publish_failed_miss_ct")
             if published_here:
@@ -472,7 +493,8 @@ class MooncakeHiddenSink:
             "prefix_index_segments_ct", self._prefix_index.segment_count
         )
         self._stats_observe_max("prefix_index_rows_ct", self._prefix_index.row_count)
-        self._append_manifest(sample_id)
+        with _trace_span(trace, "put"):
+            self._append_manifest(sample_id)
         return True
 
     def write_fingerprint(self, fingerprint: Dict[str, Any]) -> None:
@@ -752,6 +774,7 @@ class MooncakeHiddenSink:
         sidecar: Any,
         boundary_segment: Optional[HiddenSegmentRef],
         boundary_rows: int,
+        trace: Any = None,
     ):
         aux_key, last_key, meta_key = self._segment_keys(segment.segment_id)
         try:
@@ -771,9 +794,10 @@ class MooncakeHiddenSink:
         missing_payload = [not exists[0], not exists[1]]
         if not any(missing_payload):
             try:
-                self._put_json_with_config(
-                    meta_key, meta, self._group_config(group_id, 1)
-                )
+                with _trace_span(trace, "put"):
+                    self._put_json_with_config(
+                        meta_key, meta, self._group_config(group_id, 1)
+                    )
                 meta_bytes = len(json.dumps(meta, sort_keys=True).encode())
                 self._bump("segment_object_count_ct")
                 self._bump("segment_bytes_written_ct", meta_bytes)
@@ -843,6 +867,7 @@ class MooncakeHiddenSink:
                 meta_key=meta_key,
                 meta=meta,
                 group_id=group_id,
+                trace=trace,
             )
             self._transition_lane(lane, "READY")
             self._ready_tasks.put(task)
@@ -855,9 +880,10 @@ class MooncakeHiddenSink:
             self._free_lanes.put(lane)
             raise
         finally:
-            self._bump(
-                "prefix_gather_busy_ns_ct", time.monotonic_ns() - gather_started_ns
-            )
+            gather_ended_ns = time.monotonic_ns()
+            self._bump("prefix_gather_busy_ns_ct", gather_ended_ns - gather_started_ns)
+            if trace is not None:
+                trace.record("gather", gather_started_ns, gather_ended_ns)
 
     def _segment_meta(self, segment: HiddenSegmentRef) -> Dict[str, Any]:
         return {
@@ -996,7 +1022,8 @@ class MooncakeHiddenSink:
             self._transition_lane(task.lane, "PUTTING")
             put_started_ns = time.monotonic_ns()
             try:
-                self._execute_segment_put(task)
+                with _trace_span(task.trace, "put"):
+                    self._execute_segment_put(task)
                 task.success = True
             except BaseException as error:
                 task.error = error
@@ -1276,12 +1303,207 @@ class MooncakeHiddenSink:
             raise RuntimeError(f"mooncake put failed (status {rc}) for {key}")
 
 
+class SinkUnavailableError(RuntimeError):
+    """The asynchronous Mooncake connector has not published a live sink."""
+
+
+class AsyncMooncakeHiddenSink:
+    """Fail-soft startup proxy with a bounded initial wait and background retry.
+
+    Mooncake ``setup`` may spend roughly a minute in its own retry path when
+    the master is absent. This proxy first performs a bounded TCP probe and
+    builds the real sink on a daemon thread. ``write_fingerprint`` waits only
+    the configured initial budget; serving then starts with capture pressure-
+    degraded, and hooks become admissible automatically once ``ready`` flips.
+    """
+
+    def __init__(
+        self,
+        *,
+        initial_probe_timeout_s: float,
+        reconnect_interval_s: float,
+        sink_factory: Any = None,
+        probe_fn: Any = None,
+        **sink_kwargs,
+    ) -> None:
+        from sglang.srt.environ import envs
+
+        self._sink_kwargs = dict(sink_kwargs)
+        self._stats = sink_kwargs.get("stats")
+        self._master_address = (
+            sink_kwargs.get("master_address") or envs.MOONCAKE_MASTER.get()
+        )
+        self._initial_probe_timeout_s = max(0.0, float(initial_probe_timeout_s))
+        self._reconnect_interval_s = max(0.01, float(reconnect_interval_s))
+        self._sink_factory = sink_factory or MooncakeHiddenSink
+        self._probe_fn = probe_fn or _probe_master
+        self._lock = threading.Lock()
+        self._ready = threading.Event()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._sink: Optional[MooncakeHiddenSink] = None
+        self._fingerprint: Optional[Dict[str, Any]] = None
+        self._closed = False
+        self.prefix_enabled = bool(sink_kwargs.get("prefix_enabled", True))
+        self.direct_gather = bool(sink_kwargs.get("direct_gather", True))
+        self.batch_put = bool(sink_kwargs.get("batch_put", True))
+
+    @property
+    def ready(self) -> bool:
+        return self._ready.is_set()
+
+    @property
+    def registered_bytes(self) -> int:
+        with self._lock:
+            sink = self._sink
+        return int(getattr(sink, "registered_bytes", 0)) if sink is not None else 0
+
+    def write_fingerprint(self, fingerprint: Dict[str, Any]) -> None:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("asynchronous Mooncake sink is closed")
+            self._fingerprint = dict(fingerprint)
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._connect_loop,
+                    name="hidden-capture-mooncake-connect",
+                    daemon=True,
+                )
+                self._thread.start()
+        if not self._ready.wait(timeout=self._initial_probe_timeout_s):
+            self._bump("sink_initial_probe_timeout_ct")
+            logger.warning(
+                "hidden capture Mooncake was not ready within %.2fs; serving "
+                "continues with capture degraded while background reconnect runs",
+                self._initial_probe_timeout_s,
+            )
+
+    def put(self, sample_id: str, record: Dict[str, Any]) -> bool:
+        return self._require_sink().put(sample_id, record)
+
+    def put_prefix_sample(self, **kwargs) -> Optional[bool]:
+        return self._require_sink().put_prefix_sample(**kwargs)
+
+    def state_snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            sink = self._sink
+            thread = self._thread
+        delegate_state = sink.state_snapshot() if sink is not None else None
+        return {
+            "connector_ready": self.ready,
+            "connector_alive": bool(thread is not None and thread.is_alive()),
+            "master_address": self._master_address,
+            "closed": self._closed,
+            "delegate": delegate_state,
+        }
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            thread = self._thread
+            sink = self._sink
+            self._sink = None
+            self._ready.clear()
+        self._stop.set()
+        if thread is not None:
+            thread.join(timeout=max(0.1, self._initial_probe_timeout_s))
+            if thread.is_alive():
+                logger.warning(
+                    "hidden capture Mooncake connector is still inside setup; "
+                    "leaving its daemon cleanup to complete asynchronously"
+                )
+        if sink is not None:
+            sink.close()
+
+    def _require_sink(self) -> MooncakeHiddenSink:
+        with self._lock:
+            sink = self._sink
+        if sink is None:
+            self._bump("sink_unavailable_miss_ct")
+            raise SinkUnavailableError("Mooncake capture sink is not connected")
+        return sink
+
+    def _connect_loop(self) -> None:
+        while not self._stop.is_set():
+            self._bump("sink_reconnect_attempt_ct")
+            try:
+                reachable = self._probe_fn(
+                    self._master_address, self._initial_probe_timeout_s
+                )
+            except Exception:
+                reachable = False
+                logger.debug("hidden capture Mooncake probe failed", exc_info=True)
+            if not reachable:
+                self._bump("sink_probe_failed_ct")
+                if self._stop.wait(self._reconnect_interval_s):
+                    return
+                continue
+
+            candidate = None
+            try:
+                candidate = self._sink_factory(**self._sink_kwargs)
+                with self._lock:
+                    fingerprint = dict(self._fingerprint or {})
+                candidate.write_fingerprint(fingerprint)
+            except BaseException:
+                logger.warning(
+                    "hidden capture Mooncake background connect failed; retrying",
+                    exc_info=True,
+                )
+                if candidate is not None:
+                    try:
+                        candidate.close()
+                    except Exception:
+                        logger.debug("Mooncake candidate cleanup failed", exc_info=True)
+                if self._stop.wait(self._reconnect_interval_s):
+                    return
+                continue
+
+            with self._lock:
+                if self._closed or self._stop.is_set():
+                    publish = False
+                else:
+                    self._sink = candidate
+                    self._ready.set()
+                    publish = True
+            if not publish:
+                candidate.close()
+                return
+            self._bump("sink_reconnect_success_ct")
+            logger.info("hidden capture Mooncake background connection is ready")
+            return
+
+    def _bump(self, name: str, delta: int = 1) -> None:
+        if self._stats is not None:
+            self._stats.bump(name, delta)
+
+
 class SampleTooLargeError(Exception):
     """Sample exceeds the registered staging buffer; treated as a miss."""
 
     def __init__(self, sample_id: str) -> None:
         super().__init__(sample_id)
         self.sample_id = sample_id
+
+
+def _probe_master(master_address: Optional[str], timeout_s: float) -> bool:
+    """Bounded TCP reachability probe for the Mooncake master endpoint."""
+    if not master_address:
+        return False
+    address = str(master_address)
+    parsed = urlparse(address if "://" in address else f"tcp://{address}")
+    host = parsed.hostname
+    port = parsed.port
+    if not host or port is None:
+        logger.warning("invalid MOONCAKE_MASTER address for probe: %r", address)
+        return False
+    try:
+        with socket.create_connection((host, port), timeout=max(0.01, timeout_s)):
+            return True
+    except OSError:
+        return False
 
 
 def _connect(master_address: Optional[str]):

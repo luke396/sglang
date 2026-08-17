@@ -5,8 +5,8 @@ Data path::
     prefill forward -> async D2H of newly computed rows into pinned slots
     verify forward  -> GPU pack of committed rows -> two-phase header/payload D2H
         -> HiddenFinalizeWorker (global-seq event gate; sole sidecar writer)
-        -> HiddenHostSidecar    (one pageable payload copy per physical KV slot)
-        -> export thread        (legacy whole-sample gather, or V6 immutable
+        -> HiddenHostSidecar    (bounded sparse pageable payload cache)
+        -> export thread        (legacy whole-sample gather, or immutable
                                  segment reuse plus direct suffix gather)
 
 Concurrency contract
@@ -14,15 +14,12 @@ Concurrency contract
 Four threads touch this module: the scheduler thread (staging enqueue, finish
 snapshots), the compact-verify payload launcher, one finalize thread (the
 *sole writer* of the sidecar payload / generation / token arrays), and one
-export thread (reader). Sidecar access is serialized by a mutex held across
-``write_rows`` / ``read_rows_validated`` (both run on background threads; the
-hold time is the row memcpy, so serving is unaffected). A mutex — not a
-seqlock — is load-bearing here: torch CPU
-kernels release the GIL, and on weakly-ordered hosts (ARM: GH200/GB200) a
-seqlock's unfenced payload stores could become visible after the "settled"
-generation store, letting a reader return wrong-but-validated data. The
-generation counters remain for *identity* (ABA) validation, not for torn-read
-protection.
+export thread (reader). V7's sidecar mutex covers only logical-to-physical
+metadata snapshots and reader pins. Hidden-row expansion/copy runs outside
+the lock; a pinned physical row is immutable and a colliding writer uses COW
+or fails closed immediately. That pin/COW fence — not an unfenced seqlock — is
+load-bearing on weakly-ordered hosts (ARM: GH200/GB200). Generation counters
+remain for *identity* (ABA) validation, not for torn-read protection.
 
 Identity model: sidecar rows are keyed by KV token-slot index (same numbering
 as the KV cache). Requests hold their slots until ``release_kv_cache`` (called
@@ -103,13 +100,51 @@ class HiddenCaptureStats:
         self.sidecar_gather_bytes_ct = 0
         self.sidecar_write_lock_wait_ns_ct = 0
         self.sidecar_write_lock_hold_ns_ct = 0
+        self.sidecar_write_copy_ns_ct = 0
         self.sidecar_gather_lock_wait_ns_ct = 0
         self.sidecar_gather_lock_hold_ns_ct = 0
+        self.sidecar_gather_copy_ns_ct = 0
+        self.sidecar_cow_rows_ct = 0
+        self.sidecar_evicted_rows_ct = 0
+        self.sidecar_released_rows_ct = 0
+        self.sidecar_unleased_rows_ct = 0
+        self.sidecar_capacity_miss_ct = 0
+        self.sidecar_reader_conflict_miss_ct = 0
+        self.sidecar_lease_conflict_miss_ct = 0
+        self.sidecar_resident_rows_high_water_ct = 0
+        self.sidecar_leased_rows_high_water_ct = 0
         self.sidecar_direct_gather_rows_ct = 0
         self.sidecar_direct_gather_bytes_ct = 0
         self.export_barrier_wait_ns_ct = 0
         self.export_gather_busy_ns_ct = 0
         self.sink_put_busy_ns_ct = 0
+        # V7 critical-path counters are deliberately disjoint. For every
+        # export job their components add up to export_critical_wall_ns_ct;
+        # async gather/put overlap is its own bucket instead of being counted
+        # twice as it was by the V6 busy counters above.
+        self.export_critical_jobs_ct = 0
+        self.export_critical_wall_ns_ct = 0
+        self.export_critical_queue_ns_ct = 0
+        self.export_critical_finalize_ns_ct = 0
+        self.export_critical_barrier_ns_ct = 0
+        self.export_critical_gather_ns_ct = 0
+        self.export_critical_put_ns_ct = 0
+        self.export_critical_gather_put_overlap_ns_ct = 0
+        self.export_critical_other_ns_ct = 0
+        self.export_critical_max_ns_ct = 0
+        self.export_critical_attribution_mismatch_ct = 0
+        # Serving-thread spans identify the contention source without CUDA
+        # synchronization and can be carried unchanged to RDMA/NUMA hosts.
+        for name in (
+            "serving_forward_hook",
+            "serving_verify_hook",
+            "serving_prefill_stage",
+            "serving_verify_stage",
+            "serving_finish_hook",
+        ):
+            setattr(self, f"{name}_calls_ct", 0)
+            setattr(self, f"{name}_ns_ct", 0)
+            setattr(self, f"{name}_max_ns_ct", 0)
         self.mooncake_batch_put_calls_ct = 0
         self.mooncake_batch_put_objects_attempted_ct = 0
         self.mooncake_batch_put_bytes_attempted_ct = 0
@@ -166,6 +201,11 @@ class HiddenCaptureStats:
         self.duplicate_sample_miss_ct = 0
         self.sample_too_large_miss_ct = 0
         self.sink_put_failed_miss_ct = 0
+        self.sink_unavailable_miss_ct = 0
+        self.sink_reconnect_attempt_ct = 0
+        self.sink_reconnect_success_ct = 0
+        self.sink_probe_failed_ct = 0
+        self.sink_initial_probe_timeout_ct = 0
         # Sample exported but its manifest entry failed: discoverable by
         # nothing, reclaimed by lease TTL (mooncake sink only).
         self.manifest_orphan_miss_ct = 0
@@ -182,6 +222,19 @@ class HiddenCaptureStats:
         self.finish_snapshot_grow_ct = 0
         self.finish_snapshot_batch_high_water_ct = 0
         self.finish_snapshot_failed_miss_ct = 0
+        self.capture_degraded_ct = 0
+        self.capture_recovered_ct = 0
+        self.capture_degraded_drop_ct = 0
+        self.capture_degraded_request_ct = 0
+        self.capture_degraded_row_ct = 0
+        self.capture_degraded_sample_miss_ct = 0
+        self.capture_degraded_ns_ct = 0
+        self.capture_degraded_sink_ct = 0
+        self.capture_degraded_export_queue_ct = 0
+        self.capture_degraded_prefill_ring_ct = 0
+        self.capture_degraded_verify_ring_ct = 0
+        self.capture_degraded_verify_twin_ct = 0
+        self.capture_degraded_sidecar_ct = 0
         self.shutdown_admission_miss_ct = 0
         self.shutdown_verify_launcher_timeout_miss_ct = 0
         self.shutdown_finalize_timeout_miss_ct = 0
@@ -196,12 +249,300 @@ class HiddenCaptureStats:
         with self._lock:
             setattr(self, name, max(getattr(self, name), value))
 
+    def observe_duration(self, name: str, duration_ns: int) -> None:
+        """Record one wall span with count/total/max in one lock section."""
+        duration_ns = max(0, int(duration_ns))
+        with self._lock:
+            calls_name = f"{name}_calls_ct"
+            total_name = f"{name}_ns_ct"
+            max_name = f"{name}_max_ns_ct"
+            setattr(self, calls_name, getattr(self, calls_name) + 1)
+            setattr(self, total_name, getattr(self, total_name) + duration_ns)
+            setattr(self, max_name, max(getattr(self, max_name), duration_ns))
+
+    def record_export_critical_path(self, components: Dict[str, int]) -> None:
+        """Accumulate one already-disjoint V7 exporter attribution.
+
+        Attribution is observational and must never fail an export. The trace
+        normally closes exactly; defensively reconcile malformed/missing
+        values while exposing a mismatch counter for the harness.
+        """
+        wall_ns = max(0, int(components.get("wall_ns", 0)))
+        names = (
+            "queue",
+            "finalize",
+            "barrier",
+            "gather",
+            "put",
+            "gather_put_overlap",
+            "other",
+        )
+        values = {name: max(0, int(components.get(name, 0))) for name in names}
+        accounted = sum(values.values())
+        mismatch = accounted != wall_ns
+        if accounted != wall_ns:
+            if accounted < wall_ns:
+                values["other"] += wall_ns - accounted
+            else:
+                overflow = accounted - wall_ns
+                # Prefer trimming the residual bucket, then the post-barrier
+                # buckets. This branch is only a defensive guard against a
+                # trace bug; the mismatch counter makes any use visible.
+                for name in (
+                    "other",
+                    "gather_put_overlap",
+                    "put",
+                    "gather",
+                    "barrier",
+                    "finalize",
+                    "queue",
+                ):
+                    removed = min(values[name], overflow)
+                    values[name] -= removed
+                    overflow -= removed
+                    if overflow == 0:
+                        break
+        with self._lock:
+            self.export_critical_jobs_ct += 1
+            self.export_critical_attribution_mismatch_ct += int(mismatch)
+            self.export_critical_wall_ns_ct += wall_ns
+            self.export_critical_max_ns_ct = max(
+                self.export_critical_max_ns_ct, wall_ns
+            )
+            for name in names:
+                attr = f"export_critical_{name}_ns_ct"
+                setattr(self, attr, getattr(self, attr) + values[name])
+
+    def critical_path_snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            wall_ns = self.export_critical_wall_ns_ct
+            jobs = self.export_critical_jobs_ct
+            max_ns = self.export_critical_max_ns_ct
+            components = {
+                name: getattr(self, f"export_critical_{name}_ns_ct")
+                for name in (
+                    "queue",
+                    "finalize",
+                    "barrier",
+                    "gather",
+                    "put",
+                    "gather_put_overlap",
+                    "other",
+                )
+            }
+        denominator = max(1, wall_ns)
+        return {
+            "jobs": jobs,
+            "wall_ns": wall_ns,
+            "max_job_ns": max_ns,
+            "components_ns": components,
+            "components_fraction": {
+                name: value / denominator for name, value in components.items()
+            },
+        }
+
+    def serving_span_snapshot(self) -> Dict[str, Dict[str, int]]:
+        names = (
+            "serving_forward_hook",
+            "serving_verify_hook",
+            "serving_prefill_stage",
+            "serving_verify_stage",
+            "serving_finish_hook",
+        )
+        with self._lock:
+            return {
+                name: {
+                    "calls": getattr(self, f"{name}_calls_ct"),
+                    "wall_ns": getattr(self, f"{name}_ns_ct"),
+                    "max_ns": getattr(self, f"{name}_max_ns_ct"),
+                }
+                for name in names
+            }
+
     def snapshot(self) -> Dict[str, int]:
         with self._lock:
             return {k: v for k, v in vars(self).items() if k.endswith("_ct")}
 
     def log(self, prefix: str) -> None:
         logger.info("%s %s", prefix, self.snapshot())
+
+
+class HiddenWallSpanRecorder:
+    """Bounded global interval recorder used only for barrier attribution.
+
+    Finalize runs on a different thread from export. A job waiting at its
+    barrier can therefore distinguish time during which finalize was actually
+    executing from residual queue/poll wait. Intervals are monotonic-clock
+    values and reads never wait for a worker or synchronize CUDA.
+    """
+
+    def __init__(self, *, retention_s: float = 120.0, max_spans: int = 65536):
+        self._lock = threading.Lock()
+        self._retention_ns = int(retention_s * 1e9)
+        self._spans: deque[Tuple[int, int]] = deque(maxlen=max_spans)
+
+    def record_finalize(self, start_ns: int, end_ns: int) -> None:
+        if end_ns <= start_ns:
+            return
+        cutoff = end_ns - self._retention_ns
+        with self._lock:
+            self._spans.append((start_ns, end_ns))
+            while self._spans and self._spans[0][1] < cutoff:
+                self._spans.popleft()
+
+    def finalize_intervals(self, start_ns: int, end_ns: int) -> List[Tuple[int, int]]:
+        if end_ns <= start_ns:
+            return []
+        with self._lock:
+            spans = list(self._spans)
+        return [
+            (max(start_ns, left), min(end_ns, right))
+            for left, right in spans
+            if right > start_ns and left < end_ns
+        ]
+
+
+class HiddenCapturePressureController:
+    """Hysteretic, non-blocking admission gate with auditable time windows."""
+
+    _REASON_COUNTERS = {
+        "sink": "capture_degraded_sink_ct",
+        "export_queue": "capture_degraded_export_queue_ct",
+        "prefill_ring": "capture_degraded_prefill_ring_ct",
+        "verify_ring": "capture_degraded_verify_ring_ct",
+        "verify_twin": "capture_degraded_verify_twin_ct",
+        "sidecar": "capture_degraded_sidecar_ct",
+    }
+
+    def __init__(
+        self,
+        *,
+        stats: HiddenCaptureStats,
+        high_watermark: float,
+        recover_watermark: float,
+        min_degraded_s: float,
+        max_windows: int = 64,
+    ) -> None:
+        if not 0.0 <= recover_watermark < high_watermark <= 1.0:
+            raise ValueError(
+                "capture pressure watermarks require 0 <= recover < high <= 1"
+            )
+        self.stats = stats
+        self.high_watermark = float(high_watermark)
+        self.recover_watermark = float(recover_watermark)
+        self.min_degraded_ns = int(max(0.0, min_degraded_s) * 1e9)
+        self._lock = threading.Lock()
+        self._degraded = False
+        self._started_mono_ns = 0
+        self._current: Optional[Dict[str, Any]] = None
+        self._windows: deque[Dict[str, Any]] = deque(maxlen=max_windows)
+
+    def refresh(self, signals: Dict[str, float]) -> bool:
+        now_mono_ns = time.monotonic_ns()
+        now_wall_ns = time.time_ns()
+        high_reasons = {
+            name
+            for name, value in signals.items()
+            if float(value) >= self.high_watermark
+        }
+        recovered = all(
+            float(value) <= self.recover_watermark for value in signals.values()
+        )
+        with self._lock:
+            if not self._degraded and high_reasons:
+                self._degraded = True
+                self._started_mono_ns = now_mono_ns
+                self._current = {
+                    "start_wall_ns": now_wall_ns,
+                    "end_wall_ns": None,
+                    "reasons": sorted(high_reasons),
+                    "drop_calls": 0,
+                    "dropped_requests": 0,
+                    "dropped_rows": 0,
+                    "phase_drop_calls": {},
+                }
+                self.stats.bump("capture_degraded_ct")
+                for reason in high_reasons:
+                    counter = self._REASON_COUNTERS.get(reason)
+                    if counter is not None:
+                        self.stats.bump(counter)
+                logger.warning(
+                    "hidden capture entered degraded mode: reasons=%s",
+                    sorted(high_reasons),
+                )
+            elif self._degraded:
+                current_reasons = set(self._current["reasons"])
+                for reason in high_reasons - current_reasons:
+                    counter = self._REASON_COUNTERS.get(reason)
+                    if counter is not None:
+                        self.stats.bump(counter)
+                current_reasons.update(high_reasons)
+                self._current["reasons"] = sorted(current_reasons)
+                if (
+                    recovered
+                    and now_mono_ns - self._started_mono_ns >= self.min_degraded_ns
+                ):
+                    duration_ns = now_mono_ns - self._started_mono_ns
+                    self._current["end_wall_ns"] = now_wall_ns
+                    self._current["duration_ns"] = duration_ns
+                    self._windows.append(dict(self._current))
+                    self._current = None
+                    self._degraded = False
+                    self.stats.bump("capture_recovered_ct")
+                    self.stats.bump("capture_degraded_ns_ct", duration_ns)
+                    logger.info(
+                        "hidden capture recovered after %.3fs", duration_ns / 1e9
+                    )
+            return not self._degraded
+
+    def record_drop(
+        self, *, phase: str, requests: int, rows: int, sample_misses: int = 0
+    ) -> None:
+        requests = max(0, int(requests))
+        rows = max(0, int(rows))
+        with self._lock:
+            if self._current is not None:
+                self._current["drop_calls"] += 1
+                self._current["dropped_requests"] += requests
+                self._current["dropped_rows"] += rows
+                phase_calls = self._current["phase_drop_calls"]
+                phase_calls[phase] = phase_calls.get(phase, 0) + 1
+        self.stats.bump("capture_degraded_drop_ct")
+        self.stats.bump("capture_degraded_request_ct", requests)
+        self.stats.bump("capture_degraded_row_ct", rows)
+        if sample_misses:
+            self.stats.bump("capture_degraded_sample_miss_ct", sample_misses)
+
+    def snapshot(self) -> Dict[str, Any]:
+        now_mono_ns = time.monotonic_ns()
+        with self._lock:
+            current = dict(self._current) if self._current is not None else None
+            if current is not None:
+                current["duration_ns"] = now_mono_ns - self._started_mono_ns
+            return {
+                "degraded": self._degraded,
+                "high_watermark": self.high_watermark,
+                "recover_watermark": self.recover_watermark,
+                "min_degraded_ns": self.min_degraded_ns,
+                "current_window": current,
+                "recent_windows": list(self._windows),
+            }
+
+    def close(self) -> None:
+        """Seal an open window for final stats without calling it recovery."""
+        now_mono_ns = time.monotonic_ns()
+        now_wall_ns = time.time_ns()
+        with self._lock:
+            if not self._degraded or self._current is None:
+                return
+            duration_ns = now_mono_ns - self._started_mono_ns
+            self._current["end_wall_ns"] = now_wall_ns
+            self._current["duration_ns"] = duration_ns
+            self._current["closed_with_process"] = True
+            self._windows.append(dict(self._current))
+            self._current = None
+            self._degraded = False
+        self.stats.bump("capture_degraded_ns_ct", duration_ns)
 
 
 class _StagingSlot(msgspec.Struct):
@@ -277,6 +618,7 @@ class DeviceTwinPool:
     ) -> None:
         self.twin_tokens = twin_tokens
         self.max_reqs = max_reqs
+        self.num_twins = num_twins
         self._lock = threading.Lock()
         self._free: List[_DeviceTwin] = []
         self._in_use = 0
@@ -361,6 +703,11 @@ class DeviceTwinPool:
             self._in_use -= 1
             twin.borrowed_ns = 0
             self._free.append(twin)
+
+    @property
+    def in_use_count(self) -> int:
+        with self._lock:
+            return self._in_use
 
 
 class _StagingSeqCounter:
@@ -926,16 +1273,32 @@ class HiddenVerifyD2HLauncher:
         self.ring.mark_verify_payload_enqueued(slot, num_rows=0)
 
 
-class HiddenHostSidecar:
-    """Pageable per-token-slot payload arrays plus the identity maps.
+class SidecarCapacityError(RuntimeError):
+    """The bounded sparse sidecar had no unleased/non-reader row to reuse."""
 
-    Payload buffers are ``torch.empty`` (validity is gated by ``slot_gen`` /
-    ``token_id_map``, so pre-zeroing terabytes is wasted work). Only the
-    finalize thread writes; writes and validated reads are serialized by
-    ``_lock`` (see the module docstring for why a mutex, not a seqlock).
-    ``slot_gen`` still increments by 2 per settled write — the even/odd shape
-    is kept so generations recorded before this locking change stay valid —
-    but its role is identity (ABA) validation only.
+
+class HiddenHostSidecar:
+    """Capacity-bounded sparse payload cache keyed by logical KV slot.
+
+    V6 allocated one hidden payload row for every KV-pool slot and held the
+    global mutex while ``index_select`` copied tens of GiB. V7 keeps the small
+    generation/token identity maps at KV-pool cardinality, but stores payloads
+    in a compact physical arena. The mutex protects only logical->physical
+    metadata and reader pins:
+
+    * a reader validates and pins physical rows under the mutex, copies hidden
+      payloads after releasing it, then unpins;
+    * the sole finalize writer reuses an unpinned/unleased row, or
+      copy-on-writes when a reader or an export lease owns the current row. It
+      never waits for either;
+    * exact ``(slot, generation)`` versions remain leased until export settles,
+      so serving may reuse a KV slot without corrupting a queued sample;
+    * full capacity with every candidate pinned/leased is an immediate
+      whole-slot capture miss, never serving backpressure.
+
+    Pinned physical rows are immutable, which is the synchronization fence
+    required on weakly ordered hosts. ``slot_gen`` remains the ABA identity
+    generation (even settled, odd in-place write, zero never written).
     """
 
     def __init__(
@@ -946,14 +1309,49 @@ class HiddenHostSidecar:
         last_width: int,
         dtype: torch.dtype,
         stats: Optional[HiddenCaptureStats] = None,
+        capacity_tokens: Optional[int] = None,
     ) -> None:
+        if num_slots <= 0:
+            raise ValueError("sidecar num_slots must be positive")
+        capacity_tokens = num_slots if capacity_tokens is None else int(capacity_tokens)
+        if capacity_tokens <= 0 or capacity_tokens > num_slots:
+            raise ValueError(
+                "sidecar capacity_tokens must be in [1, num_slots], got "
+                f"{capacity_tokens} for {num_slots}"
+            )
         self._lock = threading.Lock()
         self._stats = stats
-        self.aux_buf = torch.empty((num_slots, aux_width), dtype=dtype)
-        self.last_buf = torch.empty((num_slots, last_width), dtype=dtype)
+        self.num_slots = int(num_slots)
+        self.capacity_tokens = capacity_tokens
+        self.aux_buf = torch.empty((capacity_tokens, aux_width), dtype=dtype)
+        self.last_buf = torch.empty((capacity_tokens, last_width), dtype=dtype)
         self.token_id_map = torch.full((num_slots,), -1, dtype=torch.int32)
-        # Even = settled, odd = write in flight; 0 = never written.
         self.slot_gen = torch.zeros((num_slots,), dtype=torch.int64)
+        # ``_slot_to_row`` is a dense logical-slot index for the newest
+        # version used by warm-prefix validation.  Keeping current versions in
+        # a Python ``dict[(slot, generation)]`` cost one tuple allocation and
+        # two hash-table operations per captured token, and showed up as the
+        # dominant finalizer GIL holder under nsys. ``_version_to_row`` now
+        # contains only older COW generations that still need exact lookup.
+        self._slot_to_row = [-1] * num_slots
+        self._version_to_row: Dict[Tuple[int, int], int] = {}
+        self._row_slot = [-1] * capacity_tokens
+        self._row_gen = [0] * capacity_tokens
+        self._row_leases = [0] * capacity_tokens
+        self._row_readers = [0] * capacity_tokens
+        self._row_writing = [False] * capacity_tokens
+        self._free_rows = set(range(capacity_tokens))
+        self._evict_cursor = 0
+        self._resident_rows = 0
+        self._leased_rows = 0
+        self._reader_pins = 0
+        self._reader_rows = 0
+        self._writing_rows = 0
+        # Exact union of rows blocked from eviction by a lease, reader, or
+        # in-progress write.  The old sum of the three populations counted a
+        # leased row again while Mooncake gathered it, causing false 100%
+        # pressure and long degraded-capture windows.
+        self._unavailable_rows = 0
         self.allocated_bytes = sum(
             tensor.numel() * tensor.element_size()
             for tensor in (
@@ -963,17 +1361,18 @@ class HiddenHostSidecar:
                 self.slot_gen,
             )
         )
-        size_gb = (
+        payload_gb = (
             self.aux_buf.numel() * self.aux_buf.element_size()
             + self.last_buf.numel() * self.last_buf.element_size()
         ) / _GB
         logger.info(
-            "HiddenHostSidecar allocated: %d slots, aux_width=%d, last_width=%d, "
-            "%.2f GB pageable host memory",
+            "HiddenHostSidecar allocated: logical_slots=%d, capacity_tokens=%d, "
+            "aux_width=%d, last_width=%d, %.2f GB pageable payload",
             num_slots,
+            capacity_tokens,
             aux_width,
             last_width,
-            size_gb,
+            payload_gb,
         )
 
     def write_rows(
@@ -984,36 +1383,263 @@ class HiddenHostSidecar:
         last_rows: torch.Tensor,
         tokens: torch.Tensor,
     ) -> torch.Tensor:
-        """Write rows under the sidecar lock (finalize thread only).
+        """Copy rows outside the metadata lock and publish atomically.
 
-        Returns the settled generations for identity bookkeeping.
+        The finalize worker is the sole caller. A same-slot reader causes COW;
+        if the bounded arena cannot supply a row, ``SidecarCapacityError`` is
+        raised immediately and the finalizer marks the affected requests miss.
         """
-        wait_start_ns = time.monotonic_ns()
+        rows = int(slots.numel())
+        if rows == 0:
+            return torch.empty((0,), dtype=torch.int64)
+        if (
+            slots.device.type != "cpu"
+            or aux_rows.device.type != "cpu"
+            or last_rows.device.type != "cpu"
+            or tokens.device.type != "cpu"
+        ):
+            raise ValueError("sidecar write tensors must be on CPU")
+        if (
+            aux_rows.shape != (rows, self.aux_buf.shape[1])
+            or last_rows.shape != (rows, self.last_buf.shape[1])
+            or tokens.numel() != rows
+        ):
+            raise ValueError("sidecar write tensors have incompatible shapes")
+        slot_values = [int(slot) for slot in slots.tolist()]
+        if len(set(slot_values)) != rows:
+            raise ValueError("sidecar write slots must be unique")
+        if any(slot < 0 or slot >= self.num_slots for slot in slot_values):
+            raise IndexError("sidecar logical slot out of range")
+        tokens_i32 = tokens.to(dtype=torch.int32).contiguous()
+
+        wait_started_ns = time.monotonic_ns()
         self._lock.acquire()
-        lock_start_ns = time.monotonic_ns()
+        lock_started_ns = time.monotonic_ns()
+        plans = []
+        evicted_count = 0
         try:
-            gens = self.slot_gen[slots]
-            new_gens = gens + 2
-            self.aux_buf[slots] = aux_rows
-            self.last_buf[slots] = last_rows
-            self.token_id_map[slots] = tokens.to(torch.int32)
-            self.slot_gen[slots] = new_gens
-            return new_gens
+            current_rows = [self._slot_to_row[slot] for slot in slot_values]
+            target_rows = {row for row in current_rows if row >= 0}
+            physical_values = list(current_rows)
+            allocation_indices = []
+            for index, current in enumerate(current_rows):
+                if (
+                    current >= 0
+                    and self._row_leases[current] == 0
+                    and self._row_readers[current] == 0
+                    and not self._row_writing[current]
+                ):
+                    continue
+                allocation_indices.append(index)
+            reserved = self._reserve_rows_locked(
+                len(allocation_indices), protected_rows=target_rows
+            )
+            evicted_slots = [None] * rows
+            for index, (new_row, evicted_slot) in zip(allocation_indices, reserved):
+                physical_values[index] = new_row
+                evicted_slots[index] = evicted_slot
+                if evicted_slot is not None:
+                    evicted_count += 1
+
+            # One tensor gather replaces a Python tensor-scalar conversion per
+            # row.  At 300k+ rows/run those conversions were the largest V7
+            # finalizer GIL regression in the nsys trace.
+            old_gens = self.slot_gen[slots].tolist()
+            new_gens = []
+            in_place_slots = []
+            in_place_odd_gens = []
+            for slot, physical_row, old_row, evicted_slot, old_gen in zip(
+                slot_values,
+                physical_values,
+                current_rows,
+                evicted_slots,
+                old_gens,
+            ):
+                new_gen = old_gen + (1 if old_gen % 2 else 2)
+                if new_gen % 2:
+                    new_gen += 1
+                self._row_writing[physical_row] = True
+                if physical_row == old_row:
+                    in_place_slots.append(slot)
+                    in_place_odd_gens.append(new_gen - 1)
+                plans.append(
+                    (slot, physical_row, old_row, evicted_slot, old_gen, new_gen)
+                )
+                new_gens.append(new_gen)
+            self._writing_rows += rows
+            self._unavailable_rows += rows
+            if in_place_slots:
+                self.slot_gen[
+                    torch.tensor(in_place_slots, dtype=torch.long)
+                ] = torch.tensor(in_place_odd_gens, dtype=torch.int64)
         finally:
-            hold_ns = time.monotonic_ns() - lock_start_ns
+            reserve_hold_ns = time.monotonic_ns() - lock_started_ns
             self._lock.release()
+
+        physical_rows = torch.tensor(physical_values, dtype=torch.long)
+        new_gens_tensor = torch.tensor(new_gens, dtype=torch.int64)
+        copy_started_ns = time.monotonic_ns()
+        try:
+            self.aux_buf.index_copy_(0, physical_rows, aux_rows)
+            self.last_buf.index_copy_(0, physical_rows, last_rows)
+        except BaseException:
+            self._abort_write(plans)
+            raise
+        copy_ns = time.monotonic_ns() - copy_started_ns
+
+        publish_wait_ns = time.monotonic_ns()
+        with self._lock:
+            publish_started_ns = time.monotonic_ns()
+            for (
+                slot,
+                physical_row,
+                old_row,
+                _evicted_slot,
+                _old_gen,
+                _new_gen,
+            ) in plans:
+                if physical_row != old_row:
+                    # Keep an older leased/current-reader generation resident;
+                    # exact-generation export may still need it after this KV
+                    # slot has been reused by serving.
+                    if (
+                        old_row >= 0
+                        and self._row_slot[old_row] == slot
+                        and self._row_gen[old_row] == _old_gen
+                    ):
+                        self._version_to_row[(slot, _old_gen)] = old_row
+                    self._resident_rows += 1
+                self._slot_to_row[slot] = physical_row
+                self._row_slot[physical_row] = slot
+                self._row_gen[physical_row] = _new_gen
+                self._row_writing[physical_row] = False
+            self._writing_rows -= rows
+            self._unavailable_rows -= rows
+            self.token_id_map[slots] = tokens_i32
+            self.slot_gen[slots] = new_gens_tensor
+            resident = self._resident_rows
+            publish_hold_ns = time.monotonic_ns() - publish_started_ns
+
+        if self._stats is not None:
+            payload_bytes = rows * self._payload_row_bytes
+            self._stats.bump(
+                "sidecar_write_lock_wait_ns_ct",
+                (lock_started_ns - wait_started_ns)
+                + (publish_started_ns - publish_wait_ns),
+            )
+            self._stats.bump(
+                "sidecar_write_lock_hold_ns_ct", reserve_hold_ns + publish_hold_ns
+            )
+            self._stats.bump("sidecar_write_copy_ns_ct", copy_ns)
+            self._stats.bump("sidecar_write_rows_ct", rows)
+            self._stats.bump("sidecar_write_bytes_ct", payload_bytes)
+            self._stats.bump(
+                "sidecar_cow_rows_ct",
+                sum(
+                    old >= 0 and physical != old
+                    for _, physical, old, *_ in plans
+                ),
+            )
+            self._stats.bump("sidecar_evicted_rows_ct", evicted_count)
+            self._stats.observe_max("sidecar_resident_rows_high_water_ct", resident)
+        return new_gens_tensor
+
+    @property
+    def _payload_row_bytes(self) -> int:
+        return (
+            self.aux_buf.shape[1] * self.aux_buf.element_size()
+            + self.last_buf.shape[1] * self.last_buf.element_size()
+        )
+
+    def _reserve_rows_locked(
+        self, count: int, *, protected_rows: set
+    ) -> List[Tuple[int, Optional[int]]]:
+        if count <= 0:
+            return []
+        free_candidates = []
+        for row in self._free_rows:
+            free_candidates.append(row)
+            if len(free_candidates) == count:
+                break
+        candidates = [(row, None) for row in free_candidates]
+        selected = set(protected_rows)
+        selected.update(free_candidates)
+        scanned = 0
+        while len(candidates) < count and scanned < self.capacity_tokens:
+            row = self._evict_cursor
+            self._evict_cursor = (self._evict_cursor + 1) % self.capacity_tokens
+            scanned += 1
+            if (
+                row in selected
+                or row in self._free_rows
+                or self._row_leases[row]
+                or self._row_readers[row]
+                or self._row_writing[row]
+            ):
+                continue
+            old_slot = self._row_slot[row]
+            candidates.append((row, old_slot if old_slot >= 0 else None))
+            selected.add(row)
+        if len(candidates) < count:
             if self._stats is not None:
-                rows = int(slots.numel())
-                payload_bytes = rows * (
-                    self.aux_buf.shape[1] * self.aux_buf.element_size()
-                    + self.last_buf.shape[1] * self.last_buf.element_size()
-                )
-                self._stats.bump(
-                    "sidecar_write_lock_wait_ns_ct", lock_start_ns - wait_start_ns
-                )
-                self._stats.bump("sidecar_write_lock_hold_ns_ct", hold_ns)
-                self._stats.bump("sidecar_write_rows_ct", rows)
-                self._stats.bump("sidecar_write_bytes_ct", payload_bytes)
+                self._stats.bump("sidecar_capacity_miss_ct", count)
+                if any(self._row_readers):
+                    self._stats.bump("sidecar_reader_conflict_miss_ct", count)
+                if any(self._row_leases):
+                    self._stats.bump("sidecar_lease_conflict_miss_ct", count)
+            raise SidecarCapacityError(
+                f"need {count} rows, only {len(candidates)} reusable"
+            )
+
+        for row, old_slot in candidates:
+            if old_slot is None:
+                self._free_rows.discard(row)
+                continue
+            self._remove_row_locked(row, add_to_free=False)
+        return candidates
+
+    def _row_for_version_locked(self, slot: int, generation: int) -> int:
+        """Resolve a current or retained COW generation under ``_lock``."""
+        current = self._slot_to_row[slot]
+        if current >= 0 and self._row_gen[current] == generation:
+            return current
+        return self._version_to_row.get((slot, generation), -1)
+
+    def _remove_row_locked(self, row: int, *, add_to_free: bool = True) -> None:
+        slot = self._row_slot[row]
+        generation = self._row_gen[row]
+        if slot >= 0:
+            if self._version_to_row.get((slot, generation)) == row:
+                del self._version_to_row[(slot, generation)]
+            if self._slot_to_row[slot] == row:
+                self._slot_to_row[slot] = -1
+            self._resident_rows -= 1
+        if self._row_leases[row]:
+            self._leased_rows -= 1
+            if self._row_readers[row] == 0 and not self._row_writing[row]:
+                self._unavailable_rows -= 1
+        self._row_slot[row] = -1
+        self._row_gen[row] = 0
+        self._row_leases[row] = 0
+        if add_to_free and self._row_readers[row] == 0 and not self._row_writing[row]:
+            self._free_rows.add(row)
+
+    def _abort_write(self, plans) -> None:
+        with self._lock:
+            for slot, physical_row, old_row, _evicted, old_gen, _new_gen in plans:
+                self._row_writing[physical_row] = False
+                if physical_row == old_row:
+                    self._remove_row_locked(physical_row)
+                    self.slot_gen[slot] = old_gen + (2 if old_gen % 2 == 0 else 1)
+                else:
+                    # Reserved rows are unpublished. An evicted resident was
+                    # already removed by ``_reserve_rows_locked``.
+                    self._row_slot[physical_row] = -1
+                    self._row_gen[physical_row] = 0
+                    if self._row_readers[physical_row] == 0:
+                        self._free_rows.add(physical_row)
+            self._writing_rows -= len(plans)
+            self._unavailable_rows -= len(plans)
 
     def read_rows_validated(
         self,
@@ -1022,12 +1648,6 @@ class HiddenHostSidecar:
         expected_tokens: torch.Tensor,
         own_slot_gens: Dict[int, int],
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """Read ``slots`` under the sidecar lock; None on any identity failure.
-
-        Own rows (present in ``own_slot_gens``) must match the exact settled
-        generation recorded at finalize time. Warm-prefix rows must carry the
-        expected token id at a nonzero generation.
-        """
         result = self._read_rows_validated(
             slots=slots,
             expected_tokens=expected_tokens,
@@ -1047,14 +1667,6 @@ class HiddenHostSidecar:
         aux_dst: torch.Tensor,
         last_dst: torch.Tensor,
     ) -> bool:
-        """Validate first, then gather directly into caller-owned CPU views.
-
-        Validation and both ``index_select(out=...)`` calls share one sidecar
-        lock critical section, so a slot cannot be rewritten between identity
-        validation and payload read. Destinations must already have exact
-        shape/dtype; PyTorch would otherwise resize and defeat reservation
-        ownership.
-        """
         self._validate_destinations(slots, aux_dst, last_dst)
         return (
             self._read_rows_validated(
@@ -1078,49 +1690,117 @@ class HiddenHostSidecar:
         last_dst: Optional[torch.Tensor],
         direct: bool,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        wait_start_ns = time.monotonic_ns()
+        if slots.device.type != "cpu" or expected_tokens.device.type != "cpu":
+            raise ValueError("sidecar read identity tensors must be on CPU")
+        rows = int(slots.numel())
+        if expected_tokens.numel() != rows:
+            raise ValueError("sidecar expected_tokens must match slots")
+        if aux_dst is None:
+            aux_dst = torch.empty(
+                (rows, self.aux_buf.shape[1]), dtype=self.aux_buf.dtype
+            )
+        if last_dst is None:
+            last_dst = torch.empty(
+                (rows, self.last_buf.shape[1]), dtype=self.last_buf.dtype
+            )
+        slot_values = [int(slot) for slot in slots.tolist()]
+        if any(slot < 0 or slot >= self.num_slots for slot in slot_values):
+            return None
+        expected_token_values = expected_tokens.to(torch.int32).tolist()
+
+        wait_started_ns = time.monotonic_ns()
         self._lock.acquire()
-        lock_start_ns = time.monotonic_ns()
+        lock_started_ns = time.monotonic_ns()
+        current_gens = self.slot_gen[slots].tolist()
+        stored_tokens = self.token_id_map[slots].tolist()
+        physical_values = []
+        valid = True
+        for index, slot in enumerate(slot_values):
+            own_gen = own_slot_gens.get(slot)
+            if own_gen is not None:
+                generation = int(own_gen)
+                physical = self._row_for_version_locked(slot, generation)
+            else:
+                generation = int(current_gens[index])
+                physical = self._slot_to_row[slot]
+                if (
+                    generation <= 0
+                    or generation % 2
+                    or int(stored_tokens[index]) != int(expected_token_values[index])
+                ):
+                    valid = False
+            physical_values.append(physical)
+            if (
+                physical < 0
+                or self._row_slot[physical] != slot
+                or self._row_gen[physical] != generation
+                or self._row_writing[physical]
+            ):
+                valid = False
+        if valid:
+            for physical in physical_values:
+                if self._row_readers[physical] == 0:
+                    self._reader_rows += 1
+                    if (
+                        self._row_leases[physical] == 0
+                        and not self._row_writing[physical]
+                    ):
+                        self._unavailable_rows += 1
+                self._row_readers[physical] += 1
+            self._reader_pins += len(physical_values)
+        snapshot_hold_ns = time.monotonic_ns() - lock_started_ns
+        self._lock.release()
+        if not valid:
+            if self._stats is not None:
+                self._stats.bump(
+                    "sidecar_gather_lock_wait_ns_ct", lock_started_ns - wait_started_ns
+                )
+                self._stats.bump("sidecar_gather_lock_hold_ns_ct", snapshot_hold_ns)
+            return None
+
+        physical_rows = torch.tensor(physical_values, dtype=torch.long)
+        copy_started_ns = time.monotonic_ns()
         gathered = False
         try:
-            gens = self.slot_gen[slots].clone()
-            stored_tokens = self.token_id_map[slots].clone()
-            if not self._identity_valid(
-                slots=slots,
-                gens=gens,
-                stored_tokens=stored_tokens,
-                expected_tokens=expected_tokens,
-                own_slot_gens=own_slot_gens,
-            ):
-                return None
-
-            rows = int(slots.numel())
-            if aux_dst is None:
-                aux_dst = torch.empty(
-                    (rows, self.aux_buf.shape[1]), dtype=self.aux_buf.dtype
-                )
-            if last_dst is None:
-                last_dst = torch.empty(
-                    (rows, self.last_buf.shape[1]), dtype=self.last_buf.dtype
-                )
-            torch.index_select(self.aux_buf, 0, slots, out=aux_dst)
-            torch.index_select(self.last_buf, 0, slots, out=last_dst)
+            torch.index_select(self.aux_buf, 0, physical_rows, out=aux_dst)
+            torch.index_select(self.last_buf, 0, physical_rows, out=last_dst)
             gathered = True
             return aux_dst, last_dst
         finally:
-            hold_ns = time.monotonic_ns() - lock_start_ns
-            self._lock.release()
+            copy_ns = time.monotonic_ns() - copy_started_ns
+            unpin_wait_ns = time.monotonic_ns()
+            with self._lock:
+                unpin_started_ns = time.monotonic_ns()
+                for physical in physical_values:
+                    self._row_readers[physical] -= 1
+                    if self._row_readers[physical] == 0:
+                        self._reader_rows -= 1
+                        if (
+                            self._row_leases[physical] == 0
+                            and not self._row_writing[physical]
+                        ):
+                            self._unavailable_rows -= 1
+                    if (
+                        self._row_readers[physical] == 0
+                        and self._row_slot[physical] < 0
+                        and not self._row_writing[physical]
+                    ):
+                        self._free_rows.add(physical)
+                self._reader_pins -= len(physical_values)
+                unpin_hold_ns = time.monotonic_ns() - unpin_started_ns
             if self._stats is not None:
                 self._stats.bump(
-                    "sidecar_gather_lock_wait_ns_ct", lock_start_ns - wait_start_ns
+                    "sidecar_gather_lock_wait_ns_ct",
+                    (lock_started_ns - wait_started_ns)
+                    + (unpin_started_ns - unpin_wait_ns),
                 )
-                self._stats.bump("sidecar_gather_lock_hold_ns_ct", hold_ns)
+                self._stats.bump(
+                    "sidecar_gather_lock_hold_ns_ct",
+                    snapshot_hold_ns + unpin_hold_ns,
+                )
+                self._stats.bump("sidecar_gather_copy_ns_ct", copy_ns)
                 if gathered:
-                    rows = int(slots.numel())
-                    payload_bytes = rows * (
-                        self.aux_buf.shape[1] * self.aux_buf.element_size()
-                        + self.last_buf.shape[1] * self.last_buf.element_size()
-                    )
+                    payload_bytes = rows * self._payload_row_bytes
                     self._stats.bump("sidecar_gather_rows_ct", rows)
                     self._stats.bump("sidecar_gather_bytes_ct", payload_bytes)
                     if direct:
@@ -1129,30 +1809,81 @@ class HiddenHostSidecar:
                             "sidecar_direct_gather_bytes_ct", payload_bytes
                         )
 
-    @staticmethod
-    def _identity_valid(
-        *,
-        slots: torch.Tensor,
-        gens: torch.Tensor,
-        stored_tokens: torch.Tensor,
-        expected_tokens: torch.Tensor,
-        own_slot_gens: Dict[int, int],
-    ) -> bool:
-        if not bool(((gens > 0) & (gens % 2 == 0)).all()):
-            return False
-        slots_list = slots.tolist()
-        gens_list = gens.tolist()
-        prefix_mask = torch.ones(len(slots_list), dtype=torch.bool)
-        for index, (slot, gen) in enumerate(zip(slots_list, gens_list)):
-            expected_gen = own_slot_gens.get(slot)
-            if expected_gen is not None:
-                prefix_mask[index] = False
-                if gen != expected_gen:
-                    return False
-        return not bool(prefix_mask.any()) or torch.equal(
-            stored_tokens[prefix_mask],
-            expected_tokens[prefix_mask].to(torch.int32),
-        )
+    def lease_rows(self, own_slot_gens: Dict[int, int]) -> int:
+        """Protect exact generations until their request export settles."""
+        leased = 0
+        with self._lock:
+            for slot, generation in own_slot_gens.items():
+                row = self._row_for_version_locked(int(slot), int(generation))
+                if row < 0 or self._row_leases[row]:
+                    continue
+                if self._row_readers[row] == 0 and not self._row_writing[row]:
+                    self._unavailable_rows += 1
+                self._row_leases[row] = 1
+                self._leased_rows += 1
+                leased += 1
+            leased_rows = self._leased_rows
+        if leased and self._stats is not None:
+            self._stats.observe_max("sidecar_leased_rows_high_water_ct", leased_rows)
+        return leased
+
+    def release_rows(
+        self, own_slot_gens: Dict[int, int], *, discard: bool = True
+    ) -> int:
+        """Settle exact generations after export.
+
+        Immutable-prefix Mooncake can discard them immediately. The legacy
+        file sink merely removes their lease, retaining newest versions as an
+        evictable warm-prefix cache.
+        """
+        released = 0
+        unleased = 0
+        with self._lock:
+            for slot, generation in own_slot_gens.items():
+                row = self._row_for_version_locked(int(slot), int(generation))
+                if row < 0:
+                    continue
+                if self._row_leases[row]:
+                    self._row_leases[row] = 0
+                    self._leased_rows -= 1
+                    if self._row_readers[row] == 0 and not self._row_writing[row]:
+                        self._unavailable_rows -= 1
+                    unleased += 1
+                if discard:
+                    self._remove_row_locked(row)
+                released += 1
+        if self._stats is not None:
+            if discard and released:
+                self._stats.bump("sidecar_released_rows_ct", released)
+            if unleased:
+                self._stats.bump("sidecar_unleased_rows_ct", unleased)
+        return released
+
+    def state_snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            readers = self._reader_pins
+            writing = self._writing_rows
+            unavailable = self._unavailable_rows
+            pressure_ratio = unavailable / self.capacity_tokens
+            return {
+                "logical_slots": self.num_slots,
+                "capacity_tokens": self.capacity_tokens,
+                "resident_rows": self._resident_rows,
+                "leased_rows": self._leased_rows,
+                "free_rows": len(self._free_rows),
+                "reader_pins": readers,
+                "reader_rows": self._reader_rows,
+                "writing_rows": writing,
+                "unavailable_rows": unavailable,
+                "pressure_ratio": pressure_ratio,
+            }
+
+    @property
+    def pressure_ratio(self) -> float:
+        # Exact-union, lock-free read for serving admission. The integer is
+        # updated under the metadata lock/GIL; a slightly stale observation
+        # only delays one hysteresis transition and cannot affect correctness.
+        return self._unavailable_rows / self.capacity_tokens
 
     def _validate_destinations(
         self,
@@ -1186,11 +1917,27 @@ class HiddenCaptureBookkeeper:
         self._max_enqueued_seq: Dict[str, int] = {}
         self._missed_rids: set = set()
         self._touch_s: Dict[str, float] = {}
+        # Retraction may race an already-enqueued D2H slot. Keep its sequence
+        # cutoff so late finalization cannot recreate stale exact leases after
+        # ``invalidate`` has cleared the request.
+        self._invalidated_through_seq: Dict[str, int] = {}
 
-    def record_rows(self, rid: str, slots: Sequence[int], gens: Sequence[int]) -> None:
+    def record_rows(
+        self,
+        rid: str,
+        slots: Sequence[int],
+        gens: Sequence[int],
+        *,
+        ring_seq: Optional[int] = None,
+    ) -> bool:
         with self._lock:
+            if ring_seq is not None and ring_seq <= self._invalidated_through_seq.get(
+                rid, -1
+            ):
+                return False
             self._finalize_records.setdefault(rid, {}).update(zip(slots, gens))
             self._touch_s[rid] = time.monotonic()
+            return True
 
     def record_enqueued(self, rids: Sequence[str], ring_seq: int) -> None:
         with self._lock:
@@ -1212,24 +1959,35 @@ class HiddenCaptureBookkeeper:
             own_seq = self._max_enqueued_seq.get(rid)
             return (own_seq, True) if own_seq is not None else (global_seq, False)
 
-    def mark_miss(self, rids: Sequence[str]) -> None:
+    def mark_miss(self, rids: Sequence[str]) -> int:
+        """Mark requests fail-closed and return the number newly missed."""
         with self._lock:
             now = time.monotonic()
+            new_misses = 0
             for rid in rids:
+                if rid not in self._missed_rids:
+                    new_misses += 1
                 self._missed_rids.add(rid)
                 self._touch_s[rid] = now
+            return new_misses
 
     def is_missed(self, rid: str) -> bool:
         with self._lock:
             return rid in self._missed_rids
 
-    def invalidate(self, rid: str) -> None:
+    def invalidate(self, rid: str) -> Dict[int, int]:
         """Retract/abort: drop stale finalize records so a re-scheduled request
         starts clean (its slots may be re-assigned on the next prefill)."""
         with self._lock:
-            self._finalize_records.pop(rid, None)
+            rows = self._finalize_records.pop(rid, {})
+            cutoff = self._max_enqueued_seq.get(rid, -1)
+            self._invalidated_through_seq[rid] = max(
+                cutoff, self._invalidated_through_seq.get(rid, -1)
+            )
             self._max_enqueued_seq.pop(rid, None)
-            self._touch_s.pop(rid, None)
+            self._touch_s[rid] = time.monotonic()
+            self._missed_rids.discard(rid)
+            return rows
 
     def pop(self, rid: str) -> Dict[int, int]:
         """Take (and clear) all bookkeeping for a finished rid."""
@@ -1237,18 +1995,25 @@ class HiddenCaptureBookkeeper:
             self._missed_rids.discard(rid)
             self._max_enqueued_seq.pop(rid, None)
             self._touch_s.pop(rid, None)
+            self._invalidated_through_seq.pop(rid, None)
             return self._finalize_records.pop(rid, {})
 
     def sweep_orphans(self, ttl_s: float = _BOOKKEEPING_TTL_S) -> int:
+        return len(self.take_orphans(ttl_s=ttl_s))
+
+    def take_orphans(self, ttl_s: float = _BOOKKEEPING_TTL_S) -> List[Dict[int, int]]:
+        """Pop stale exact generations so their sidecar leases can settle."""
         with self._lock:
             now = time.monotonic()
             stale = [rid for rid, t in self._touch_s.items() if now - t > ttl_s]
+            rows = []
             for rid in stale:
-                self._finalize_records.pop(rid, None)
+                rows.append(self._finalize_records.pop(rid, {}))
                 self._max_enqueued_seq.pop(rid, None)
                 self._missed_rids.discard(rid)
                 self._touch_s.pop(rid, None)
-            return len(stale)
+                self._invalidated_through_seq.pop(rid, None)
+            return rows
 
     def state_snapshot(self) -> Dict[str, int]:
         """Small, lock-consistent backlog summary for characterization."""
@@ -1257,6 +2022,7 @@ class HiddenCaptureBookkeeper:
                 "finalize_record_rids": len(self._finalize_records),
                 "enqueued_rids": len(self._max_enqueued_seq),
                 "missed_rids": len(self._missed_rids),
+                "invalidated_rids": len(self._invalidated_through_seq),
                 "touched_rids": len(self._touch_s),
             }
 
@@ -1283,6 +2049,7 @@ class HiddenFinalizeWorker:
         stats: HiddenCaptureStats,
         verify_ring: Optional[HiddenStagingRing] = None,
         twin_pool: Optional[DeviceTwinPool] = None,
+        span_recorder: Optional[HiddenWallSpanRecorder] = None,
         poll_interval_s: float = 0.001,
         stats_log_interval_s: float = _STATS_LOG_INTERVAL_S,
     ) -> None:
@@ -1292,6 +2059,7 @@ class HiddenFinalizeWorker:
         self.bookkeeper = bookkeeper
         self.stats = stats
         self.twin_pool = twin_pool
+        self.span_recorder = span_recorder or HiddenWallSpanRecorder()
         self.last_finalized_seq = -1
         self._poll_interval_s = poll_interval_s
         self._stats_log_interval_s = stats_log_interval_s
@@ -1368,6 +2136,17 @@ class HiddenFinalizeWorker:
             try:
                 self._active = 1
                 self.finalize_slot(slot)
+            except SidecarCapacityError as error:
+                logger.warning(
+                    "hidden capture sidecar pressure miss; dropping slot: %s",
+                    error,
+                )
+                missed = (
+                    slot.rids
+                    if slot.kind.startswith("verify")
+                    else [rid for rid, _, _ in slot.req_ranges]
+                )
+                self.bookkeeper.mark_miss(missed)
             except Exception:
                 # Capture must never take serving down; drop the slot's rows.
                 logger.exception("hidden capture finalize failed; dropping slot")
@@ -1410,30 +2189,62 @@ class HiddenFinalizeWorker:
             if kind.startswith("verify"):
                 self._finalize_verify_slot(slot)
             else:
-                self._finalize_prefill_slot(slot)
-                self.stats.bump("prefill_rows_finalized_ct", slot.num_rows)
+                finalized_rows = self._finalize_prefill_slot(slot)
+                self.stats.bump("prefill_rows_finalized_ct", finalized_rows)
             self.stats.bump("slots_finalized_ct")
         finally:
+            ended_ns = time.monotonic_ns()
             self.stats.bump(
                 f"finalize_{stats_kind}_busy_ns_ct",
-                time.monotonic_ns() - started_ns,
+                ended_ns - started_ns,
             )
+            self.span_recorder.record_finalize(started_ns, ended_ns)
 
-    def _finalize_prefill_slot(self, slot: _StagingSlot) -> None:
+    def _finalize_prefill_slot(self, slot: _StagingSlot) -> int:
         num_rows = slot.num_rows
-        slots = slot.cache_loc[:num_rows]
+        keep = []
+        compact_ranges = []
+        for rid, start, end in slot.req_ranges:
+            if end <= start:
+                continue
+            compact_start = len(keep)
+            keep.extend(range(start, end))
+            compact_ranges.append((rid, compact_start, len(keep)))
+        if not keep:
+            return 0
+        if len(keep) == num_rows and keep[0] == 0 and keep[-1] == num_rows - 1:
+            slots = slot.cache_loc[:num_rows]
+            aux_rows = slot.aux[:num_rows]
+            last_rows = slot.last[:num_rows]
+            tokens = slot.tokens[:num_rows]
+        else:
+            keep_idx = torch.tensor(keep, dtype=torch.long)
+            slots = slot.cache_loc[keep_idx]
+            aux_rows = slot.aux[keep_idx]
+            last_rows = slot.last[keep_idx]
+            tokens = slot.tokens[keep_idx]
         gens = self.sidecar.write_rows(
             slots=slots,
-            aux_rows=slot.aux[:num_rows],
-            last_rows=slot.last[:num_rows],
-            tokens=slot.tokens[:num_rows],
+            aux_rows=aux_rows,
+            last_rows=last_rows,
+            tokens=tokens,
         )
         slots_list = slots.tolist()
         gens_list = gens.tolist()
-        for rid, start, end in slot.req_ranges:
-            self.bookkeeper.record_rows(
-                rid, slots_list[start:end], gens_list[start:end]
+        leased_rows = {}
+        for rid, start, end in compact_ranges:
+            rid_slots = slots_list[start:end]
+            rid_gens = gens_list[start:end]
+            if self.bookkeeper.record_rows(
+                rid, rid_slots, rid_gens, ring_seq=slot.ring_seq
+            ):
+                leased_rows.update(zip(rid_slots, rid_gens))
+        leased = self.sidecar.lease_rows(leased_rows)
+        if leased != len(leased_rows):
+            raise RuntimeError(
+                f"sidecar leased {leased}/{len(leased_rows)} finalized prefill rows"
             )
+        return len(keep)
 
     def _finalize_verify_slot(self, slot: _StagingSlot) -> None:
         """Committed-prefix selection on CPU: request i's rows live at
@@ -1459,13 +2270,23 @@ class HiddenFinalizeWorker:
                 slots_list = slots.tolist()
                 gens_list = gens.tolist()
                 row = 0
+                leased_rows = {}
                 for rid, commit_len in zip(slot.rids, commit_lens):
-                    self.bookkeeper.record_rows(
+                    rid_slots = slots_list[row : row + commit_len]
+                    rid_gens = gens_list[row : row + commit_len]
+                    if self.bookkeeper.record_rows(
                         rid,
-                        slots_list[row : row + commit_len],
-                        gens_list[row : row + commit_len],
-                    )
+                        rid_slots,
+                        rid_gens,
+                        ring_seq=slot.ring_seq,
+                    ):
+                        leased_rows.update(zip(rid_slots, rid_gens))
                     row += commit_len
+                leased = self.sidecar.lease_rows(leased_rows)
+                if leased != len(leased_rows):
+                    raise RuntimeError(
+                        f"sidecar leased {leased}/{len(leased_rows)} compact verify rows"
+                    )
             self.stats.bump("verify_rows_committed_ct", num_rows)
             return
 
@@ -1484,11 +2305,21 @@ class HiddenFinalizeWorker:
             slots_list = slots.tolist()
             gens_list = gens.tolist()
             row = 0
+            leased_rows = {}
             for rid, commit_len in zip(slot.rids, commit_lens):
-                self.bookkeeper.record_rows(
+                rid_slots = slots_list[row : row + commit_len]
+                rid_gens = gens_list[row : row + commit_len]
+                if self.bookkeeper.record_rows(
                     rid,
-                    slots_list[row : row + commit_len],
-                    gens_list[row : row + commit_len],
-                )
+                    rid_slots,
+                    rid_gens,
+                    ring_seq=slot.ring_seq,
+                ):
+                    leased_rows.update(zip(rid_slots, rid_gens))
                 row += commit_len
+            leased = self.sidecar.lease_rows(leased_rows)
+            if leased != len(leased_rows):
+                raise RuntimeError(
+                    f"sidecar leased {leased}/{len(leased_rows)} verify rows"
+                )
         self.stats.bump("verify_rows_committed_ct", len(keep))

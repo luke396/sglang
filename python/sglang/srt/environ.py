@@ -981,8 +981,9 @@ class Envs:
     # Directory for the per-sample training-data file sink. Required: capture
     # is disabled at startup when unset.
     SGLANG_HIDDEN_CAPTURE_DIR = EnvStr(None)
-    # Fraction of finished requests exported (decided at request finish, not
-    # at admission; all forwarded rows are staged to host regardless).
+    # Deterministic request fraction captured/exported. V7 applies the same
+    # rid hash at forward/verify and finish, so unsampled rows never enter the
+    # compact sidecar (a mixed staging segment may still D2H as one unit).
     SGLANG_HIDDEN_CAPTURE_SAMPLE_RATE = EnvFloat(1.0)
     # Pinned staging ring geometry overrides. By default both adapt at
     # startup: slot size = one forward's staged-row bound
@@ -1004,10 +1005,23 @@ class Envs:
     # Graceful scheduler shutdown budget for draining D2H/finalize/export and
     # joining capture workers before registered Mooncake buffers are released.
     SGLANG_HIDDEN_CAPTURE_SHUTDOWN_TIMEOUT_S = EnvFloat(30.0)
-    # Upper bound on the host sidecar allocation (which scales with
-    # max_total_num_tokens x row bytes); exceeding it disables capture at
-    # startup rather than silently committing tens of GB per scheduler.
+    # Sparse sidecar payload budget at sample_rate=1. The actual compact-row
+    # capacity scales with SAMPLE_RATE and is floored so one maximum-size
+    # export / staging window always fits; it is capped by the KV pool. This
+    # replaces V6's one-hidden-row-per-KV-slot preallocation. 256K keeps the
+    # standard 48-request, 4.6K+512 warm workload below the 80% admission
+    # watermark (measured leased-row HWM: 142K); 128K degraded at 106K.
+    SGLANG_HIDDEN_CAPTURE_SIDECAR_TOKEN_BUDGET = EnvInt(262144)
+    # Upper bound on compact payload plus the small KV-cardinality identity
+    # maps; exceeding it disables capture at startup.
     SGLANG_HIDDEN_CAPTURE_MAX_HOST_GB = EnvFloat(64.0)
+    # Proactive high-pressure hysteresis. Any capture queue/ring at HIGH (or
+    # an unavailable sink) opens a degraded window; capture resumes only when
+    # every source is at/below RECOVER for at least MIN_DEGRADED_S. Drops and
+    # wall-clock windows are exposed by the internal-state endpoint.
+    SGLANG_HIDDEN_CAPTURE_DEGRADE_HIGH_WATERMARK = EnvFloat(0.80)
+    SGLANG_HIDDEN_CAPTURE_DEGRADE_RECOVER_WATERMARK = EnvFloat(0.50)
+    SGLANG_HIDDEN_CAPTURE_MIN_DEGRADED_S = EnvFloat(1.0)
     # Export sink: "file" (per-sample .ckpt under SGLANG_HIDDEN_CAPTURE_DIR)
     # or "mooncake" (self-describing keys in a Mooncake store; requires
     # MOONCAKE_MASTER, uses the MOONCAKE_* connection settings above).
@@ -1019,6 +1033,10 @@ class Envs:
     # tail to discover samples; a controller should assign a unique store id
     # per server instance so streams never collide across fleets.
     SGLANG_HIDDEN_CAPTURE_STORE_ID = EnvStr("sglang_hidden_capture")
+    # Mooncake startup is fail-soft: wait at most this long for the initial
+    # background connection, then let serving start degraded while retrying.
+    SGLANG_HIDDEN_CAPTURE_MOONCAKE_PROBE_TIMEOUT_S = EnvFloat(1.0)
+    SGLANG_HIDDEN_CAPTURE_MOONCAKE_RECONNECT_INTERVAL_S = EnvFloat(5.0)
     # Mooncake sink: maximum rows in one sample. In prefix mode this sizes the
     # registered input-id arena; segment hidden arenas are bounded separately
     # by PREFIX_MAX_SEGMENT_ROWS. Registration never runs per sample. Longer

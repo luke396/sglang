@@ -18,14 +18,18 @@ import torch
 from sglang.srt.state_capturer.hidden_host import (
     DeviceTwinPool,
     HiddenCaptureBookkeeper,
+    HiddenCapturePressureController,
     HiddenCaptureStats,
     HiddenFinalizeWorker,
     HiddenHostSidecar,
     HiddenStagingRing,
     HiddenVerifyD2HLauncher,
+    HiddenWallSpanRecorder,
+    SidecarCapacityError,
 )
 from sglang.srt.state_capturer.hidden_sink import (
     HiddenExportJob,
+    HiddenExportTrace,
     HiddenExportWorker,
     HiddenFileSink,
 )
@@ -437,11 +441,324 @@ class TestSidecarSeqlock(CustomTestCase):
         self.assertEqual(torn, [])
 
 
+class TestSparseSidecarV7(CustomTestCase):
+    def test_leased_old_generation_survives_slot_reuse_until_settled(self):
+        sidecar = HiddenHostSidecar(
+            num_slots=4,
+            capacity_tokens=2,
+            aux_width=AUX_WIDTH,
+            last_width=LAST_WIDTH,
+            dtype=DTYPE,
+        )
+        old_aux, old_last = _rows(1, seed=58)
+        old_gen = sidecar.write_rows(
+            slots=torch.tensor([0]),
+            aux_rows=old_aux,
+            last_rows=old_last,
+            tokens=torch.tensor([9]),
+        )
+        own = {0: int(old_gen[0])}
+        self.assertEqual(sidecar.lease_rows(own), 1)
+
+        new_aux, new_last = _rows(1, seed=59)
+        sidecar.write_rows(
+            slots=torch.tensor([0]),
+            aux_rows=new_aux,
+            last_rows=new_last,
+            tokens=torch.tensor([10]),
+        )
+        old = sidecar.read_rows_validated(
+            slots=torch.tensor([0]),
+            expected_tokens=torch.tensor([9]),
+            own_slot_gens=own,
+        )
+        current = sidecar.read_rows_validated(
+            slots=torch.tensor([0]),
+            expected_tokens=torch.tensor([10]),
+            own_slot_gens={},
+        )
+        self.assertTrue(torch.equal(old[0], old_aux))
+        self.assertTrue(torch.equal(old[1], old_last))
+        self.assertTrue(torch.equal(current[0], new_aux))
+        self.assertEqual(sidecar.release_rows(own, discard=False), 1)
+        self.assertEqual(sidecar.state_snapshot()["leased_rows"], 0)
+
+    def test_leased_capacity_fails_immediately_then_recovers(self):
+        stats = HiddenCaptureStats()
+        sidecar = HiddenHostSidecar(
+            num_slots=2,
+            capacity_tokens=1,
+            aux_width=AUX_WIDTH,
+            last_width=LAST_WIDTH,
+            dtype=DTYPE,
+            stats=stats,
+        )
+        aux, last = _rows(1, seed=57)
+        gen = sidecar.write_rows(
+            slots=torch.tensor([0]),
+            aux_rows=aux,
+            last_rows=last,
+            tokens=torch.tensor([1]),
+        )
+        own = {0: int(gen[0])}
+        sidecar.lease_rows(own)
+        self.assertEqual(sidecar.pressure_ratio, 1.0)
+        with self.assertRaises(SidecarCapacityError):
+            sidecar.write_rows(
+                slots=torch.tensor([1]),
+                aux_rows=aux,
+                last_rows=last,
+                tokens=torch.tensor([2]),
+            )
+        self.assertEqual(stats.sidecar_lease_conflict_miss_ct, 1)
+        sidecar.release_rows(own, discard=False)
+        sidecar.write_rows(
+            slots=torch.tensor([1]),
+            aux_rows=aux,
+            last_rows=last,
+            tokens=torch.tensor([2]),
+        )
+
+    def test_multirow_eviction_reserves_distinct_physical_rows(self):
+        sidecar = HiddenHostSidecar(
+            num_slots=8,
+            capacity_tokens=2,
+            aux_width=AUX_WIDTH,
+            last_width=LAST_WIDTH,
+            dtype=DTYPE,
+        )
+        first_aux, first_last = _rows(2, seed=60)
+        sidecar.write_rows(
+            slots=torch.tensor([0, 1]),
+            aux_rows=first_aux,
+            last_rows=first_last,
+            tokens=torch.tensor([10, 11]),
+        )
+        second_aux, second_last = _rows(2, seed=61)
+        gens = sidecar.write_rows(
+            slots=torch.tensor([2, 3]),
+            aux_rows=second_aux,
+            last_rows=second_last,
+            tokens=torch.tensor([12, 13]),
+        )
+        rows = sidecar.read_rows_validated(
+            slots=torch.tensor([2, 3]),
+            expected_tokens=torch.tensor([12, 13]),
+            own_slot_gens={2: int(gens[0]), 3: int(gens[1])},
+        )
+        self.assertTrue(torch.equal(rows[0], second_aux))
+        self.assertTrue(torch.equal(rows[1], second_last))
+
+    def test_capacity_evicts_old_identity_and_exact_release_recycles(self):
+        stats = HiddenCaptureStats()
+        sidecar = HiddenHostSidecar(
+            num_slots=8,
+            capacity_tokens=2,
+            aux_width=AUX_WIDTH,
+            last_width=LAST_WIDTH,
+            dtype=DTYPE,
+            stats=stats,
+        )
+        aux, last = _rows(2, seed=70)
+        gens = sidecar.write_rows(
+            slots=torch.tensor([0, 1]),
+            aux_rows=aux,
+            last_rows=last,
+            tokens=torch.tensor([10, 11]),
+        )
+        aux2, last2 = _rows(1, seed=71)
+        sidecar.write_rows(
+            slots=torch.tensor([2]),
+            aux_rows=aux2,
+            last_rows=last2,
+            tokens=torch.tensor([12]),
+        )
+        self.assertIsNone(
+            sidecar.read_rows_validated(
+                slots=torch.tensor([0]),
+                expected_tokens=torch.tensor([10]),
+                own_slot_gens={0: int(gens[0])},
+            )
+        )
+        state = sidecar.state_snapshot()
+        self.assertEqual(state["capacity_tokens"], 2)
+        self.assertEqual(state["resident_rows"], 2)
+        self.assertEqual(stats.sidecar_evicted_rows_ct, 1)
+
+        slot2_gen = int(sidecar.slot_gen[2])
+        self.assertEqual(sidecar.release_rows({2: slot2_gen}), 1)
+        self.assertEqual(sidecar.state_snapshot()["free_rows"], 1)
+        self.assertEqual(stats.sidecar_released_rows_ct, 1)
+
+    def test_reader_copy_runs_outside_lock_and_same_slot_writer_uses_cow(self):
+        sidecar = HiddenHostSidecar(
+            num_slots=4,
+            capacity_tokens=2,
+            aux_width=AUX_WIDTH,
+            last_width=LAST_WIDTH,
+            dtype=DTYPE,
+        )
+        old_aux = torch.full((1, AUX_WIDTH), 1.0)
+        old_last = torch.full((1, LAST_WIDTH), 1.0)
+        old_gen = sidecar.write_rows(
+            slots=torch.tensor([0]),
+            aux_rows=old_aux,
+            last_rows=old_last,
+            tokens=torch.tensor([9]),
+        )
+
+        copy_entered = threading.Event()
+        release_copy = threading.Event()
+        real_index_select = torch.index_select
+
+        def blocking_index_select(*args, **kwargs):
+            copy_entered.set()
+            release_copy.wait(timeout=5.0)
+            return real_index_select(*args, **kwargs)
+
+        reader_result = []
+        with mock.patch("torch.index_select", side_effect=blocking_index_select):
+            reader = threading.Thread(
+                target=lambda: reader_result.append(
+                    sidecar.read_rows_validated(
+                        slots=torch.tensor([0]),
+                        expected_tokens=torch.tensor([9]),
+                        own_slot_gens={0: int(old_gen[0])},
+                    )
+                )
+            )
+            reader.start()
+            self.assertTrue(copy_entered.wait(timeout=2.0))
+
+            new_aux = torch.full((1, AUX_WIDTH), 2.0)
+            new_last = torch.full((1, LAST_WIDTH), 2.0)
+            writer = threading.Thread(
+                target=lambda: sidecar.write_rows(
+                    slots=torch.tensor([0]),
+                    aux_rows=new_aux,
+                    last_rows=new_last,
+                    tokens=torch.tensor([9]),
+                )
+            )
+            writer.start()
+            writer.join(timeout=1.0)
+            self.assertFalse(writer.is_alive(), "writer waited on gather copy")
+            release_copy.set()
+            reader.join(timeout=2.0)
+        self.assertTrue(torch.equal(reader_result[0][0], old_aux))
+        current = sidecar.read_rows_validated(
+            slots=torch.tensor([0]),
+            expected_tokens=torch.tensor([9]),
+            own_slot_gens={},
+        )
+        self.assertTrue(torch.equal(current[0], new_aux))
+
+    def test_leased_reader_pressure_counts_physical_row_once(self):
+        sidecar = HiddenHostSidecar(
+            num_slots=4,
+            capacity_tokens=2,
+            aux_width=AUX_WIDTH,
+            last_width=LAST_WIDTH,
+            dtype=DTYPE,
+        )
+        aux, last = _rows(1, seed=62)
+        gen = sidecar.write_rows(
+            slots=torch.tensor([0]),
+            aux_rows=aux,
+            last_rows=last,
+            tokens=torch.tensor([9]),
+        )
+        own = {0: int(gen[0])}
+        self.assertEqual(sidecar.lease_rows(own), 1)
+        self.assertEqual(sidecar.pressure_ratio, 0.5)
+
+        entered = threading.Event()
+        release = threading.Event()
+        real_index_select = torch.index_select
+
+        def block(*args, **kwargs):
+            entered.set()
+            release.wait(timeout=5.0)
+            return real_index_select(*args, **kwargs)
+
+        with mock.patch("torch.index_select", side_effect=block):
+            reader = threading.Thread(
+                target=lambda: sidecar.read_rows_validated(
+                    slots=torch.tensor([0]),
+                    expected_tokens=torch.tensor([9]),
+                    own_slot_gens=own,
+                )
+            )
+            reader.start()
+            self.assertTrue(entered.wait(timeout=2.0))
+            state = sidecar.state_snapshot()
+            self.assertEqual(state["leased_rows"], 1)
+            self.assertEqual(state["reader_rows"], 1)
+            self.assertEqual(state["unavailable_rows"], 1)
+            self.assertEqual(state["pressure_ratio"], 0.5)
+            release.set()
+            reader.join(timeout=2.0)
+            self.assertFalse(reader.is_alive())
+        self.assertEqual(sidecar.pressure_ratio, 0.5)
+        sidecar.release_rows(own, discard=False)
+        self.assertEqual(sidecar.pressure_ratio, 0.0)
+
+    def test_all_rows_reader_pinned_fails_immediately(self):
+        stats = HiddenCaptureStats()
+        sidecar = HiddenHostSidecar(
+            num_slots=2,
+            capacity_tokens=1,
+            aux_width=AUX_WIDTH,
+            last_width=LAST_WIDTH,
+            dtype=DTYPE,
+            stats=stats,
+        )
+        aux, last = _rows(1)
+        gen = sidecar.write_rows(
+            slots=torch.tensor([0]),
+            aux_rows=aux,
+            last_rows=last,
+            tokens=torch.tensor([1]),
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        real_index_select = torch.index_select
+
+        def block(*args, **kwargs):
+            entered.set()
+            release.wait(timeout=5.0)
+            return real_index_select(*args, **kwargs)
+
+        with mock.patch("torch.index_select", side_effect=block):
+            reader = threading.Thread(
+                target=lambda: sidecar.read_rows_validated(
+                    slots=torch.tensor([0]),
+                    expected_tokens=torch.tensor([1]),
+                    own_slot_gens={0: int(gen[0])},
+                )
+            )
+            reader.start()
+            self.assertTrue(entered.wait(timeout=2.0))
+            started = time.monotonic()
+            with self.assertRaises(SidecarCapacityError):
+                sidecar.write_rows(
+                    slots=torch.tensor([0]),
+                    aux_rows=aux,
+                    last_rows=last,
+                    tokens=torch.tensor([1]),
+                )
+            self.assertLess(time.monotonic() - started, 0.1)
+            release.set()
+            reader.join(timeout=2.0)
+        self.assertEqual(stats.sidecar_capacity_miss_ct, 1)
+
+
 class TestBookkeeper(CustomTestCase):
     def test_miss_propagation_and_pop(self):
         bk = HiddenCaptureBookkeeper()
         bk.record_rows("r1", [1, 2], [2, 2])
-        bk.mark_miss(["r1"])
+        self.assertEqual(bk.mark_miss(["r1"]), 1)
+        self.assertEqual(bk.mark_miss(["r1"]), 0)
         self.assertTrue(bk.is_missed("r1"))
         records = bk.pop("r1")
         self.assertEqual(records, {1: 2, 2: 2})
@@ -461,6 +778,15 @@ class TestBookkeeper(CustomTestCase):
         self.assertEqual(bk.sweep_orphans(ttl_s=-1.0), 1)
         self.assertEqual(bk.pop("r_orphan"), {})
 
+    def test_invalidate_rejects_late_old_sequence_rows(self):
+        bk = HiddenCaptureBookkeeper()
+        bk.record_enqueued(["r"], 7)
+        self.assertEqual(bk.invalidate("r"), {})
+        self.assertFalse(bk.record_rows("r", [1], [2], ring_seq=7))
+        bk.record_enqueued(["r"], 8)
+        self.assertTrue(bk.record_rows("r", [2], [2], ring_seq=8))
+        self.assertEqual(bk.pop("r"), {2: 2})
+
     def test_per_request_barrier_ignores_younger_enqueue(self):
         bk = HiddenCaptureBookkeeper()
         bk.record_enqueued(["a"], 3)
@@ -479,6 +805,70 @@ class TestBookkeeper(CustomTestCase):
 
 
 class TestObservability(CustomTestCase):
+    def test_export_critical_path_buckets_are_disjoint_and_close(self):
+        recorder = HiddenWallSpanRecorder()
+        recorder.record_finalize(150, 175)
+        trace = HiddenExportTrace(100, dequeued_ns=150)
+        trace.record("gather", 200, 400)
+        trace.record("put", 300, 500)
+        components = trace.attribute(
+            barrier_end_ns=200,
+            end_ns=600,
+            span_recorder=recorder,
+        )
+        self.assertEqual(
+            components,
+            {
+                "wall_ns": 500,
+                "queue": 50,
+                "finalize": 25,
+                "barrier": 25,
+                "gather": 100,
+                "put": 100,
+                "gather_put_overlap": 100,
+                "other": 100,
+            },
+        )
+        stats = HiddenCaptureStats()
+        stats.record_export_critical_path(components)
+        snapshot = stats.critical_path_snapshot()
+        self.assertEqual(snapshot["wall_ns"], 500)
+        self.assertAlmostEqual(sum(snapshot["components_fraction"].values()), 1.0)
+
+    def test_export_critical_path_attribution_is_fail_soft(self):
+        stats = HiddenCaptureStats()
+        stats.record_export_critical_path({"wall_ns": 10, "queue": 3})
+        snapshot = stats.critical_path_snapshot()
+        self.assertEqual(snapshot["components_ns"]["queue"], 3)
+        self.assertEqual(snapshot["components_ns"]["other"], 7)
+        self.assertEqual(stats.export_critical_attribution_mismatch_ct, 1)
+
+    def test_pressure_hysteresis_records_degraded_window(self):
+        stats = HiddenCaptureStats()
+        pressure = HiddenCapturePressureController(
+            stats=stats,
+            high_watermark=0.8,
+            recover_watermark=0.5,
+            min_degraded_s=0.0,
+        )
+        self.assertFalse(
+            pressure.refresh({"sink": 0.0, "export_queue": 0.8, "prefill_ring": 0.0})
+        )
+        pressure.record_drop(phase="finish", requests=3, rows=30, sample_misses=3)
+        self.assertTrue(
+            pressure.refresh({"sink": 0.0, "export_queue": 0.5, "prefill_ring": 0.0})
+        )
+        snapshot = pressure.snapshot()
+        self.assertFalse(snapshot["degraded"])
+        self.assertEqual(len(snapshot["recent_windows"]), 1)
+        window = snapshot["recent_windows"][0]
+        self.assertEqual(window["reasons"], ["export_queue"])
+        self.assertEqual(window["dropped_requests"], 3)
+        self.assertEqual(window["dropped_rows"], 30)
+        self.assertEqual(stats.capture_degraded_ct, 1)
+        self.assertEqual(stats.capture_recovered_ct, 1)
+        self.assertEqual(stats.capture_degraded_sample_miss_ct, 3)
+
     def test_ring_sidecar_and_finalize_counters_close(self):
         stats = HiddenCaptureStats()
         ring = _make_ring(num_slots=2, slot_tokens=4, stats=stats)
@@ -514,6 +904,33 @@ class TestObservability(CustomTestCase):
         self.assertGreater(snapshot["sidecar_write_bytes_ct"], 0)
         self.assertGreater(snapshot["sidecar_gather_bytes_ct"], 0)
         self.assertGreater(snapshot["finalize_prefill_busy_ns_ct"], 0)
+
+    def test_prefill_finalize_writes_only_sampled_request_ranges(self):
+        stats = HiddenCaptureStats()
+        ring = _make_ring(num_slots=1, slot_tokens=4, stats=stats)
+        sidecar = _make_sidecar(stats=stats)
+        bookkeeper = HiddenCaptureBookkeeper()
+        finalize = HiddenFinalizeWorker(
+            ring=ring, sidecar=sidecar, bookkeeper=bookkeeper, stats=stats
+        )
+        aux, last = _rows(4, seed=99)
+        (slot,) = ring.try_acquire(1)
+        ring.enqueue_segment(
+            slot,
+            aux_rows=aux,
+            last_rows=last,
+            cache_locs=torch.tensor([10, 11, 12, 13]),
+            tokens=torch.tensor([20, 21, 22, 23]),
+            req_ranges=[("sampled-a", 0, 1), ("sampled-b", 3, 4)],
+        )
+        finalize.finalize_slot(ring.pop_ready())
+        self.assertEqual(int(sidecar.slot_gen[10]), 2)
+        self.assertEqual(int(sidecar.slot_gen[11]), 0)
+        self.assertEqual(int(sidecar.slot_gen[12]), 0)
+        self.assertEqual(int(sidecar.slot_gen[13]), 2)
+        self.assertEqual(set(bookkeeper.pop("sampled-a")), {10})
+        self.assertEqual(set(bookkeeper.pop("sampled-b")), {13})
+        self.assertEqual(stats.prefill_rows_finalized_ct, 2)
 
     def test_allocated_resource_bytes_and_bookkeeper_state_are_exact(self):
         ring = _make_ring(num_slots=3, slot_tokens=5)
@@ -558,6 +975,7 @@ class TestObservability(CustomTestCase):
                 "finalize_record_rids": 0,
                 "enqueued_rids": 1,
                 "missed_rids": 1,
+                "invalidated_rids": 0,
                 "touched_rids": 2,
             },
         )
@@ -1625,12 +2043,13 @@ class TestEndToEndPipeline(CustomTestCase):
             self.assertEqual(stats.export_ok_ct, 0)
             self.assertEqual(os.listdir(tmpdir), [])
 
-    def test_slot_reuse_after_finish_fails_validation(self):
-        """ABA: r1 finishes, its slots are re-assigned to r2 and rewritten
-        before r1's export runs -> gen mismatch, whole-sample miss."""
+    def test_slot_reuse_after_finish_keeps_leased_generation(self):
+        """V7 COW keeps r1's exact generation while r2 reuses its KV slots."""
         with tempfile.TemporaryDirectory() as tmpdir:
             stats, bookkeeper, ring, sidecar, finalize, export = self._build(tmpdir)
-            self._stage_and_finalize(ring, finalize, "r1", [1, 2], [5, 6], seed=1)
+            aux1, last1 = self._stage_and_finalize(
+                ring, finalize, "r1", [1, 2], [5, 6], seed=1
+            )
             job = HiddenExportJob(
                 rid="r1",
                 sample_id="r1",
@@ -1642,8 +2061,12 @@ class TestEndToEndPipeline(CustomTestCase):
             self._stage_and_finalize(ring, finalize, "r2", [1, 2], [5, 6], seed=2)
 
             export.export_one(job)
-            self.assertEqual(stats.prefix_invalid_miss_ct, 1)
-            self.assertEqual(os.listdir(tmpdir), [])
+            self.assertEqual(stats.prefix_invalid_miss_ct, 0)
+            self.assertEqual(stats.export_ok_ct, 1)
+            record = torch.load(os.path.join(tmpdir, "r1.ckpt"), weights_only=True)
+            self.assertTrue(torch.equal(record["aux_hidden_state"][0], aux1))
+            self.assertTrue(torch.equal(record["hidden_state"][0], last1))
+            self.assertEqual(sidecar.state_snapshot()["leased_rows"], 2)
 
     def test_warm_prefix_rows_from_other_request(self):
         """r2 shares a prefix written by r1; token-id validation admits it."""
@@ -1652,7 +2075,9 @@ class TestEndToEndPipeline(CustomTestCase):
             aux1, last1 = self._stage_and_finalize(
                 ring, finalize, "r1", [1, 2], [5, 6], seed=1
             )
-            bookkeeper.pop("r1")  # r1 finished unsampled
+            sidecar.release_rows(
+                bookkeeper.pop("r1"), discard=False
+            )  # file-sink row becomes an evictable warm cache entry
             # r2: prefix slots 1,2 (cached; no rows of its own) + new slot 3.
             aux2, last2 = self._stage_and_finalize(
                 ring, finalize, "r2", [3], [7], seed=2
@@ -1930,9 +2355,8 @@ class TestSnapshotKvSlots(CustomTestCase):
         capturer.sample_rate = 1.0
         capturer.sink = SimpleNamespace(prefix_enabled=False)
         capturer.ring = SimpleNamespace(last_enqueued_seq=-1)
-        capturer.export_worker = SimpleNamespace(
-            submit=lambda _job: self.fail("snapshot failure must not enqueue a job")
-        )
+        jobs = []
+        capturer.export_worker = SimpleNamespace(submit=jobs.append)
         capturer._snapshot_kv_slots_batch = lambda _ranges: (_ for _ in ()).throw(
             RuntimeError("injected snapshot failure")
         )
@@ -1957,6 +2381,9 @@ class TestSnapshotKvSlots(CustomTestCase):
 
         self.assertEqual(capturer.stats.finish_snapshot_failed_miss_ct, 1)
         self.assertTrue(capturer.bookkeeper.is_missed(req.rid))
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0].rid, req.rid)
+        self.assertEqual(jobs[0].tokens.numel(), 0)
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_gpu_batched_snapshot_single_wait_and_buffer_growth(self):

@@ -21,6 +21,7 @@ Sinks share ``put(sample_id, record) -> bool`` / ``write_fingerprint(dict)``:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -37,6 +38,7 @@ from sglang.srt.state_capturer.hidden_host import (
     HiddenCaptureStats,
     HiddenFinalizeWorker,
     HiddenHostSidecar,
+    HiddenWallSpanRecorder,
 )
 from sglang.srt.state_capturer.hidden_mooncake import SampleTooLargeError
 
@@ -48,6 +50,123 @@ _BARRIER_TIMEOUT_S = 30.0
 _ORPHAN_SWEEP_INTERVAL_S = 60.0
 
 
+def _union_ns(intervals, start_ns: int, end_ns: int) -> int:
+    clipped = sorted(
+        (max(start_ns, left), min(end_ns, right))
+        for left, right in intervals
+        if right > start_ns and left < end_ns
+    )
+    total = 0
+    current_left = current_right = None
+    for left, right in clipped:
+        if right <= left:
+            continue
+        if current_left is None:
+            current_left, current_right = left, right
+        elif left <= current_right:
+            current_right = max(current_right, right)
+        else:
+            total += current_right - current_left
+            current_left, current_right = left, right
+    if current_left is not None:
+        total += current_right - current_left
+    return total
+
+
+class HiddenExportTrace:
+    """One export job's cross-thread gather/put wall intervals.
+
+    The trace retains intervals, not summed busy time. At completion a sweep
+    produces disjoint queue, finalize, barrier, gather, put, overlap, and
+    other buckets. Finalize spans are intersected only with the dequeued
+    pre-barrier phase, so all components add up exactly to the
+    finish-hook-to-export wall clock.
+    """
+
+    def __init__(self, start_ns: int, dequeued_ns: Optional[int] = None) -> None:
+        self.start_ns = int(start_ns)
+        self.dequeued_ns = int(dequeued_ns if dequeued_ns is not None else start_ns)
+        self.barrier_end_ns = int(start_ns)
+        self._lock = threading.Lock()
+        self._intervals = []
+
+    @contextlib.contextmanager
+    def span(self, kind: str):
+        started_ns = time.monotonic_ns()
+        try:
+            yield
+        finally:
+            self.record(kind, started_ns, time.monotonic_ns())
+
+    def record(self, kind: str, start_ns: int, end_ns: int) -> None:
+        if kind not in ("gather", "put") or end_ns <= start_ns:
+            return
+        with self._lock:
+            self._intervals.append((kind, int(start_ns), int(end_ns)))
+
+    def attribute(
+        self,
+        *,
+        barrier_end_ns: int,
+        end_ns: int,
+        span_recorder: HiddenWallSpanRecorder,
+    ) -> Dict[str, int]:
+        start_ns = min(self.start_ns, end_ns)
+        dequeued_ns = min(max(start_ns, self.dequeued_ns), end_ns)
+        barrier_end_ns = min(max(dequeued_ns, barrier_end_ns), end_ns)
+        queue_ns = dequeued_ns - start_ns
+        finalize_intervals = span_recorder.finalize_intervals(
+            dequeued_ns, barrier_end_ns
+        )
+        finalize_ns = _union_ns(finalize_intervals, dequeued_ns, barrier_end_ns)
+        barrier_ns = barrier_end_ns - dequeued_ns - finalize_ns
+
+        with self._lock:
+            intervals = list(self._intervals)
+        events = {}
+        for kind, left, right in intervals:
+            left = max(barrier_end_ns, left)
+            right = min(end_ns, right)
+            if right <= left:
+                continue
+            events.setdefault(left, []).append((kind, 1))
+            events.setdefault(right, []).append((kind, -1))
+
+        buckets = {"gather": 0, "put": 0, "gather_put_overlap": 0}
+        active = {"gather": 0, "put": 0}
+        cursor = barrier_end_ns
+        for point in sorted(events):
+            duration = max(0, point - cursor)
+            if active["gather"] and active["put"]:
+                buckets["gather_put_overlap"] += duration
+            elif active["gather"]:
+                buckets["gather"] += duration
+            elif active["put"]:
+                buckets["put"] += duration
+            for kind, delta in events[point]:
+                active[kind] += delta
+            cursor = point
+        duration = max(0, end_ns - cursor)
+        if active["gather"] and active["put"]:
+            buckets["gather_put_overlap"] += duration
+        elif active["gather"]:
+            buckets["gather"] += duration
+        elif active["put"]:
+            buckets["put"] += duration
+
+        post_ns = end_ns - barrier_end_ns
+        post_accounted = sum(buckets.values())
+        other_ns = max(0, post_ns - post_accounted)
+        return {
+            "wall_ns": end_ns - start_ns,
+            "queue": queue_ns,
+            "finalize": finalize_ns,
+            "barrier": barrier_ns,
+            **buckets,
+            "other": other_ns,
+        }
+
+
 class HiddenExportJob(msgspec.Struct):
     rid: str
     sample_id: str
@@ -57,6 +176,9 @@ class HiddenExportJob(msgspec.Struct):
     # Rows [0, prompt_len) are prompt; the rest are verify-committed decode
     # rows. Recorded for downstream loss-mask reconstruction.
     prompt_len: int = 0
+    # Set by submit if the caller leaves it zero. It anchors the V7 critical
+    # path at finish-hook admission, including export-queue and barrier wait.
+    enqueued_ns: int = 0
 
 
 class HiddenFileSink:
@@ -112,6 +234,7 @@ class HiddenExportWorker:
         self.sidecar = sidecar
         self.bookkeeper = bookkeeper
         self.finalize_worker = finalize_worker
+        self.span_recorder = finalize_worker.span_recorder
         self.stats = stats
         self.sink = sink
         self._queue: queue.Queue[HiddenExportJob] = queue.Queue(maxsize=queue_size)
@@ -149,17 +272,34 @@ class HiddenExportWorker:
     def pending_count(self) -> int:
         return self._queue.qsize()
 
+    @property
+    def capacity(self) -> int:
+        return self._queue.maxsize
+
+    def _settle_sidecar_rows(self, own_slot_gens: Dict[int, int]) -> None:
+        # Prefix rows are immutable in Mooncake after export and can leave the
+        # arena. The file sink retains the newest version as an evictable warm
+        # cache, but its in-flight export lease must still be removed.
+        self.sidecar.release_rows(
+            own_slot_gens,
+            discard=bool(getattr(self.sink, "prefix_enabled", False)),
+        )
+
     def submit(self, job: HiddenExportJob) -> bool:
         with self._admission_lock:
             if not self._accepting:
                 self.stats.bump("shutdown_admission_miss_ct")
-                self.bookkeeper.pop(job.rid)
+                own_slot_gens = self.bookkeeper.pop(job.rid)
+                self._settle_sidecar_rows(own_slot_gens)
                 return False
             try:
+                if job.enqueued_ns <= 0:
+                    job.enqueued_ns = time.monotonic_ns()
                 self._queue.put_nowait(job)
             except queue.Full:
                 self.stats.bump("export_queue_full_miss_ct")
-                self.bookkeeper.pop(job.rid)
+                own_slot_gens = self.bookkeeper.pop(job.rid)
+                self._settle_sidecar_rows(own_slot_gens)
                 return False
             self.stats.observe_max("export_queue_high_water_ct", self._queue.qsize())
             return True
@@ -194,7 +334,10 @@ class HiddenExportWorker:
         now = time.monotonic()
         if now - self._last_sweep_s > _ORPHAN_SWEEP_INTERVAL_S:
             self._last_sweep_s = now
-            swept = self.bookkeeper.sweep_orphans()
+            orphan_rows = self.bookkeeper.take_orphans()
+            swept = len(orphan_rows)
+            for own_slot_gens in orphan_rows:
+                self._settle_sidecar_rows(own_slot_gens)
             if swept:
                 logger.info("hidden capture: swept %d orphaned records", swept)
 
@@ -207,18 +350,50 @@ class HiddenExportWorker:
         return True
 
     def export_one(self, job: HiddenExportJob) -> None:
+        dequeued_ns = time.monotonic_ns()
+        trace = HiddenExportTrace(
+            job.enqueued_ns or dequeued_ns, dequeued_ns=dequeued_ns
+        )
+        try:
+            self._export_one(job, trace)
+        finally:
+            ended_ns = time.monotonic_ns()
+            components = trace.attribute(
+                barrier_end_ns=trace.barrier_end_ns,
+                end_ns=ended_ns,
+                span_recorder=self.span_recorder,
+            )
+            self.stats.record_export_critical_path(components)
+
+    def _export_one(self, job: HiddenExportJob, trace: HiddenExportTrace) -> None:
         barrier_started_ns = time.monotonic_ns()
         barrier_ready = self._wait_barrier(job.ring_seq_barrier)
+        trace.barrier_end_ns = time.monotonic_ns()
         self.stats.bump(
-            "export_barrier_wait_ns_ct", time.monotonic_ns() - barrier_started_ns
+            "export_barrier_wait_ns_ct", trace.barrier_end_ns - barrier_started_ns
         )
         if not barrier_ready:
             self.stats.bump("export_timeout_miss_ct")
-            self.bookkeeper.pop(job.rid)
+            own_slot_gens = self.bookkeeper.pop(job.rid)
+            self._settle_sidecar_rows(own_slot_gens)
             return
 
         missed = self.bookkeeper.is_missed(job.rid)
         own_slot_gens = self.bookkeeper.pop(job.rid)
+        try:
+            self._export_settled(job, trace, missed, own_slot_gens)
+        finally:
+            # Failures and duplicates settle leases too: the sample has
+            # already become an attributable miss and must not pin capacity.
+            self._settle_sidecar_rows(own_slot_gens)
+
+    def _export_settled(
+        self,
+        job: HiddenExportJob,
+        trace: HiddenExportTrace,
+        missed: bool,
+        own_slot_gens: Dict[int, int],
+    ) -> None:
         if missed:
             # Staging already dropped rows for this request; whole-sample miss.
             return
@@ -235,6 +410,7 @@ class HiddenExportWorker:
                         prompt_len=job.prompt_len,
                         own_slot_gens=own_slot_gens,
                         sidecar=self.sidecar,
+                        trace=trace,
                     )
                 finally:
                     self.stats.bump(
@@ -251,11 +427,12 @@ class HiddenExportWorker:
 
         gather_started_ns = time.monotonic_ns()
         try:
-            rows = self.sidecar.read_rows_validated(
-                slots=job.slots,
-                expected_tokens=job.tokens,
-                own_slot_gens=own_slot_gens,
-            )
+            with trace.span("gather"):
+                rows = self.sidecar.read_rows_validated(
+                    slots=job.slots,
+                    expected_tokens=job.tokens,
+                    own_slot_gens=own_slot_gens,
+                )
         finally:
             self.stats.bump(
                 "export_gather_busy_ns_ct", time.monotonic_ns() - gather_started_ns
@@ -281,7 +458,8 @@ class HiddenExportWorker:
         try:
             sink_started_ns = time.monotonic_ns()
             try:
-                exported = self.sink.put(job.sample_id, record)
+                with trace.span("put"):
+                    exported = self.sink.put(job.sample_id, record)
             finally:
                 self.stats.bump(
                     "sink_put_busy_ns_ct", time.monotonic_ns() - sink_started_ns
