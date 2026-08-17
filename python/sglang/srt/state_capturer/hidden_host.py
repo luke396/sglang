@@ -838,53 +838,6 @@ class HiddenStagingRing:
         with self._lock:
             return self._inflight[0].ring_seq if self._inflight else None
 
-    def enqueue_verify_segment(
-        self,
-        slot: _StagingSlot,
-        *,
-        twin: _DeviceTwin,
-        rids: List[str],
-        stride: int,
-        num_reqs: int,
-    ) -> int:
-        """D2H one verify step's strided window from its device twin into
-        pinned memory. Caller's current stream must wait on ``twin.fence_event``
-        first (the twin was packed on the forward stream). Committed-row
-        selection happens at finalize on CPU via the commit lens.
-        """
-        num_rows = num_reqs * stride
-        slot.payload_start_event.record()
-        slot.aux[:num_rows].copy_(twin.aux[:num_rows], non_blocking=True)
-        slot.last[:num_rows].copy_(twin.last[:num_rows], non_blocking=True)
-        slot.cache_loc[:num_rows].copy_(twin.cache_loc[:num_rows], non_blocking=True)
-        slot.tokens[:num_rows].copy_(twin.tokens[:num_rows], non_blocking=True)
-        if slot.commit_lens is None or slot.commit_lens.shape[0] < num_reqs:
-            slot.commit_lens = torch.empty(
-                (max(num_reqs, 256),),
-                dtype=torch.int32,
-                pin_memory=slot.aux.is_pinned(),
-            )
-        slot.commit_lens[:num_reqs].copy_(
-            twin.commit_lens[:num_reqs], non_blocking=True
-        )
-        slot.event.record()
-
-        slot.kind = "verify"
-        slot.num_rows = num_rows
-        slot.req_ranges = []
-        slot.rids = rids
-        slot.stride = stride
-        slot.num_reqs = num_reqs
-        slot.twin = twin
-        slot.payload_enqueued = True
-        slot.timing_accounted = False
-        with self._lock:
-            slot.ring_seq = self._seq.next_seq()
-            self._inflight.append(slot)
-            inflight = len(self._inflight)
-        self._observe_high_water(inflight)
-        return slot.ring_seq
-
     def reserve_verify_compact(
         self,
         slot: _StagingSlot,
@@ -1104,7 +1057,6 @@ class HiddenVerifyD2HLauncher:
         self._cv = threading.Condition()
         self._pending: deque[_StagingSlot] = deque()
         self._stop_requested = False
-        self._drain_on_stop = True
         self._thread: Optional[threading.Thread] = None
         self._active = 0
 
@@ -1121,9 +1073,9 @@ class HiddenVerifyD2HLauncher:
             self._cv.notify()
         self.stats.observe_max("verify_header_queue_high_water_ct", depth)
 
-    def stop(self, *, drain: bool = True) -> None:
+    def stop(self) -> None:
+        """Request shutdown; the worker drains pending slots before exiting."""
         with self._cv:
-            self._drain_on_stop = drain
             self._stop_requested = True
             self._cv.notify_all()
 
@@ -1143,14 +1095,7 @@ class HiddenVerifyD2HLauncher:
             with self._cv:
                 while not self._pending and not self._stop_requested:
                     self._cv.wait(timeout=0.1)
-                if self._stop_requested and (
-                    not self._drain_on_stop or not self._pending
-                ):
-                    if not self._drain_on_stop:
-                        abandoned = list(self._pending)
-                        self._pending.clear()
-                    else:
-                        abandoned = []
+                if self._stop_requested and not self._pending:
                     break
                 slot = self._pending[0]
 
@@ -1159,10 +1104,6 @@ class HiddenVerifyD2HLauncher:
                 continue
 
             with self._cv:
-                # Only this worker removes entries; retain the defensive
-                # identity check so shutdown changes cannot reorder tasks.
-                if not self._pending or self._pending[0] is not slot:
-                    continue
                 self._pending.popleft()
             try:
                 self._active = 1
@@ -1176,11 +1117,6 @@ class HiddenVerifyD2HLauncher:
                 self._complete_failed_slot(slot)
             finally:
                 self._active = 0
-
-        for slot in abandoned:
-            self.stats.bump("verify_launch_failed_miss_ct")
-            self.bookkeeper.mark_miss(slot.rids)
-            self._complete_failed_slot(slot)
 
     def _launch_payload(self, slot: _StagingSlot) -> None:
         if slot.commit_lens is None or slot.total_rows is None or slot.twin is None:
@@ -2047,7 +1983,6 @@ class HiddenFinalizeWorker:
         self._last_stats_log_s = time.monotonic()
         self._last_stats_snapshot: Optional[Dict[str, int]] = None
         self._stop_requested = threading.Event()
-        self._drain_on_stop = True
         self._thread: Optional[threading.Thread] = None
         self._active = 0
 
@@ -2057,8 +1992,8 @@ class HiddenFinalizeWorker:
         )
         self._thread.start()
 
-    def stop(self, *, drain: bool = True) -> None:
-        self._drain_on_stop = drain
+    def stop(self) -> None:
+        """Request shutdown; the worker drains both rings before exiting."""
         self._stop_requested.set()
 
     def join(self, timeout_s: Optional[float] = None) -> bool:
@@ -2099,9 +2034,7 @@ class HiddenFinalizeWorker:
 
     def _run(self) -> None:
         while True:
-            if self._stop_requested.is_set() and (
-                not self._drain_on_stop or self.pending_count == 0
-            ):
+            if self._stop_requested.is_set() and self.pending_count == 0:
                 break
             self._maybe_log_stats()
             # Recycle twins as soon as their D2H completes, independent of
@@ -2228,60 +2161,24 @@ class HiddenFinalizeWorker:
         return len(keep)
 
     def _finalize_verify_slot(self, slot: _StagingSlot) -> None:
-        """Committed-prefix selection on CPU: request i's rows live at
-        [i*stride, i*stride + commit_lens[i]); the rest of its stride window
-        is rejected drafts and must not enter the sidecar."""
-        stride = slot.stride
+        """Commit compact verify rows: the payload launcher already packed
+        exactly the committed prefix of every request (request i's rows are
+        contiguous at [sum(commit_lens[:i]), sum(commit_lens[:i+1]))), so the
+        whole payload enters the sidecar."""
         commit_lens = slot.commit_lens[: slot.num_reqs].tolist()
-        if slot.kind == "verify_compact":
-            num_rows = slot.num_rows
-            if sum(commit_lens) != num_rows:
-                raise RuntimeError(
-                    "compact verify payload/header mismatch: "
-                    f"rows={num_rows}, commit_lens={commit_lens}"
-                )
-            if num_rows:
-                slots = slot.cache_loc[:num_rows]
-                gens = self.sidecar.write_rows(
-                    slots=slots,
-                    aux_rows=slot.aux[:num_rows],
-                    last_rows=slot.last[:num_rows],
-                    tokens=slot.tokens[:num_rows],
-                )
-                slots_list = slots.tolist()
-                gens_list = gens.tolist()
-                row = 0
-                leased_rows = {}
-                for rid, commit_len in zip(slot.rids, commit_lens):
-                    rid_slots = slots_list[row : row + commit_len]
-                    rid_gens = gens_list[row : row + commit_len]
-                    if self.bookkeeper.record_rows(
-                        rid,
-                        rid_slots,
-                        rid_gens,
-                        ring_seq=slot.ring_seq,
-                    ):
-                        leased_rows.update(zip(rid_slots, rid_gens))
-                    row += commit_len
-                leased = self.sidecar.lease_rows(leased_rows)
-                if leased != len(leased_rows):
-                    raise RuntimeError(
-                        f"sidecar leased {leased}/{len(leased_rows)} compact verify rows"
-                    )
-            self.stats.bump("verify_rows_committed_ct", num_rows)
-            return
-
-        keep = []
-        for i, commit_len in enumerate(commit_lens):
-            keep.extend(range(i * stride, i * stride + commit_len))
-        if keep:
-            keep_idx = torch.tensor(keep, dtype=torch.long)
-            slots = slot.cache_loc[keep_idx]
+        num_rows = slot.num_rows
+        if sum(commit_lens) != num_rows:
+            raise RuntimeError(
+                "compact verify payload/header mismatch: "
+                f"rows={num_rows}, commit_lens={commit_lens}"
+            )
+        if num_rows:
+            slots = slot.cache_loc[:num_rows]
             gens = self.sidecar.write_rows(
                 slots=slots,
-                aux_rows=slot.aux[keep_idx],
-                last_rows=slot.last[keep_idx],
-                tokens=slot.tokens[keep_idx],
+                aux_rows=slot.aux[:num_rows],
+                last_rows=slot.last[:num_rows],
+                tokens=slot.tokens[:num_rows],
             )
             slots_list = slots.tolist()
             gens_list = gens.tolist()
@@ -2301,6 +2198,6 @@ class HiddenFinalizeWorker:
             leased = self.sidecar.lease_rows(leased_rows)
             if leased != len(leased_rows):
                 raise RuntimeError(
-                    f"sidecar leased {leased}/{len(leased_rows)} verify rows"
+                    f"sidecar leased {leased}/{len(leased_rows)} compact verify rows"
                 )
-        self.stats.bump("verify_rows_committed_ct", len(keep))
+        self.stats.bump("verify_rows_committed_ct", num_rows)

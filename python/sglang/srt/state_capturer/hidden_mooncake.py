@@ -84,7 +84,6 @@ logger = logging.getLogger(__name__)
 
 # Constant generation segment: bypass capture writes each sample id once
 # (first-write-wins), so the SpecForge re-put/supersede machinery is unused.
-_GEN_SEGMENT = "g0"
 
 # Restart tail search: after the binary-search candidate, scan this many
 # consecutive numbers for surviving entries before declaring the tail found.
@@ -92,12 +91,6 @@ _GEN_SEGMENT = "g0"
 # eviction; a cluster wider than this window is handled by the pre-put
 # existence check instead.
 _TAIL_SCAN_WINDOW = 64
-
-_RECORD_TO_KEY_NAME = {
-    "aux_hidden_state": "aux",
-    "hidden_state": "last_hidden",
-    "input_ids": "input_ids",
-}
 
 
 def _trace_span(trace: Any, kind: str):
@@ -136,7 +129,6 @@ class MooncakeHiddenSink:
         self,
         *,
         store_id: str,
-        row_bytes: int,
         max_export_tokens: int,
         dp_rank: int = 0,
         stats: Any = None,
@@ -145,15 +137,12 @@ class MooncakeHiddenSink:
         replicate_config: Any = None,
         manifest_config: Any = None,
         replicate_config_cls: Any = None,
-        prefix_enabled: bool = True,
         max_segment_rows: int = 256,
         prefix_lanes: int = 2,
         aux_width: Optional[int] = None,
         last_width: Optional[int] = None,
         dtype: Optional[torch.dtype] = None,
         writer_epoch: Optional[str] = None,
-        direct_gather: bool = True,
-        batch_put: bool = True,
     ) -> None:
         """``store``/``replicate_config``/``manifest_config`` are unit-test
         seams; production connects via ``_connect`` using the MOONCAKE_* env
@@ -176,14 +165,13 @@ class MooncakeHiddenSink:
             manifest_config if manifest_config is not None else replicate_config
         )
         self._stats = stats
-        self.prefix_enabled = bool(prefix_enabled)
+        # Prefix-segment publishing is the only Mooncake protocol.
+        self.prefix_enabled = True
         self.max_segment_rows = int(max_segment_rows)
         self.prefix_lanes = int(prefix_lanes)
         self.aux_width = aux_width
         self.last_width = last_width
         self.dtype = dtype
-        self.direct_gather = bool(direct_gather)
-        self.batch_put = bool(batch_put)
         self.writer_epoch = writer_epoch or uuid.uuid4().hex
         self._prefix_index = HiddenPrefixIndex()
         self._context_id: Optional[str] = None
@@ -196,13 +184,12 @@ class MooncakeHiddenSink:
         self._registered_ptrs: List[int] = []
         self.registered_bytes = 0
         self._closed = False
-        if self.prefix_enabled:
-            self._validate_prefix_configuration()
+        self._validate_prefix_configuration()
         self._manifest_prefix = f"{store_id}/_seq/{dp_rank}"
         self._next_manifest_seq = self._find_manifest_tail()
 
         try:
-            registered_bytes = self._initialize_registered_arenas(row_bytes)
+            registered_bytes = self._initialize_registered_arenas()
         except BaseException:
             self._unregister_registered_arenas()
             self._close_owned_store()
@@ -211,81 +198,14 @@ class MooncakeHiddenSink:
         self._stats_observe_max("mooncake_registered_bytes_ct", registered_bytes)
         logger.info(
             "MooncakeHiddenSink ready: store_id=%s, registered=%d MB, "
-            "prefix=%s, max_segment_rows=%d, lanes=%d",
+            "max_segment_rows=%d, lanes=%d",
             store_id,
             registered_bytes // (1024 * 1024),
-            self.prefix_enabled,
             self.max_segment_rows,
-            self.prefix_lanes if self.prefix_enabled else 0,
+            self.prefix_lanes,
         )
 
     # ------------------------------------------------------------------ sink
-
-    def put(self, sample_id: str, record: Dict[str, Any]) -> bool:
-        """Export one sample; False on duplicate id (first write wins)."""
-        meta_key = self._key(sample_id, "meta")
-        if self._is_exist(meta_key):
-            return False
-
-        tensors = {
-            _RECORD_TO_KEY_NAME[name]: record[name].contiguous()
-            for name in _RECORD_TO_KEY_NAME
-        }
-        total_bytes = sum(t.numel() * t.element_size() for t in tensors.values())
-        if total_bytes > self._staging.numel():
-            logger.warning(
-                "hidden capture: sample %s (%d bytes) exceeds the registered "
-                "staging buffer (%d bytes); capture miss. Raise "
-                "SGLANG_HIDDEN_CAPTURE_MAX_EXPORT_TOKENS to fit longer samples",
-                sample_id,
-                total_bytes,
-                self._staging.numel(),
-            )
-            raise SampleTooLargeError(sample_id)
-
-        # Serialize into the registered staging buffer, then publish each
-        # tensor's byte range. Safe to reuse per sample: put_from returns
-        # after the transfer engine has consumed the source.
-        offset = 0
-        spans = {}
-        for name, tensor in tensors.items():
-            nbytes = tensor.numel() * tensor.element_size()
-            flat = tensor.view(-1).view(torch.uint8)
-            self._staging[offset : offset + nbytes] = flat
-            spans[name] = (offset, nbytes)
-            offset += nbytes
-        self._put_batch_bytes(
-            [
-                (
-                    self._key(sample_id, name),
-                    self._staging.data_ptr() + start,
-                    nbytes,
-                )
-                for name, (start, nbytes) in spans.items()
-            ]
-        )
-
-        meta = {
-            "rid": record["rid"],
-            "num_tokens": int(record["input_ids"].numel()),
-            # Older direct sink callers may omit it; zero preserves their
-            # decode-only/unknown boundary while new capture records always
-            # carry the exact prompt length.
-            "prompt_len": int(record.get("prompt_len", 0)),
-            "tensors": {
-                name: {
-                    "shape": list(tensors[name].shape),
-                    "dtype": str(tensors[name].dtype),
-                }
-                for name in tensors
-            },
-            "loss_mask": "all_ones_placeholder",
-        }
-        # Meta goes last: its existence marks the sample complete, so a
-        # consumer scanning for meta keys never sees partial samples.
-        self._put_json(meta_key, meta)
-        self._append_manifest(sample_id)
-        return True
 
     def put_prefix_sample(
         self,
@@ -305,8 +225,6 @@ class MooncakeHiddenSink:
         sample id, and ``True`` means sample meta was committed and a manifest
         append was attempted. This method runs only on the export worker.
         """
-        if not self.prefix_enabled:
-            raise RuntimeError("prefix sample export requested while disabled")
         if self._context_id is None:
             raise RuntimeError("prefix sink fingerprint was not initialized")
 
@@ -496,10 +414,9 @@ class MooncakeHiddenSink:
         return True
 
     def write_fingerprint(self, fingerprint: Dict[str, Any]) -> None:
-        if self.prefix_enabled:
-            self._context_id = context_id_for(
-                dict(fingerprint), "plain-text-extra-key-none"
-            )
+        self._context_id = context_id_for(
+            dict(fingerprint), "plain-text-extra-key-none"
+        )
         key = f"{self.store_id}/_fingerprint"
         if not self._is_exist(key):
             self._put_json(key, fingerprint)
@@ -557,8 +474,6 @@ class MooncakeHiddenSink:
             "prefix_index_rows": self._prefix_index.row_count,
             "writer_epoch": self.writer_epoch,
             "store_id": self.store_id,
-            "direct_gather": self.direct_gather,
-            "batch_put": self.batch_put,
         }
 
     # ------------------------------------------------------------- internals
@@ -588,7 +503,7 @@ class MooncakeHiddenSink:
                 "(mooncake-transfer-engine 0.3.12.post1 or compatible)"
             )
         required_methods = ["batch_is_exist", "batch_get_into"]
-        required_methods.append("batch_put_from" if self.batch_put else "put_from")
+        required_methods.append("batch_put_from")
         missing_methods = [
             name
             for name in required_methods
@@ -600,39 +515,37 @@ class MooncakeHiddenSink:
             )
         self._replicate_config_cls = config_cls
 
-    def _initialize_registered_arenas(self, row_bytes: int) -> int:
+    def _initialize_registered_arenas(self) -> int:
         """Allocate/register every arena before starting the writer thread."""
-        staging_bytes = self.max_export_tokens * (
-            8 if self.prefix_enabled else row_bytes
-        )
+        # Prefix mode stages only int64 input-ids per sample.
+        staging_bytes = self.max_export_tokens * 8
         self._staging = torch.empty(staging_bytes, dtype=torch.uint8)
         self._register_arena(self._staging, "sample staging")
-        if self.prefix_enabled:
-            hidden_row_bytes = (self.aux_width + self.last_width) * self.dtype.itemsize
-            self._boundary_staging = torch.empty(
-                self.max_segment_rows * hidden_row_bytes,
-                dtype=torch.uint8,
+        hidden_row_bytes = (self.aux_width + self.last_width) * self.dtype.itemsize
+        self._boundary_staging = torch.empty(
+            self.max_segment_rows * hidden_row_bytes,
+            dtype=torch.uint8,
+        )
+        self._register_arena(self._boundary_staging, "boundary staging")
+        self._free_lanes = queue.Queue(maxsize=self.prefix_lanes)
+        self._ready_tasks = queue.Queue(maxsize=self.prefix_lanes)
+        for index in range(self.prefix_lanes):
+            lane = _PrefixLane(
+                index=index,
+                arena=torch.empty(
+                    self.max_segment_rows * hidden_row_bytes,
+                    dtype=torch.uint8,
+                ),
             )
-            self._register_arena(self._boundary_staging, "boundary staging")
-            self._free_lanes = queue.Queue(maxsize=self.prefix_lanes)
-            self._ready_tasks = queue.Queue(maxsize=self.prefix_lanes)
-            for index in range(self.prefix_lanes):
-                lane = _PrefixLane(
-                    index=index,
-                    arena=torch.empty(
-                        self.max_segment_rows * hidden_row_bytes,
-                        dtype=torch.uint8,
-                    ),
-                )
-                self._register_arena(lane.arena, f"prefix lane {index}")
-                self._lanes.append(lane)
-                self._free_lanes.put_nowait(lane)
-            self._writer_thread = threading.Thread(
-                target=self._run_prefix_writer,
-                name="hidden-capture-mooncake-writer",
-                daemon=True,
-            )
-            self._writer_thread.start()
+            self._register_arena(lane.arena, f"prefix lane {index}")
+            self._lanes.append(lane)
+            self._free_lanes.put_nowait(lane)
+        self._writer_thread = threading.Thread(
+            target=self._run_prefix_writer,
+            name="hidden-capture-mooncake-writer",
+            daemon=True,
+        )
+        self._writer_thread.start()
         registered_bytes = self._staging.numel() + sum(
             lane.arena.numel() for lane in self._lanes
         )
@@ -832,19 +745,11 @@ class MooncakeHiddenSink:
                     ],
                     "own_slot_gens": own_slot_gens,
                 }
-                if self.direct_gather:
-                    valid = sidecar.read_rows_validated_into(
-                        **read_args,
-                        aux_dst=aux_view[boundary_rows:],
-                        last_dst=last_view[boundary_rows:],
-                    )
-                else:
-                    rows = sidecar.read_rows_validated(**read_args)
-                    valid = rows is not None
-                    if rows is not None:
-                        aux_rows, last_rows = rows
-                        aux_view[boundary_rows:].copy_(aux_rows)
-                        last_view[boundary_rows:].copy_(last_rows)
+                valid = sidecar.read_rows_validated_into(
+                    **read_args,
+                    aux_dst=aux_view[boundary_rows:],
+                    last_dst=last_view[boundary_rows:],
+                )
                 if not valid:
                     self._bump("prefix_invalid_miss_ct")
                     self._transition_lane(lane, "FREE")
@@ -1040,9 +945,6 @@ class MooncakeHiddenSink:
             ptrs=ptrs,
             sizes=sizes,
             batch_config=self._group_config(task.group_id, len(keys)),
-            single_configs=[
-                self._group_config(task.group_id, 1) for _ in task.payload_objects
-            ],
         )
         if statuses is None or len(statuses) != len(keys):
             self._bump("mooncake_batch_partial_failure_miss_ct")
@@ -1105,9 +1007,6 @@ class MooncakeHiddenSink:
         observer = getattr(self._stats, "observe_max", None)
         if callable(observer):
             observer(name, value)
-
-    def _key(self, sample_id: str, name: str) -> str:
-        return f"{self.store_id}/{sample_id}/{_GEN_SEGMENT}/{name}"
 
     def _manifest_key(self, seq: int) -> str:
         return f"{self._manifest_prefix}/{seq}"
@@ -1243,22 +1142,11 @@ class MooncakeHiddenSink:
         ptrs: Sequence[int],
         sizes: Sequence[int],
         batch_config: Any,
-        single_configs: Optional[Sequence[Any]] = None,
     ) -> Sequence[Any]:
-        """Run the default batch call or the characterization fallback."""
-        if self.batch_put:
-            self._record_batch_put_attempt(sizes)
-            return self._store.batch_put_from(
-                list(keys), list(ptrs), list(sizes), batch_config
-            )
-
-        configs = single_configs or [batch_config] * len(keys)
-        statuses = []
-        for key, ptr, size, config in zip(keys, ptrs, sizes, configs):
-            self._bump("mooncake_put_from_calls_ct")
-            self._bump("mooncake_put_from_bytes_attempted_ct", int(size))
-            statuses.append(self._store.put_from(key, ptr, size, config))
-        return statuses
+        self._record_batch_put_attempt(sizes)
+        return self._store.batch_put_from(
+            list(keys), list(ptrs), list(sizes), batch_config
+        )
 
     def _bump(self, name: str, delta: int = 1) -> None:
         if self._stats is not None:
@@ -1338,7 +1226,7 @@ class AsyncMooncakeHiddenSink:
         self._sink: Optional[MooncakeHiddenSink] = None
         self._fingerprint: Optional[Dict[str, Any]] = None
         self._closed = False
-        self.prefix_enabled = bool(sink_kwargs.get("prefix_enabled", True))
+        self.prefix_enabled = True
 
     @property
     def ready(self) -> bool:

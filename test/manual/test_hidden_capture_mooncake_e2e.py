@@ -101,11 +101,9 @@ def _protocol_sink(store_id, master_address, stats, writer_epoch, store=None):
         }
     return MooncakeHiddenSink(
         store_id=store_id,
-        row_bytes=(8 + 4) * torch.bfloat16.itemsize + 8,
         max_export_tokens=64,
         master_address=master_address,
         stats=stats,
-        prefix_enabled=True,
         max_segment_rows=4,
         prefix_lanes=2,
         aux_width=8,

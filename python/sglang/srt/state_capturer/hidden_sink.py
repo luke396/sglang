@@ -244,7 +244,6 @@ class HiddenExportWorker:
         self._admission_lock = threading.Lock()
         self._accepting = True
         self._stop_requested = threading.Event()
-        self._drain_on_stop = True
         self._thread: Optional[threading.Thread] = None
         self._active = 0
         self._last_sweep_s = time.monotonic()
@@ -259,9 +258,9 @@ class HiddenExportWorker:
         with self._admission_lock:
             self._accepting = False
 
-    def stop(self, *, drain: bool = True) -> None:
+    def stop(self) -> None:
+        """Stop admission; the worker drains the queue before exiting."""
         self.stop_admission()
-        self._drain_on_stop = drain
         self._stop_requested.set()
 
     def join(self, timeout_s: Optional[float] = None) -> bool:
@@ -308,9 +307,7 @@ class HiddenExportWorker:
 
     def _run(self) -> None:
         while True:
-            if self._stop_requested.is_set() and (
-                not self._drain_on_stop or self._queue.empty()
-            ):
+            if self._stop_requested.is_set() and (self._queue.empty()):
                 break
             try:
                 job = self._queue.get(timeout=0.1)
@@ -426,6 +423,8 @@ class HiddenExportWorker:
             self._record_export_result(job, exported)
             return
 
+        # File sink: gather the sample's rows out of the sidecar and write
+        # one SpecForge-compatible record.
         gather_started_ns = time.monotonic_ns()
         try:
             with trace.span("gather"):
@@ -458,18 +457,14 @@ class HiddenExportWorker:
             "rid": job.rid,
             "prompt_len": job.prompt_len,
         }
+        sink_started_ns = time.monotonic_ns()
         try:
-            sink_started_ns = time.monotonic_ns()
-            try:
-                with trace.span("put"):
-                    exported = self.sink.put(job.sample_id, record)
-            finally:
-                self.stats.bump(
-                    "sink_put_busy_ns_ct", time.monotonic_ns() - sink_started_ns
-                )
-        except SampleTooLargeError:
-            self.stats.bump("sample_too_large_miss_ct")
-            return
+            with trace.span("put"):
+                exported = self.sink.put(job.sample_id, record)
+        finally:
+            self.stats.bump(
+                "sink_put_busy_ns_ct", time.monotonic_ns() - sink_started_ns
+            )
         self._record_export_result(job, exported)
 
     def _record_export_result(self, job: HiddenExportJob, exported: bool) -> None:

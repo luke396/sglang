@@ -127,20 +127,25 @@ class FakeReplicateConfig:
         self.with_hard_pin = False
 
 
-def _make_sink(max_export_tokens=16, store=None, stats=None, dp_rank=0, batch_put=True):
+def _make_sink(max_export_tokens=16, store=None, stats=None, dp_rank=0):
+    """Minimal prefix sink + sidecar for manifest/lifecycle tests."""
     store = store if store is not None else FakeStore()
+    stats_obj = stats if stats is not None else HiddenCaptureStats()
     sink = MooncakeHiddenSink(
         store_id="test_store",
-        row_bytes=ROW_BYTES,
         max_export_tokens=max_export_tokens,
         dp_rank=dp_rank,
         stats=stats,
         store=store,
-        replicate_config=object(),
-        manifest_config=object(),
-        prefix_enabled=False,
-        batch_put=batch_put,
+        replicate_config=FakeReplicateConfig(),
+        manifest_config=FakeReplicateConfig(),
+        replicate_config_cls=FakeReplicateConfig,
+        max_segment_rows=4,
+        aux_width=AUX_WIDTH,
+        last_width=LAST_WIDTH,
+        dtype=DTYPE,
     )
+    sink.write_fingerprint({"model_path": "test-model"})
     return sink, store
 
 
@@ -152,29 +157,23 @@ def _make_prefix_sink(
     store=None,
     stats=None,
     writer_epoch="epoch-1",
-    direct_gather=True,
-    batch_put=True,
 ):
     store = store if store is not None else FakeStore()
     stats = stats if stats is not None else HiddenCaptureStats()
     sink = MooncakeHiddenSink(
         store_id="test_store",
-        row_bytes=ROW_BYTES,
         max_export_tokens=max_export_tokens,
         stats=stats,
         store=store,
         replicate_config=FakeReplicateConfig(),
         manifest_config=FakeReplicateConfig(),
         replicate_config_cls=FakeReplicateConfig,
-        prefix_enabled=True,
         max_segment_rows=max_segment_rows,
         prefix_lanes=prefix_lanes,
         aux_width=AUX_WIDTH,
         last_width=LAST_WIDTH,
         dtype=DTYPE,
         writer_epoch=writer_epoch,
-        direct_gather=direct_gather,
-        batch_put=batch_put,
     )
     sink.write_fingerprint({"model_path": "test-model", "revision": "r1"})
     return sink, store, stats
@@ -277,149 +276,20 @@ class TestMooncakeSinkKeysAndBytes(CustomTestCase):
                 _connect("127.0.0.1:1")
         self.assertTrue(store.closed)
 
-    def test_key_layout_matches_specforge_tkey(self):
-        """The key shape {store_id}/{sample_id}/g0/{name} is SpecForge
-        MooncakeFeatureStore._tkey's contract — the trainer's existing
-        zero-copy reader consumes it verbatim. Renaming any segment silently
-        orphans every exported sample. The manifest entry _seq/{dp_rank}/{n}
-        is the SpecLoop discovery contract on top."""
-        sink, store = _make_sink()
-        self.assertTrue(sink.put("s1", _record(4)))
-        self.assertEqual(
-            set(store.data),
-            {
-                "test_store/s1/g0/aux",
-                "test_store/s1/g0/last_hidden",
-                "test_store/s1/g0/input_ids",
-                "test_store/s1/g0/meta",
-                "test_store/_seq/0/0",
-            },
-        )
-
-    def test_payload_bytes_roundtrip(self):
-        sink, store = _make_sink()
-        record = _record(4, seed=7)
-        sink.put("s1", record)
-        aux_back = torch.frombuffer(
-            bytearray(store.data["test_store/s1/g0/aux"]), dtype=DTYPE
-        ).view(1, 4, AUX_WIDTH)
-        self.assertTrue(torch.equal(aux_back, record["aux_hidden_state"]))
-        ids_back = torch.frombuffer(
-            bytearray(store.data["test_store/s1/g0/input_ids"]), dtype=torch.long
-        )
-        self.assertTrue(torch.equal(ids_back, record["input_ids"]))
-
-    def test_payloads_use_one_batch_put(self):
-        sink, store = _make_sink()
-        sink.put("s1", _record(4))
-        self.assertEqual(len(store.batch_put_calls), 1)
-        self.assertEqual(
-            store.batch_put_calls[0]["keys"],
-            [
-                "test_store/s1/g0/aux",
-                "test_store/s1/g0/last_hidden",
-                "test_store/s1/g0/input_ids",
-            ],
-        )
-
-    def test_payloads_can_use_sequential_put_ablation(self):
-        stats = HiddenCaptureStats()
-        sink, store = _make_sink(stats=stats, batch_put=False)
-        sink.put("s1", _record(4))
-        self.assertEqual(store.batch_put_calls, [])
-        self.assertEqual(stats.mooncake_put_from_calls_ct, 3)
-        self.assertEqual(
-            stats.mooncake_put_from_bytes_attempted_ct,
-            sum(
-                len(store.data[f"test_store/s1/g0/{name}"])
-                for name in ("aux", "last_hidden", "input_ids")
-            ),
-        )
-
-    def test_meta_is_self_describing_and_last(self):
-        """Bypass capture has no response channel: shape/dtype must live in
-        the meta key, and meta must be written after every tensor so a
-        scanner that finds it never sees a partial sample. The manifest entry
-        comes after meta — a sample must never be discoverable before it is
-        complete."""
-        sink, store = _make_sink()
-        sink.put("s1", _record(4))
-        meta = json.loads(store.data["test_store/s1/g0/meta"])
-        self.assertEqual(meta["rid"], "rid-1")
-        self.assertEqual(meta["num_tokens"], 4)
-        self.assertEqual(meta["tensors"]["aux"]["shape"], [1, 4, AUX_WIDTH])
-        self.assertEqual(meta["tensors"]["aux"]["dtype"], "torch.bfloat16")
-        self.assertEqual(meta["loss_mask"], "all_ones_placeholder")
-        # Compatibility for direct/older sink callers with no boundary.
-        self.assertEqual(meta["prompt_len"], 0)
-        self.assertEqual(
-            store.put_order[-2:], ["test_store/s1/g0/meta", "test_store/_seq/0/0"]
-        )
-
-    def test_meta_carries_prompt_len(self):
-        sink, store = _make_sink()
-        record = _record(4)
-        record["prompt_len"] = 3
-        sink.put("s1", record)
-        meta = json.loads(store.data["test_store/s1/g0/meta"])
-        self.assertEqual(meta["prompt_len"], 3)
-
-    def test_duplicate_sample_id_first_write_wins(self):
-        sink, store = _make_sink()
-        self.assertTrue(sink.put("s1", _record(4, seed=1)))
-        first_aux = store.data["test_store/s1/g0/aux"]
-        self.assertFalse(sink.put("s1", _record(4, seed=2)))
-        self.assertEqual(store.data["test_store/s1/g0/aux"], first_aux)
-
-    def test_oversized_sample_raises_too_large(self):
-        sink, store = _make_sink(max_export_tokens=2)
-        with self.assertRaises(SampleTooLargeError):
-            sink.put("big", _record(64))
-        # Nothing partial published.
-        self.assertEqual(store.data, {})
-
-    def test_staging_reuse_across_samples(self):
-        """Consecutive samples reuse one registered buffer; the second put
-        must not be corrupted by the first's leftovers."""
-        sink, store = _make_sink()
-        rec_a, rec_b = _record(6, seed=1), _record(3, seed=2)
-        sink.put("a", rec_a)
-        sink.put("b", rec_b)
-        b_back = torch.frombuffer(
-            bytearray(store.data["test_store/b/g0/aux"]), dtype=DTYPE
-        ).view(1, 3, AUX_WIDTH)
-        self.assertTrue(torch.equal(b_back, rec_b["aux_hidden_state"]))
-
-    def test_batch_partial_failure_does_not_publish_meta_or_manifest(self):
-        class PartialFailureStore(FakeStore):
-            def batch_put_from(self, keys, ptrs, sizes, config):
-                statuses = super().batch_put_from(keys, ptrs, sizes, config)
-                statuses[1] = -99
-                return statuses
-
-        stats = _StatsStub()
-        sink, store = _make_sink(store=PartialFailureStore(), stats=stats)
-        with self.assertRaisesRegex(RuntimeError, "last_hidden.*status -99"):
-            sink.put("partial", _record(4))
-        self.assertNotIn("test_store/partial/g0/meta", store.data)
-        self.assertNotIn("test_store/_seq/0/0", store.data)
-        self.assertEqual(
-            stats.bumped.count("mooncake_batch_partial_failure_miss_ct"), 1
-        )
-
     def test_fingerprint_idempotent_but_mismatch_fails_closed(self):
-        sink, store = _make_sink()
-        sink.write_fingerprint({"model_path": "a"})
-        sink.write_fingerprint({"model_path": "a"})
+        sink, store = _make_sink()  # helper already wrote {"model_path": "test-model"}
+        sink.write_fingerprint({"model_path": "test-model"})  # idempotent re-put
         with self.assertRaisesRegex(RuntimeError, "fingerprint mismatch"):
             sink.write_fingerprint({"model_path": "b"})
         self.assertEqual(
-            json.loads(store.data["test_store/_fingerprint"])["model_path"], "a"
+            json.loads(store.data["test_store/_fingerprint"])["model_path"],
+            "test-model",
         )
 
     def test_close_unregisters_staging(self):
         sink, store = _make_sink()
-        self.assertEqual(len(store.registered), 1)
+        # input-id staging + boundary staging + 2 prefix lanes
+        self.assertEqual(len(store.registered), 4)
         before = sink.state_snapshot()
         self.assertFalse(before["closed"])
         self.assertGreater(before["registered_bytes"], 0)
@@ -452,14 +322,17 @@ class TestMooncakeSinkKeysAndBytes(CustomTestCase):
         ):
             sink = MooncakeHiddenSink(
                 store_id="owned",
-                row_bytes=ROW_BYTES,
                 max_export_tokens=4,
-                prefix_enabled=False,
+                max_segment_rows=4,
+                aux_width=AUX_WIDTH,
+                last_width=LAST_WIDTH,
+                dtype=DTYPE,
             )
         sink.close()
-        self.assertEqual(store.lifecycle, ["unregister", "close"])
+        # 4 arenas (staging + boundary + 2 lanes) unregister before close.
+        self.assertEqual(store.lifecycle, ["unregister"] * 4 + ["close"])
         sink.close()
-        self.assertEqual(store.lifecycle, ["unregister", "close"])
+        self.assertEqual(store.lifecycle, ["unregister"] * 4 + ["close"])
 
 
 class TestMooncakePrefixProtocol(CustomTestCase):
@@ -512,38 +385,6 @@ class TestMooncakePrefixProtocol(CustomTestCase):
             store.put_order.index(sample_meta_key), store.put_order.index(manifest_key)
         )
         self.assertEqual(stats.sidecar_direct_gather_rows_ct, len(tokens))
-
-    def test_copy_gather_ablation_preserves_prefix_payload(self):
-        sink, store, stats = _make_prefix_sink(direct_gather=False)
-        self.addCleanup(sink.close)
-        sidecar = _make_sidecar(stats=stats)
-        tokens = [10, 11, 12, 13, 14, 15]
-        slots = list(range(len(tokens)))
-        aux, last, own = _write_rows(sidecar, slots, tokens, seed=71)
-        self.assertTrue(_put_prefix(sink, sidecar, "copy", tokens, slots, own))
-        _, ids, aux_back, last_back = _read_prefix_sample(store, "copy")
-        self.assertEqual(ids.tolist(), tokens)
-        self.assertTrue(torch.equal(aux_back, aux))
-        self.assertTrue(torch.equal(last_back, last))
-        self.assertEqual(stats.sidecar_direct_gather_rows_ct, 0)
-        self.assertEqual(stats.sidecar_gather_rows_ct, len(tokens))
-
-    def test_prefix_payloads_can_use_sequential_put_ablation(self):
-        sink, store, stats = _make_prefix_sink(batch_put=False)
-        self.addCleanup(sink.close)
-        sidecar = _make_sidecar(stats=stats)
-        tokens = [1, 2, 3, 4]
-        slots = list(range(len(tokens)))
-        _, _, own = _write_rows(sidecar, slots, tokens, seed=72)
-        self.assertTrue(_put_prefix(sink, sidecar, "sequential", tokens, slots, own))
-        self.assertEqual(store.batch_put_calls, [])
-        # aux + last payload, then the per-sample input_ids object.
-        self.assertEqual(stats.mooncake_put_from_calls_ct, 3)
-        payload_keys = [
-            key for key in store.put_order if key.endswith(("/aux", "/last_hidden"))
-        ]
-        self.assertTrue(payload_keys)
-        self.assertTrue(all(store.put_configs[key].group_ids for key in payload_keys))
 
     def test_a_to_ab_reuses_whole_segment_and_gathers_only_suffix(self):
         sink, store, stats = _make_prefix_sink()
@@ -976,13 +817,11 @@ class TestMooncakePrefixProtocol(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "group_ids"):
             MooncakeHiddenSink(
                 store_id="test_store",
-                row_bytes=ROW_BYTES,
                 max_export_tokens=4,
                 store=store,
                 replicate_config=NoGroupConfig(),
                 manifest_config=NoGroupConfig(),
                 replicate_config_cls=NoGroupConfig,
-                prefix_enabled=True,
                 max_segment_rows=4,
                 aux_width=AUX_WIDTH,
                 last_width=LAST_WIDTH,
@@ -997,13 +836,11 @@ class TestMooncakePrefixProtocol(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "batch_get_into"):
             MooncakeHiddenSink(
                 store_id="test_store",
-                row_bytes=ROW_BYTES,
                 max_export_tokens=4,
                 store=store,
                 replicate_config=FakeReplicateConfig(),
                 manifest_config=FakeReplicateConfig(),
                 replicate_config_cls=FakeReplicateConfig,
-                prefix_enabled=True,
                 max_segment_rows=4,
                 aux_width=AUX_WIDTH,
                 last_width=LAST_WIDTH,
@@ -1027,13 +864,11 @@ class TestMooncakePrefixProtocol(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "prefix lane 0"):
             MooncakeHiddenSink(
                 store_id="test_store",
-                row_bytes=ROW_BYTES,
                 max_export_tokens=4,
                 store=store,
                 replicate_config=FakeReplicateConfig(),
                 manifest_config=FakeReplicateConfig(),
                 replicate_config_cls=FakeReplicateConfig,
-                prefix_enabled=True,
                 max_segment_rows=4,
                 aux_width=AUX_WIDTH,
                 last_width=LAST_WIDTH,
@@ -1078,10 +913,8 @@ class TestAsyncMooncakeStartup(CustomTestCase):
             probe_fn=lambda _address, _timeout: allow_probe.is_set(),
             master_address="127.0.0.1:1",
             store_id="async-test",
-            row_bytes=ROW_BYTES,
             max_export_tokens=8,
             stats=stats,
-            prefix_enabled=True,
         )
         started = time.monotonic()
         proxy.write_fingerprint({"model": "test"})
@@ -1119,10 +952,16 @@ class TestManifest(CustomTestCase):
     without overwrites, burn-on-failure) is load-bearing for that tail loop.
     """
 
+    def _publish(self, sink, sidecar, sample_id, *, slots, seed):
+        tokens = [100 + s for s in slots]
+        _, _, own = _write_rows(sidecar, slots, tokens, seed=seed)
+        self.assertTrue(_put_prefix(sink, sidecar, sample_id, tokens, slots, own))
+
     def test_one_entry_per_sample_monotone_and_bare_sample_id(self):
         sink, store = _make_sink(dp_rank=3)
-        sink.put("alpha", _record(4, seed=1))
-        sink.put("beta", _record(4, seed=2))
+        sidecar = _make_sidecar()
+        self._publish(sink, sidecar, "alpha", slots=[0, 1], seed=1)
+        self._publish(sink, sidecar, "beta", slots=[2, 3], seed=2)
         self.assertEqual(store.data["test_store/_seq/3/0"], b"alpha")
         self.assertEqual(store.data["test_store/_seq/3/1"], b"beta")
         self.assertNotIn("test_store/_seq/3/2", store.data)
@@ -1132,10 +971,18 @@ class TestManifest(CustomTestCase):
         and oversized samples publish no manifest entry, and the entry for a
         good sample follows its meta (see put_order)."""
         sink, store = _make_sink(max_export_tokens=4)
-        self.assertTrue(sink.put("s1", _record(4)))
-        self.assertFalse(sink.put("s1", _record(4, seed=2)))  # duplicate
+        sidecar = _make_sidecar()
+        self._publish(sink, sidecar, "s1", slots=[0, 1], seed=1)
+        # Duplicate id: rejected, no new manifest entry.
+        tokens = [100, 101]
+        _, _, own = _write_rows(sidecar, [0, 1], tokens, seed=2)
+        self.assertFalse(_put_prefix(sink, sidecar, "s1", tokens, [0, 1], own))
+        # Oversized sample: input-id staging is max_export_tokens rows.
+        big_slots = list(range(8))
+        big_tokens = [100 + s for s in big_slots]
+        _, _, big_own = _write_rows(sidecar, big_slots, big_tokens, seed=3)
         with self.assertRaises(SampleTooLargeError):
-            sink.put("big", _record(64))
+            _put_prefix(sink, sidecar, "big", big_tokens, big_slots, big_own)
         manifest_keys = [k for k in store.data if "/_seq/" in k]
         self.assertEqual(manifest_keys, ["test_store/_seq/0/0"])
 
@@ -1143,27 +990,41 @@ class TestManifest(CustomTestCase):
         """Manifests are hard-pinned while payloads stay unpinned; putting a
         manifest with the payload config silently reintroduces the
         orphan-by-eviction failure the pin exists to prevent."""
-        payload_cfg, manifest_cfg = object(), object()
+        payload_cfg = FakeReplicateConfig()
+        manifest_cfg = FakeReplicateConfig()
         store = FakeStore()
         sink = MooncakeHiddenSink(
             store_id="test_store",
-            row_bytes=ROW_BYTES,
             max_export_tokens=16,
             store=store,
             replicate_config=payload_cfg,
             manifest_config=manifest_cfg,
-            prefix_enabled=False,
+            replicate_config_cls=FakeReplicateConfig,
+            max_segment_rows=4,
+            aux_width=AUX_WIDTH,
+            last_width=LAST_WIDTH,
+            dtype=DTYPE,
         )
-        sink.put("s1", _record(4))
+        sink.write_fingerprint({"model_path": "test-model"})
+        sidecar = _make_sidecar()
+        tokens = [100, 101]
+        _, _, own = _write_rows(sidecar, [0, 1], tokens, seed=1)
+        self.assertTrue(_put_prefix(sink, sidecar, "s1", tokens, [0, 1], own))
         self.assertIs(store.put_configs["test_store/_seq/0/0"], manifest_cfg)
-        self.assertIs(store.put_configs["test_store/s1/g0/meta"], payload_cfg)
+        self.assertIs(store.put_configs["test_store/_samples/s1/meta"], payload_cfg)
 
     def test_restart_resumes_after_tail_without_overwrite(self):
         sink, store = _make_sink()
+        sidecar = _make_sidecar()
         for i in range(5):
-            sink.put(f"s{i}", _record(4, seed=i))
+            self._publish(sink, sidecar, f"s{i}", slots=[2 * i, 2 * i + 1], seed=i)
         reborn, _ = _make_sink(store=store)
-        reborn.put("after-restart", _record(4, seed=9))
+        sidecar2 = _make_sidecar()
+        tokens = [100, 101]
+        _, _, own = _write_rows(sidecar2, [0, 1], tokens, seed=9)
+        self.assertTrue(
+            _put_prefix(reborn, sidecar2, "after-restart", tokens, [0, 1], own)
+        )
         self.assertEqual(store.data["test_store/_seq/0/5"], b"after-restart")
         # No pre-restart entry was overwritten.
         self.assertEqual(store.data["test_store/_seq/0/0"], b"s0")
@@ -1175,21 +1036,27 @@ class TestManifest(CustomTestCase):
         turns that collision into silent entry loss. The tail scan must
         resume after the LAST survivor."""
         sink, store = _make_sink()
+        sidecar = _make_sidecar()
         for i in range(6):
-            sink.put(f"s{i}", _record(4, seed=i))
+            self._publish(sink, sidecar, f"s{i}", slots=[2 * i, 2 * i + 1], seed=i)
         del store.data["test_store/_seq/0/2"]  # simulate eviction/burn
         del store.data["test_store/_seq/0/3"]
         reborn, _ = _make_sink(store=store)
-        reborn.put("after-restart", _record(4, seed=9))
+        sidecar2 = _make_sidecar()
+        tokens = [100, 101]
+        _, _, own = _write_rows(sidecar2, [0, 1], tokens, seed=9)
+        self.assertTrue(
+            _put_prefix(reborn, sidecar2, "after-restart", tokens, [0, 1], own)
+        )
         self.assertEqual(store.data["test_store/_seq/0/6"], b"after-restart")
         self.assertEqual(store.data["test_store/_seq/0/5"], b"s5")
 
     def test_manifest_failure_is_counted_orphan_not_export_failure(self):
         """Requirement: manifest put failure = no retry, orphan counter +1,
-        payload/meta NOT rolled back, and put() still reports success so the
-        export worker doesn't double-count a sink failure. The failed attempt
-        burns its sequence number (ambiguous failures must not retry into a
-        first-write-wins key)."""
+        payload/meta NOT rolled back, and the put still reports success so
+        the export worker doesn't double-count a sink failure. The failed
+        attempt burns its sequence number (ambiguous failures must not retry
+        into a first-write-wins key)."""
 
         class FailingManifestStore(FakeStore):
             def put(self, key, value, config):
@@ -1200,12 +1067,19 @@ class TestManifest(CustomTestCase):
         stats = _StatsStub()
         store = FailingManifestStore()
         sink, _ = _make_sink(store=store, stats=stats)
-        self.assertTrue(sink.put("ok", _record(4, seed=1)))
-        self.assertTrue(sink.put("orphaned", _record(4, seed=2)))  # manifest fails
-        self.assertTrue(sink.put("next", _record(4, seed=3)))
+        sidecar = _make_sidecar()
+
+        def publish(sample_id, slots, seed):
+            tokens = [100 + s for s in slots]
+            _, _, own = _write_rows(sidecar, slots, tokens, seed=seed)
+            return _put_prefix(sink, sidecar, sample_id, tokens, slots, own)
+
+        self.assertTrue(publish("ok", [0, 1], 1))
+        self.assertTrue(publish("orphaned", [2, 3], 2))  # manifest fails
+        self.assertTrue(publish("next", [4, 5], 3))
         self.assertEqual(stats.bumped.count("manifest_orphan_miss_ct"), 1)
         # Payload survives the manifest failure.
-        self.assertIn("test_store/orphaned/g0/meta", store.data)
+        self.assertIn("test_store/_samples/orphaned/meta", store.data)
         # Number 1 is burnt; the next sample takes 2.
         self.assertNotIn("test_store/_seq/0/1", store.data)
         self.assertEqual(store.data["test_store/_seq/0/2"], b"next")

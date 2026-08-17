@@ -192,7 +192,15 @@ class TestSplitRingFinalizeOrder(CustomTestCase):
             fence_event=_NullEvent(),
         )
         (slot,) = ring.try_acquire(1)
-        ring.enqueue_verify_segment(slot, twin=twin, rids=[rid], stride=2, num_reqs=1)
+        ring.reserve_verify_compact(
+            slot,
+            twin=twin,
+            rids=[rid],
+            stride=2,
+            num_reqs=1,
+            header_submitted_ns=time.monotonic_ns(),
+        )
+        ring.mark_verify_payload_enqueued(slot, num_rows=2)
 
     def test_finalize_merges_rings_in_global_seq_order(self):
         prefill_ring, verify_ring = self._make_pair()
@@ -999,7 +1007,7 @@ class TestWorkerShutdown(CustomTestCase):
             req_ranges=[("d2h", 0, 2)],
         )
         finalize.start()
-        finalize.stop(drain=True)
+        finalize.stop()
         self.addCleanup(gate.ready.set)
         self.assertFalse(finalize.join(timeout_s=0.02))
         self.assertEqual(finalize.pending_count, 1)
@@ -1044,7 +1052,7 @@ class TestWorkerShutdown(CustomTestCase):
             )
             self.assertTrue(export.submit(queued))
             export.start()
-            export.stop(drain=True)
+            export.stop()
             self.assertTrue(export.join(timeout_s=2.0))
             self.assertTrue(os.path.exists(os.path.join(tmpdir, "queued.ckpt")))
 
@@ -1097,7 +1105,7 @@ class TestWorkerShutdown(CustomTestCase):
         )
         finalize.start()
         self.assertTrue(entered.wait(timeout=2.0))
-        finalize.stop(drain=True)
+        finalize.stop()
         self.addCleanup(release.set)
         self.assertFalse(finalize.join(timeout_s=0.02))
         release.set()
@@ -1159,7 +1167,7 @@ class TestWorkerShutdown(CustomTestCase):
             )
             export.start()
             self.assertTrue(entered.wait(timeout=2.0))
-            export.stop(drain=True)
+            export.stop()
             self.addCleanup(release.set)
             self.assertFalse(export.join(timeout_s=0.02))
             release.set()
@@ -1218,7 +1226,7 @@ class TestWorkerShutdown(CustomTestCase):
         self.assertTrue(export.submit(_job("put-b")))
         self.assertFalse(export.submit(_job("put-c")))
         self.assertLess(time.monotonic() - started, 0.05)
-        export.stop(drain=True)
+        export.stop()
         self.addCleanup(release.set)
         self.assertFalse(export.join(timeout_s=0.02))
         release.set()
@@ -1242,7 +1250,7 @@ class TestWorkerShutdown(CustomTestCase):
         slot = SimpleNamespace(header_event=gate)
         launcher.start()
         launcher.submit(slot)
-        launcher.stop(drain=True)
+        launcher.stop()
         self.addCleanup(gate.ready.set)
         self.assertFalse(launcher.join(timeout_s=0.02))
         self.assertEqual(launcher.pending_count, 1)
@@ -1262,8 +1270,8 @@ class TestWorkerShutdown(CustomTestCase):
                 self.name = name
                 self.block_join = block_join
 
-            def stop(self, *, drain):
-                events.append((self.name, "stop", drain))
+            def stop(self):
+                events.append((self.name, "stop"))
 
             def join(self, timeout_s):
                 events.append((self.name, "join"))
@@ -1315,7 +1323,7 @@ class TestWorkerShutdown(CustomTestCase):
         class Worker:
             pending_count = 2
 
-            def stop(self, *, drain):
+            def stop(self):
                 pass
 
             def join(self, timeout_s):
@@ -1351,10 +1359,11 @@ class TestWorkerShutdown(CustomTestCase):
 
 
 class TestVerifyCommittedRows(CustomTestCase):
-    """Verify-window finalize: only rows [i*stride, i*stride+commit_lens[i])
-    per request enter the sidecar. Rejected drafts entering the sidecar would
-    poison warm-prefix reuse (their kv slots are freed and reused while the
-    stale row still carries a plausible token id)."""
+    """Verify-window finalize: the compact payload holds exactly the
+    committed prefix of every request (request i's rows contiguous at
+    [sum(commit_lens[:i]), sum(commit_lens[:i+1]))). Rejected drafts entering
+    the sidecar would poison warm-prefix reuse (their kv slots are freed and
+    reused while the stale row still carries a plausible token id)."""
 
     def _make_verify_slot(self, ring, commit_lens, stride, seed=0):
         from sglang.srt.state_capturer.hidden_host import _DeviceTwin, _NullEvent
@@ -1372,13 +1381,29 @@ class TestVerifyCommittedRows(CustomTestCase):
             fence_event=_NullEvent(),
         )
         (slot,) = ring.try_acquire(1)
-        ring.enqueue_verify_segment(
+        ring.reserve_verify_compact(
             slot,
             twin=twin,
             rids=[f"r{i}" for i in range(num_reqs)],
             stride=stride,
             num_reqs=num_reqs,
+            header_submitted_ns=time.monotonic_ns(),
         )
+        # Emulate the payload launcher: contiguous committed rows only.
+        keep = []
+        for i, commit_len in enumerate(commit_lens):
+            keep.extend(range(i * stride, i * stride + commit_len))
+        keep_idx = torch.tensor(keep, dtype=torch.long)
+        packed = len(keep)
+        slot.aux[:packed].copy_(aux[keep_idx])
+        slot.last[:packed].copy_(last[keep_idx])
+        slot.cache_loc[:packed].copy_(twin.cache_loc[keep_idx])
+        slot.tokens[:packed].copy_(twin.tokens[keep_idx])
+        if slot.commit_lens is None:
+            slot.commit_lens = torch.tensor(commit_lens, dtype=torch.int32)
+        else:
+            slot.commit_lens[:num_reqs].copy_(twin.commit_lens[:num_reqs])
+        ring.mark_verify_payload_enqueued(slot, num_rows=packed)
         return ring.pop_ready(), aux, last
 
     def test_only_committed_prefix_enters_sidecar(self):
@@ -1437,7 +1462,15 @@ class TestVerifyCommittedRows(CustomTestCase):
         twin.tokens[:2] = torch.tensor([5, 6], dtype=torch.int64)
         twin.commit_lens[:1] = torch.tensor([1], dtype=torch.int32)
         (slot,) = ring.try_acquire(1)
-        ring.enqueue_verify_segment(slot, twin=twin, rids=["r0"], stride=2, num_reqs=1)
+        ring.reserve_verify_compact(
+            slot,
+            twin=twin,
+            rids=["r0"],
+            stride=2,
+            num_reqs=1,
+            header_submitted_ns=time.monotonic_ns(),
+        )
+        ring.mark_verify_payload_enqueued(slot, num_rows=1)
         self.assertIsNone(pool.try_acquire())
 
         # D2H done (_NullEvent queries True); slot NOT yet finalized.
@@ -1719,7 +1752,7 @@ class TestVerifyCommittedPack(CustomTestCase):
         while ready is None and time.monotonic() < deadline:
             ready = ring.pop_ready()
             time.sleep(0.001)
-        launcher.stop(drain=True)
+        launcher.stop()
         self.assertTrue(launcher.join(timeout_s=2))
         self.assertIsNotNone(ready)
 
@@ -1816,7 +1849,7 @@ class TestVerifyCommittedPack(CustomTestCase):
         while ready is None and time.monotonic() < deadline:
             ready = ring.pop_ready()
             time.sleep(0.001)
-        launcher.stop(drain=True)
+        launcher.stop()
         self.assertTrue(launcher.join(timeout_s=2))
         self.assertIsNotNone(ready)
         self.assertTrue(torch.equal(ready.aux[:4], torch.full_like(ready.aux[:4], 7)))

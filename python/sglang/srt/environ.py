@@ -989,17 +989,18 @@ class Envs:
     # startup: slot size = one forward's staged-row bound
     # (chunked_prefill_size, or max_prefill_tokens when chunking is disabled,
     # floored to the verify window and rounded to 256) and slot count = a
-    # fixed pinned-host token budget / slot size (min 2). Set explicitly to
-    # pin either dimension. A forward spanning S = ceil(rows / SLOT_TOKENS)
-    # segments stages only if S free slots are available; S > SLOTS can never
-    # stage (guaranteed miss).
-    SGLANG_HIDDEN_CAPTURE_STAGING_SLOTS = EnvInt(4)
-    SGLANG_HIDDEN_CAPTURE_STAGING_SLOT_TOKENS = EnvInt(8192)
+    # fixed pinned-host token budget / slot size (min 2). The declared
+    # defaults never apply — a variable takes effect only when explicitly set
+    # (is_set() gates the adaptive computation). A forward spanning
+    # S = ceil(rows / SLOT_TOKENS) segments stages only if S free slots are
+    # available; S > SLOTS can never stage (guaranteed miss).
+    SGLANG_HIDDEN_CAPTURE_STAGING_SLOTS = EnvInt(None)
+    SGLANG_HIDDEN_CAPTURE_STAGING_SLOT_TOKENS = EnvInt(None)
     # Verify staging ring depth override (slot size is always the verify
     # window). Verify stages through its own pinned ring so a prefill
     # finalize stall can never drop a whole decode batch; default depth =
     # 16384-token budget / verify window (min 2).
-    SGLANG_HIDDEN_CAPTURE_VERIFY_STAGING_SLOTS = EnvInt(32)
+    SGLANG_HIDDEN_CAPTURE_VERIFY_STAGING_SLOTS = EnvInt(None)
     # Export job queue capacity; full queue => capture-miss (never backpressure).
     SGLANG_HIDDEN_CAPTURE_EXPORT_QUEUE_SIZE = EnvInt(256)
     # Graceful scheduler shutdown budget for draining D2H/finalize/export and
@@ -1037,39 +1038,28 @@ class Envs:
     # background connection, then let serving start degraded while retrying.
     SGLANG_HIDDEN_CAPTURE_MOONCAKE_PROBE_TIMEOUT_S = EnvFloat(1.0)
     SGLANG_HIDDEN_CAPTURE_MOONCAKE_RECONNECT_INTERVAL_S = EnvFloat(5.0)
-    # Mooncake sink: maximum rows in one sample. In prefix mode this sizes the
-    # registered input-id arena; segment hidden arenas are bounded separately
-    # by PREFIX_MAX_SEGMENT_ROWS. Registration never runs per sample. Longer
+    # Mooncake sink: maximum rows in one sample. Sizes the registered
+    # input-id arena; segment hidden arenas are bounded separately by
+    # PREFIX_MAX_SEGMENT_ROWS. Registration never runs per sample. Longer
     # samples are whole-sample capture misses.
     SGLANG_HIDDEN_CAPTURE_MAX_EXPORT_TOKENS = EnvInt(16384)
-    # Mooncake prefix V1. It is the default Mooncake capture format; the flag
-    # remains available for controlled whole-sample A/B runs. The performance
-    # defaults are provisional and will be tuned from real-workload profiles.
-    # Segments are immutable and whole-object referenced, with at most
-    # MAX_SEGMENT_ROWS rows each.
-    SGLANG_HIDDEN_CAPTURE_PREFIX_ENABLED = EnvBool(True)
+    # Mooncake prefix segments: immutable, whole-object referenced, at most
+    # MAX_SEGMENT_ROWS rows each. Prefix-segment publishing is the only
+    # Mooncake protocol.
     SGLANG_HIDDEN_CAPTURE_PREFIX_MAX_SEGMENT_ROWS = EnvInt(256)
-    # Two bounded registered lanes overlap sidecar gather with one synchronous
-    # Mooncake writer. Keep configurable for the post-implementation A/B.
+    # Bounded registered lanes overlap sidecar gather with one synchronous
+    # Mooncake writer.
     SGLANG_HIDDEN_CAPTURE_PREFIX_LANES = EnvInt(2)
-    # Characterization ablations. Production defaults retain the V6 direct
-    # gather and synchronous batch-put paths; false selects the correctness-
-    # equivalent legacy copy / per-object put_from path for paired evidence.
-    SGLANG_HIDDEN_CAPTURE_DIRECT_GATHER = EnvBool(True)
-    SGLANG_HIDDEN_CAPTURE_BATCH_PUT = EnvBool(True)
     # Verify (decode) row capture: device twin-pool geometry overrides. By
     # default both adapt at startup: slot size = the actual verify window
     # (max_running_requests x speculative_num_draft_tokens, rounded up to
     # 256) and slot count = a fixed HBM token budget / slot size (min 2) —
     # deep pools for small deployments, window-fitting slots for large-batch
-    # ones. Set explicitly to pin either dimension; a verify step larger
-    # than a slot is a capture miss for every request in the batch.
-    SGLANG_HIDDEN_CAPTURE_VERIFY_RING_SLOTS = EnvInt(2)
-    SGLANG_HIDDEN_CAPTURE_VERIFY_RING_TOKENS = EnvInt(2048)
-    # Pack only accepted verify rows into the capture-owned twin, then use a
-    # pinned header + background launch to D2H the actual row count. This is
-    # the provisional V6 default; set false for full-window H200 A/B/fallback.
-    SGLANG_HIDDEN_CAPTURE_VERIFY_COMPACT_D2H = EnvBool(True)
+    # ones. The declared defaults never apply — they take effect only when
+    # the variable is explicitly set (is_set() gates the adaptive computation).
+    # A verify step larger than a slot is a capture miss for the whole batch.
+    SGLANG_HIDDEN_CAPTURE_VERIFY_RING_SLOTS = EnvInt(None)
+    SGLANG_HIDDEN_CAPTURE_VERIFY_RING_TOKENS = EnvInt(None)
 
     # VLM
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)

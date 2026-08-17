@@ -619,22 +619,10 @@ def run_cell(cell, repeat_idx, attempt_name):
                 # capture pipeline. v2 samples are ~4.5k tokens x ~57KB/token
                 # -> ~260MB/sample x 300 requests needs headroom.
                 "MOONCAKE_GLOBAL_SEGMENT_SIZE": "96gb",
-                "SGLANG_HIDDEN_CAPTURE_PREFIX_ENABLED": str(
-                    cell.get("prefix_capture", True)
-                ).lower(),
-                "SGLANG_HIDDEN_CAPTURE_VERIFY_COMPACT_D2H": str(
-                    cell.get("compact_d2h", True)
-                ).lower(),
                 "SGLANG_HIDDEN_CAPTURE_PREFIX_LANES": str(cell.get("prefix_lanes", 2)),
                 "SGLANG_HIDDEN_CAPTURE_PREFIX_MAX_SEGMENT_ROWS": str(
                     cell.get("max_segment_rows", 256)
                 ),
-                "SGLANG_HIDDEN_CAPTURE_DIRECT_GATHER": str(
-                    cell.get("direct_gather", True)
-                ).lower(),
-                "SGLANG_HIDDEN_CAPTURE_BATCH_PUT": str(
-                    cell.get("batch_put", True)
-                ).lower(),
             }
         )
     safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", attempt_name)
@@ -1002,10 +990,6 @@ def main():
         help="parallel-shard index: offsets server + mooncake-master ports "
         "so shards on different GPUs don't collide",
     )
-    parser.add_argument("--prefix-capture", choices=["true", "false"], default=None)
-    parser.add_argument("--compact-d2h", choices=["true", "false"], default=None)
-    parser.add_argument("--direct-gather", choices=["true", "false"], default=None)
-    parser.add_argument("--batch-put", choices=["true", "false"], default=None)
     parser.add_argument("--prefix-lanes", type=int, default=None)
     parser.add_argument("--max-segment-rows", type=int, default=None)
     opts = parser.parse_args()
@@ -1039,16 +1023,7 @@ def main():
             todo += regression_cells()
         if opts.cells in ("supplement", "all"):
             todo += supplement_cells()
-        bool_overrides = {
-            "prefix_capture": opts.prefix_capture,
-            "compact_d2h": opts.compact_d2h,
-            "direct_gather": opts.direct_gather,
-            "batch_put": opts.batch_put,
-        }
         for _, _, cell in todo:
-            for key, value in bool_overrides.items():
-                if value is not None:
-                    cell[key] = value == "true"
             if opts.prefix_lanes is not None:
                 cell["prefix_lanes"] = opts.prefix_lanes
             if opts.max_segment_rows is not None:

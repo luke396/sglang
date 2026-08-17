@@ -223,7 +223,6 @@ class HiddenVerifyCaptureOutput(msgspec.Struct):
     admitted_rids: List[str]
     stride: int
     num_reqs: int
-    compact_d2h: bool
     capturer: HiddenStatesCapturer
 
     def stage(self) -> None:
@@ -404,7 +403,6 @@ class HiddenStatesCapturer:
 
         self.stats = HiddenCaptureStats()
         self.bookkeeper = HiddenCaptureBookkeeper()
-        self.verify_compact_d2h = envs.SGLANG_HIDDEN_CAPTURE_VERIFY_COMPACT_D2H.get()
         # Dedicated stream for capture D2H. The scheduler's copy stream is
         # FIFO: queueing capture's large copies there would make the NEXT
         # step's (tiny) result copies — and thus its copy_done — wait behind
@@ -533,7 +531,7 @@ class HiddenStatesCapturer:
                 capture_launch_lock=self._capture_launch_lock,
                 row_bytes=row_bytes,
             )
-            if self.verify_compact_d2h and self.twin_pool is not None
+            if self.twin_pool is not None
             else None
         )
         self.finalize_worker = HiddenFinalizeWorker(
@@ -608,12 +606,11 @@ class HiddenStatesCapturer:
         self.export_worker.start()
         logger.info(
             "hidden state capture enabled: sink=%s (dir=%s), aux_layer_ids=%s, "
-            "sample_rate=%.3f, verify_compact_d2h=%s",
+            "sample_rate=%.3f",
             sink_kind,
             sink_dir,
             aux_layer_ids,
             self.sample_rate,
-            self.verify_compact_d2h,
         )
 
     def _build_sink(self, sink_kind: str, sink_dir: Optional[str], dp_rank: int):
@@ -623,7 +620,6 @@ class HiddenStatesCapturer:
             )
 
             # +8 bytes/row: input_ids ride the same registered staging buffer.
-            row_bytes = (self.aux_width + self.last_width) * self.dtype.itemsize + 8
             return AsyncMooncakeHiddenSink(
                 initial_probe_timeout_s=(
                     envs.SGLANG_HIDDEN_CAPTURE_MOONCAKE_PROBE_TIMEOUT_S.get()
@@ -632,11 +628,9 @@ class HiddenStatesCapturer:
                     envs.SGLANG_HIDDEN_CAPTURE_MOONCAKE_RECONNECT_INTERVAL_S.get()
                 ),
                 store_id=envs.SGLANG_HIDDEN_CAPTURE_STORE_ID.get(),
-                row_bytes=row_bytes,
                 max_export_tokens=envs.SGLANG_HIDDEN_CAPTURE_MAX_EXPORT_TOKENS.get(),
                 dp_rank=dp_rank,
                 stats=self.stats,
-                prefix_enabled=envs.SGLANG_HIDDEN_CAPTURE_PREFIX_ENABLED.get(),
                 max_segment_rows=(
                     envs.SGLANG_HIDDEN_CAPTURE_PREFIX_MAX_SEGMENT_ROWS.get()
                 ),
@@ -644,8 +638,6 @@ class HiddenStatesCapturer:
                 aux_width=self.aux_width,
                 last_width=self.last_width,
                 dtype=self.dtype,
-                direct_gather=envs.SGLANG_HIDDEN_CAPTURE_DIRECT_GATHER.get(),
-                batch_put=envs.SGLANG_HIDDEN_CAPTURE_BATCH_PUT.get(),
             )
         return HiddenFileSink(sink_dir)
 
@@ -665,9 +657,9 @@ class HiddenStatesCapturer:
             self._accepting.clear()
             self.export_worker.stop_admission()
             if self.verify_launcher is not None:
-                self.verify_launcher.stop(drain=True)
-            self.finalize_worker.stop(drain=True)
-            self.export_worker.stop(drain=True)
+                self.verify_launcher.stop()
+            self.finalize_worker.stop()
+            self.export_worker.stop()
             deadline = time.monotonic() + max(0.0, timeout_s)
 
             launcher_done = True
@@ -1003,57 +995,29 @@ class HiddenStatesCapturer:
             # fence. Timing events are consumed only after fence completion by
             # the background/reap path, never synchronized here.
             twin.pack_start_event.record()
-            if self.verify_compact_d2h:
-                from sglang.srt.state_capturer.hidden_pack import (
-                    pack_committed_verify_rows_into,
-                )
+            from sglang.srt.state_capturer.hidden_pack import (
+                pack_committed_verify_rows_into,
+            )
 
-                pack_committed_verify_rows_into(
-                    aux_strided=aux_strided,
-                    last_strided=last_strided,
-                    last_compact=last_compact,
-                    verify_lens=verify_lens,
-                    verify_cache_loc=verify_cache_loc,
-                    verify_tokens=verify_tokens,
-                    commit_lens=capture_commit_lens,
-                    bs=bs,
-                    stride=stride,
-                    out_aux=twin.aux,
-                    out_last=twin.last,
-                    out_cache_loc=twin.cache_loc,
-                    out_tokens=twin.tokens,
-                    out_commit_lens=twin.commit_lens,
-                    out_commit_offsets=twin.commit_offsets,
-                    out_total_rows=twin.total_rows,
-                    out_verify_offsets=twin.verify_offsets,
-                )
-            else:
-                twin.aux[:num_rows].copy_(aux_strided[:num_rows], non_blocking=True)
-                if last_strided is not None:
-                    twin.last[:num_rows].copy_(
-                        last_strided[:num_rows], non_blocking=True
-                    )
-                else:
-                    from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
-                        scatter_compact_to_strided_into,
-                    )
-
-                    scatter_compact_to_strided_into(
-                        compact=last_compact.contiguous(),
-                        verify_lens=verify_lens,
-                        out=twin.last[:num_rows],
-                        stride=stride,
-                        fill_value=0.0,
-                    )
-                twin.cache_loc[:num_rows].copy_(
-                    verify_cache_loc[:num_rows].to(torch.int64), non_blocking=True
-                )
-                twin.tokens[:num_rows].copy_(
-                    verify_tokens[:num_rows].to(torch.int64), non_blocking=True
-                )
-                twin.commit_lens[:bs].copy_(
-                    capture_commit_lens.to(torch.int32), non_blocking=True
-                )
+            pack_committed_verify_rows_into(
+                aux_strided=aux_strided,
+                last_strided=last_strided,
+                last_compact=last_compact,
+                verify_lens=verify_lens,
+                verify_cache_loc=verify_cache_loc,
+                verify_tokens=verify_tokens,
+                commit_lens=capture_commit_lens,
+                bs=bs,
+                stride=stride,
+                out_aux=twin.aux,
+                out_last=twin.last,
+                out_cache_loc=twin.cache_loc,
+                out_tokens=twin.tokens,
+                out_commit_lens=twin.commit_lens,
+                out_commit_offsets=twin.commit_offsets,
+                out_total_rows=twin.total_rows,
+                out_verify_offsets=twin.verify_offsets,
+            )
             twin.fence_event.record()
         except Exception:
             # Capture is best-effort and must never take down serving. Return
@@ -1071,7 +1035,6 @@ class HiddenStatesCapturer:
             admitted_rids=admitted_rids,
             stride=stride,
             num_reqs=bs,
-            compact_d2h=self.verify_compact_d2h,
             capturer=self,
         )
 
@@ -1106,33 +1069,7 @@ class HiddenStatesCapturer:
 
         num_rows = output.num_reqs * output.stride
         self.stats.bump("verify_candidate_rows_staged_ct", num_rows)
-        if output.compact_d2h:
-            header_submitted_ns = time.monotonic_ns()
-            with self._capture_launch_lock:
-                if self.capture_stream is not None:
-                    self.capture_stream.wait_event(output.twin.fence_event)
-                    stream_ctx = torch.cuda.stream(self.capture_stream)
-                else:
-                    stream_ctx = contextlib.nullcontext()
-                with stream_ctx:
-                    slot.commit_lens[: output.num_reqs].copy_(
-                        output.twin.commit_lens[: output.num_reqs],
-                        non_blocking=True,
-                    )
-                    slot.total_rows.copy_(output.twin.total_rows, non_blocking=True)
-                    slot.header_event.record()
-            ring_seq = self.verify_ring.reserve_verify_compact(
-                slot,
-                twin=output.twin,
-                rids=output.rids,
-                stride=output.stride,
-                num_reqs=output.num_reqs,
-                header_submitted_ns=header_submitted_ns,
-            )
-            self.bookkeeper.record_enqueued(output.admitted_rids, ring_seq)
-            self.verify_launcher.submit(slot)
-            return
-
+        header_submitted_ns = time.monotonic_ns()
         with self._capture_launch_lock:
             if self.capture_stream is not None:
                 self.capture_stream.wait_event(output.twin.fence_event)
@@ -1140,21 +1077,22 @@ class HiddenStatesCapturer:
             else:
                 stream_ctx = contextlib.nullcontext()
             with stream_ctx:
-                ring_seq = self.verify_ring.enqueue_verify_segment(
-                    slot,
-                    twin=output.twin,
-                    rids=output.rids,
-                    stride=output.stride,
-                    num_reqs=output.num_reqs,
+                slot.commit_lens[: output.num_reqs].copy_(
+                    output.twin.commit_lens[: output.num_reqs],
+                    non_blocking=True,
                 )
-        self.bookkeeper.record_enqueued(output.admitted_rids, ring_seq)
-        row_bytes = (self.aux_width + self.last_width) * self.dtype.itemsize + 16
-        self.stats.bump("rows_staged_ct", num_rows)
-        self.stats.bump("verify_payload_rows_staged_ct", num_rows)
-        self.stats.bump(
-            "verify_d2h_bytes_ct",
-            num_rows * row_bytes + output.num_reqs * torch.int32.itemsize,
+                slot.total_rows.copy_(output.twin.total_rows, non_blocking=True)
+                slot.header_event.record()
+        ring_seq = self.verify_ring.reserve_verify_compact(
+            slot,
+            twin=output.twin,
+            rids=output.rids,
+            stride=output.stride,
+            num_reqs=output.num_reqs,
+            header_submitted_ns=header_submitted_ns,
         )
+        self.bookkeeper.record_enqueued(output.admitted_rids, ring_seq)
+        self.verify_launcher.submit(slot)
 
     # ---------------------------------------------------------------- staging
 
