@@ -1420,6 +1420,12 @@ class Engine(EngineScoreMixin, EngineBase):
             flush_cache=flush_cache,
             draft_only=draft_only,
         )
+        if draft_only:
+            # Draft weights update only through the atomic transaction.
+            result = self.loop.run_until_complete(
+                self.tokenizer_manager.update_weights_from_tensor_atomic(obj)
+            )
+            return result.success, result.message
         return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_tensor(obj, None)
         )

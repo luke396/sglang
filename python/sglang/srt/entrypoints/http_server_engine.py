@@ -86,24 +86,27 @@ class HttpServerEngineAdapter(EngineBase):
         Update model weights from tensor data. The HTTP request carries only
         metadata; CPU tensors use filename-backed shared memory so a separately
         launched server does not need to share the producer's authkey.
+
+        Draft updates route to the atomic endpoint (the only draft path):
+        CPU-staged while serving, then a short pause for the commit.
         """
 
-        return self._make_request(
-            "update_weights_from_tensor",
-            {
-                "serialized_named_tensors": [
-                    MultiprocessingSerializer.serialize(
-                        named_tensors,
-                        output_str=True,
-                        cpu_sharing_strategy="file_system",
-                    )
-                    for _ in range(self.server_args.tp_size)
-                ],
-                "load_format": load_format,
-                "flush_cache": flush_cache,
-                "draft_only": draft_only,
-            },
-        )
+        payload = {
+            "serialized_named_tensors": [
+                MultiprocessingSerializer.serialize(
+                    named_tensors,
+                    output_str=True,
+                    cpu_sharing_strategy="file_system",
+                )
+                for _ in range(self.server_args.tp_size)
+            ],
+            "load_format": load_format,
+            "flush_cache": flush_cache,
+            "draft_only": draft_only,
+        }
+        if draft_only:
+            return self._make_request("update_weights_from_tensor_atomic", payload)
+        return self._make_request("update_weights_from_tensor", payload)
 
     def shutdown(self):
         kill_process_tree(self.process.pid, wait_timeout=60)

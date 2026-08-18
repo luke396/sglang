@@ -799,7 +799,13 @@ def run_fail_closed_fault_injection(
             "weight_version": f"{args.weight_version_prefix}-must-not-commit",
             "tensors_are_pre_sharded": True,
             "collect_phase_timings": True,
-            "fault_injection_after_tensors": 2,
+            # The checkpoint leads with confidence_head.* tensors, which the
+            # server consumes without applying when the confidence head is
+            # disabled (static ragged-verify mode), so a fault after 2 tensors
+            # fires before any real draft mutation and the post-failure
+            # "draft changed" assertion below can never hold. 8 lands the
+            # fault safely inside decoder-parameter mutations.
+            "fault_injection_after_tensors": 8,
         },
     )
     del updated_payloads, updated_keepalive
