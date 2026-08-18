@@ -406,7 +406,26 @@ class TestAtomicFailClosedController(unittest.IsolatedAsyncioTestCase):
         self.assertIn("partial copy", message)
         manager._async_dispatch_to_scheduler.assert_not_called()
 
-    async def test_legacy_update_waits_for_atomic_transaction_lock(self):
+    async def test_legacy_endpoint_rejects_draft_only(self):
+        # The one-shot endpoint has no draft path: draft weights update only
+        # through the atomic transaction, so draft_only is refused before any
+        # dispatch reaches the scheduler.
+        manager, _ = self.make_manager()
+        manager.update_weights_from_tensor_communicator = AsyncMock()
+        request = UpdateWeightsFromTensorReqInput(
+            serialized_named_tensors=[b"payload"],
+            draft_only=True,
+        )
+
+        result = await manager.update_weights_from_tensor_detailed(request)
+
+        self.assertFalse(result.success)
+        self.assertIn("atomic", result.message)
+        manager.update_weights_from_tensor_communicator.assert_not_awaited()
+
+    async def test_target_update_waits_for_atomic_transaction_lock(self):
+        # Target-model one-shot updates still serialize behind the atomic
+        # transaction lock so they cannot interleave with a staged commit.
         manager, _ = self.make_manager()
         manager.is_pause = True
         manager.update_weights_from_tensor_communicator = AsyncMock(
@@ -416,7 +435,7 @@ class TestAtomicFailClosedController(unittest.IsolatedAsyncioTestCase):
         )
         request = UpdateWeightsFromTensorReqInput(
             serialized_named_tensors=[b"payload"],
-            draft_only=True,
+            draft_only=False,
         )
 
         await manager.atomic_tensor_update_lock.acquire()

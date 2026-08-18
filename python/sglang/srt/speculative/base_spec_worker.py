@@ -412,21 +412,15 @@ class BaseSpecWorker(ABC):
         phase_timings_ms: Optional[Dict[str, float]] = None,
         update_status: Optional[dict] = None,
     ):
-        if not recv_req.draft_only:
-            return self.target_worker.update_weights_from_tensor(recv_req)
-
-        try:
-            staged = self.prepare_weights_from_tensor(recv_req)
-        except BaseException as error:
-            if update_status is not None:
-                update_status["partial_update"] = False
-            return False, f"Failed to prepare draft model weights: {error}"
-        return self.apply_prepared_weights_from_tensor(
-            staged,
-            recv_req,
-            phase_timings_ms=phase_timings_ms,
-            update_status=update_status,
-        )
+        # Draft weights update only through the atomic CPU-staged transaction
+        # (prepare_weights_from_tensor / apply_prepared_weights_from_tensor,
+        # driven by the scheduler's stage/commit operations).
+        if recv_req.draft_only:
+            return (
+                False,
+                "draft weights update only through the atomic endpoint.",
+            )
+        return self.target_worker.update_weights_from_tensor(recv_req)
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         for runner in self.draft_worker.draft_runners:

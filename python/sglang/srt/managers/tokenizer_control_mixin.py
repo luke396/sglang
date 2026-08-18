@@ -591,7 +591,9 @@ class TokenizerControlMixin:
         obj: UpdateWeightsFromTensorReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> TensorUpdateControlResult:
-        """Legacy apply endpoint with enforced fail-closed draft semantics."""
+        """Target-model apply endpoint. Draft weights update only through the
+        atomic endpoint (CPU-staged, short pause, server-enforced fail-closed);
+        this path has no draft support."""
 
         del request
         self.auto_create_handle_loop()
@@ -603,22 +605,23 @@ class TokenizerControlMixin:
                 success=False,
                 message="stage/status/commit/discard are internal to the atomic endpoint.",
             )
-        unhealthy, unhealthy_reason = self._tensor_update_health()
-        if unhealthy and not obj.recovery:
+        if obj.draft_only or obj.recovery:
             return TensorUpdateControlResult(
                 success=False,
                 message=(
-                    "Draft weight updates are fail-closed; explicitly restore known-good "
-                    f"tensors with recovery=true first. Cause: {unhealthy_reason}"
+                    "draft weights update only through "
+                    "/update_weights_from_tensor_atomic."
                 ),
-                unhealthy=True,
-                unhealthy_reason=unhealthy_reason,
             )
-        if obj.recovery and not obj.draft_only:
+        unhealthy, unhealthy_reason = self._tensor_update_health()
+        if unhealthy:
             return TensorUpdateControlResult(
                 success=False,
-                message="recovery=true requires draft_only=true.",
-                unhealthy=unhealthy,
+                message=(
+                    "The instance is fail-closed after a failed draft update; "
+                    f"recover via the atomic endpoint first. Cause: {unhealthy_reason}"
+                ),
+                unhealthy=True,
                 unhealthy_reason=unhealthy_reason,
             )
 
@@ -639,12 +642,6 @@ class TokenizerControlMixin:
         if result.success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             result.message += f" Weight version updated to {obj.weight_version}."
-        if obj.draft_only and not result.success:
-            self._mark_tensor_update_unhealthy(result.message, result.update_id)
-            if not is_paused:
-                await self.pause_generation(PauseGenerationReqInput(mode="in_place"))
-        elif obj.draft_only and obj.recovery and result.success:
-            self._clear_tensor_update_unhealthy()
 
         unhealthy, unhealthy_reason = self._tensor_update_health()
         result.unhealthy = unhealthy
