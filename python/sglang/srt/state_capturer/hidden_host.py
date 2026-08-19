@@ -1,39 +1,22 @@
-"""Host-side staging ring, sidecar, and finalize worker for hidden-state capture.
+"""Host-side capture pipeline: staging rings, sidecar, finalize worker.
 
 Data path::
 
     prefill forward -> async D2H of newly computed rows into pinned slots
     verify forward  -> GPU pack of committed rows -> two-phase header/payload D2H
         -> HiddenFinalizeWorker (global-seq event gate; sole sidecar writer)
-        -> HiddenHostSidecar    (bounded sparse pageable payload cache)
-        -> export thread        (legacy whole-sample gather, or immutable
-                                 segment reuse plus direct suffix gather)
+        -> HiddenHostSidecar    (bounded sparse payload cache)
+        -> export thread        (segment reuse plus direct suffix gather)
 
-Concurrency contract
---------------------
-Four threads touch this module: the scheduler thread (staging enqueue, finish
-snapshots), the compact-verify payload launcher, one finalize thread (the
-*sole writer* of the sidecar payload / generation / token arrays), and one
-export thread (reader). V7's sidecar mutex covers only logical-to-physical
-metadata snapshots and reader pins. Hidden-row expansion/copy runs outside
-the lock; a pinned physical row is immutable and a colliding writer uses COW
-or fails closed immediately. That pin/COW fence — not an unfenced seqlock — is
-load-bearing on weakly-ordered hosts (ARM: GH200/GB200). Generation counters
-remain for *identity* (ABA) validation, not for torn-read protection.
+Threads: scheduler (staging enqueue, finish snapshots), the compact-verify
+payload launcher, one finalize thread (sole sidecar writer), one export
+thread (reader). Concurrency and identity rules live on the classes that
+own them: ``HiddenHostSidecar`` (pin/COW fence, generation identity),
+``HiddenStagingRing`` (event-gated FIFO), ``HiddenFinalizeWorker`` (global
+sequence order). Package glossary: ``state_capturer/__init__.py``.
 
-Identity model: sidecar rows are keyed by KV token-slot index (same numbering
-as the KV cache). Requests hold their slots until ``release_kv_cache`` (called
-*after* the finish hook), and warm-prefix slots are protected by radix
-``lock_ref`` while the request is alive, so the race window is only
-(a) rows still in flight in the staging ring and (b) slot reuse after finish.
-Own rows are validated against the exact generation recorded at finalize time;
-legacy warm-prefix rows (written by another request) are validated by token-id
-match plus an even, unchanged generation across the payload read. That legacy
-check is probabilistic if the same token rewrites a slot. Prefix V1 does not
-use it to rebuild a page-internal branch: it reads the warm boundary from an
-already published immutable Mooncake segment and gathers only exact-generation
-own suffix rows. Every inconsistency fails closed to a whole-sample capture
-miss; capture never backpressures or corrupts serving.
+Every inconsistency fails closed to a whole-sample capture miss; capture
+never backpressures or corrupts serving.
 """
 
 from __future__ import annotations
@@ -119,10 +102,11 @@ class HiddenCaptureStats:
         self.export_barrier_wait_ns_ct = 0
         self.export_gather_busy_ns_ct = 0
         self.sink_put_busy_ns_ct = 0
-        # V7 critical-path counters are deliberately disjoint. For every
-        # export job their components add up to export_critical_wall_ns_ct;
-        # async gather/put overlap is its own bucket instead of being counted
-        # twice as it was by the V6 busy counters above.
+        # Critical-path counters are deliberately disjoint: for every export
+        # job their components add up to export_critical_wall_ns_ct, with
+        # async gather/put overlap in its own bucket (the legacy busy
+        # counters above double-count overlap; kept for cross-version
+        # comparison, removal tracked in PR #6).
         self.export_critical_jobs_ct = 0
         self.export_critical_wall_ns_ct = 0
         self.export_critical_queue_ns_ct = 0
@@ -195,6 +179,7 @@ class HiddenCaptureStats:
         self.prefill_stage_full_miss_ct = 0
         self.verify_stage_full_miss_ct = 0
         self.attach_mismatch_miss_ct = 0
+        self.aux_not_fresh_miss_ct = 0
         self.prefix_invalid_miss_ct = 0
         self.export_queue_full_miss_ct = 0
         self.export_timeout_miss_ct = 0
@@ -261,7 +246,7 @@ class HiddenCaptureStats:
             setattr(self, max_name, max(getattr(self, max_name), duration_ns))
 
     def record_export_critical_path(self, components: Dict[str, int]) -> None:
-        """Accumulate one already-disjoint V7 exporter attribution.
+        """Accumulate one already-disjoint exporter critical-path attribution.
 
         Attribution is observational and must never fail an export. The trace
         normally closes exactly; defensively reconcile malformed/missing
@@ -580,10 +565,10 @@ class _DeviceTwin(msgspec.Struct):
     """Capture-owned HBM buffers for one verify step's strided window.
 
     The worker packs the (graph/persistent) verify outputs into a twin on the
-    forward stream — same-stream ordering IS the overwrite fence required by
-    the capture plan's invariant #6: step t+1's replay queues behind the pack,
-    so the persistent source can't be rewritten under the copy, and the
-    forward stream never waits on D2H (which reads the twin, not the source).
+    forward stream — same-stream ordering IS the overwrite fence: step t+1's
+    replay queues behind the pack, so the persistent source can't be
+    rewritten under the copy, and the forward stream never waits on D2H
+    (which reads the twin, not the source).
     """
 
     index: int
@@ -709,7 +694,7 @@ class DeviceTwinPool:
             return self._in_use
 
 
-class _StagingSeqCounter:
+class StagingSeqCounter:
     """Monotonic enqueue sequence shared across staging rings.
 
     Prefill and verify stage through separate rings (capacity isolation), but
@@ -753,7 +738,7 @@ class HiddenStagingRing:
         dtype: torch.dtype,
         pin_memory: bool = True,
         use_cuda_events: bool = True,
-        seq_counter: Optional[_StagingSeqCounter] = None,
+        seq_counter: Optional[StagingSeqCounter] = None,
         stats: Optional[HiddenCaptureStats] = None,
         stats_prefix: str = "prefill",
         max_verify_reqs: int = 0,
@@ -762,7 +747,7 @@ class HiddenStagingRing:
         self._lock = threading.Lock()
         self._free: deque[_StagingSlot] = deque()
         self._inflight: deque[_StagingSlot] = deque()
-        self._seq = seq_counter if seq_counter is not None else _StagingSeqCounter()
+        self._seq = seq_counter if seq_counter is not None else StagingSeqCounter()
         self._stats = stats
         self._stats_prefix = stats_prefix
         self.num_slots = num_slots
@@ -1203,10 +1188,9 @@ class SidecarCapacityError(RuntimeError):
 class HiddenHostSidecar:
     """Capacity-bounded sparse payload cache keyed by logical KV slot.
 
-    V6 allocated one hidden payload row for every KV-pool slot and held the
-    global mutex while ``index_select`` copied tens of GiB. V7 keeps the small
-    generation/token identity maps at KV-pool cardinality, but stores payloads
-    in a compact physical arena. The mutex protects only logical->physical
+    Generation/token identity maps are kept at KV-pool cardinality (small),
+    but payloads live in a compact physical arena of bounded token budget —
+    never one row per KV slot. The mutex protects only logical->physical
     metadata and reader pins:
 
     * a reader validates and pins physical rows under the mutex, copies hidden
@@ -1220,8 +1204,19 @@ class HiddenHostSidecar:
       whole-slot capture miss, never serving backpressure.
 
     Pinned physical rows are immutable, which is the synchronization fence
-    required on weakly ordered hosts. ``slot_gen`` remains the ABA identity
-    generation (even settled, odd in-place write, zero never written).
+    required on weakly ordered hosts (ARM: GH200/GB200). ``slot_gen`` is the
+    ABA identity generation (even settled, odd in-place write window, zero
+    never written) — it validates identity, it is not torn-read protection.
+
+    Identity model: rows are keyed by KV token-slot index. Requests hold
+    their slots until ``release_kv_cache`` (after the finish hook) and
+    warm-prefix slots are radix-locked while alive, so the race window is
+    only in-flight staging rows and slot reuse after finish. Own rows are
+    validated against the exact generation recorded at finalize; warm rows
+    written by another request are validated by token-id match plus an even,
+    unchanged generation across the read (probabilistic if the same token
+    rewrites a slot — the prefix protocol therefore reads warm boundaries
+    from already-published immutable segments instead).
     """
 
     def __init__(
@@ -1364,9 +1359,9 @@ class HiddenHostSidecar:
                 if evicted_slot is not None:
                     evicted_count += 1
 
-            # One tensor gather replaces a Python tensor-scalar conversion per
-            # row.  At 300k+ rows/run those conversions were the largest V7
-            # finalizer GIL regression in the nsys trace.
+            # One tensor gather replaces a per-row Python tensor-scalar
+            # conversion — per-row conversions dominate finalizer GIL time at
+            # scale (measurements: PR #3).
             old_gens = self.slot_gen[slots].tolist()
             new_gens = []
             in_place_slots = []

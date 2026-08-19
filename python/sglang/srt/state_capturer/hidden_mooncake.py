@@ -1,56 +1,31 @@
-"""Mooncake sink for hidden-state capture (bypass capture -> transit store).
+"""Mooncake sink: publish captured samples as immutable prefix segments.
 
-Prefix mode (the SGLang default) publishes immutable whole segments plus an
-ordered per-sample view::
+Key layout (all tensor payloads are raw bytes; shape/dtype in the meta)::
 
     {store_id}/_segments/{writer_epoch}/{segment_id}/aux
     {store_id}/_segments/{writer_epoch}/{segment_id}/last_hidden
     {store_id}/_segments/{writer_epoch}/{segment_id}/meta
     {store_id}/_samples/{sample_id}/input_ids
-    {store_id}/_samples/{sample_id}/meta
-    {store_id}/_seq/{dp_rank}/{n}          bare sample_id
-
-The compatibility whole-sample mode used for controlled A/B runs keeps the
-legacy layout::
-
-    {store_id}/{sample_id}/g0/aux          raw bf16 bytes [T, K*H]
-    {store_id}/{sample_id}/g0/last_hidden  raw bf16 bytes [T, H]
-    {store_id}/{sample_id}/g0/input_ids    raw int64 bytes [T]
-    {store_id}/{sample_id}/g0/meta         JSON: shapes/dtype/rid/loss_mask note
-    {store_id}/_seq/{dp_rank}/{n}          bare sample_id (manifest, see below)
+    {store_id}/_samples/{sample_id}/meta   (written LAST: marks completeness)
+    {store_id}/_seq/{dp_rank}/{n}          bare sample_id (manifest)
     {store_id}/_fingerprint                JSON: model/aux-layer/norm contract
 
-Discovery: Mooncake is a flat KV store (no list/scan), so an out-of-band
-consumer needs a tailable manifest. After a sample's meta lands, the sink
-appends one manifest entry at a per-writer monotonically increasing sequence
-number (per-writer streams because the store is first-write-wins: a shared
-counter across DP replicas would silently swallow one replica's entries).
-The consumer tails ``_seq/{w}/{n}`` per writer; a missing ``n`` with ``n+1``
-present means the entry was evicted or its put failed — count and skip (gap
-detection). Manifest entries are hard-pinned when the binding supports it:
-an evicted 50MB payload is one missed sample, an evicted few-byte manifest
-entry silently orphans it, and pinned entries are tiny and bounded. On
-restart the sink probes for the stream's tail (exponential + binary search
-over ``is_exist``) and resumes after it; first-write-wins makes overwriting
-an existing sequence number impossible by construction.
+Discovery: Mooncake is a flat KV store (no list/scan), so consumers tail the
+per-writer manifest stream ``_seq/{w}/{n}``. Per-writer numbering because the
+store is first-write-wins: a shared counter across DP replicas would swallow
+entries. A missing ``n`` with ``n+1`` present means eviction or a failed put
+— count and skip. Manifest entries are hard-pinned where supported (a lost
+few-byte entry silently orphans a sample; pinned entries are tiny and
+bounded). On restart the sink searches for the stream tail and resumes after
+it; first-write-wins makes overwriting impossible by construction.
 
-Whole-sample keys match SpecForge's ``MooncakeFeatureStore._tkey`` with a
-constant generation. Prefix keys intentionally require the SpecLoop segmented
-read adapter; SpecForge and Mooncake themselves remain unchanged. Tensor
-payloads are raw bytes and shape/dtype travel in the corresponding meta.
+Payload lifecycle: payloads are NOT pinned. The trainer may lag or be
+offline, and pinning would fill the store until every put fails; an evicted
+sample is a capture-miss-equivalent (miss-over-backpressure). Revisit when
+the trainer is in the loop.
 
-Lifecycle: no hard pin (deliberate deviation from the v4 spec-capture patch
-contract, which assumed an in-loop trainer releasing consumed samples).
-Under bypass capture the trainer may lag or be offline; pinned samples would
-accumulate until the store rejects every new put. Payload objects remain
-unpinned and are evicted by the master's lease/watermark policy — an evicted
-sample is a capture-miss-equivalent, consistent with the pipeline's
-miss-over-backpressure semantics. Revisit pinning when the trainer is in the
-loop.
-
-Transport arenas are registered once at startup: whole-sample mode uses one
-sample-sized arena; prefix mode uses a small input-id arena, one boundary-read
-arena, and a bounded set of segment lanes. Registration is never per sample.
+Transport arenas (input-id staging, boundary read, segment lanes) are
+registered once at startup — never per sample.
 """
 
 from __future__ import annotations
