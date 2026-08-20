@@ -474,9 +474,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             final_pos=final_pos,
         )
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
-        # Hidden-state capture (state_capturer/hidden_states.py) already took
-        # its own references in model_runner's forward hook; this None only
-        # drops this holder's reference. Keep the hook ordering if refactoring.
+        # Ordering contract with hidden capture: model_runner's forward hook
+        # took its references BEFORE this point; this None only drops this
+        # holder's reference. Do not move it ahead of the forward hook when
+        # refactoring — capture would silently lose every prefill row.
         logits_output.hidden_states = None
 
         batch_output.next_draft_input = make_next_draft_input(
@@ -748,6 +749,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                 ),
                 verify_lens=(layout.verify_lens if layout is not None else None),
             )
+        # Ordering contract with hidden capture: capture_verify_window above
+        # must consume logits_output.hidden_states BEFORE these references
+        # are dropped. Moving the None assignments above the capture call
+        # silently loses every verify row (coverage drop with no local
+        # error). The ordering is locked by
+        # test_verify_capture_runs_before_hidden_refs_drop.
         logits_output.hidden_states = None
         logits_output.last_hidden_states = None
 

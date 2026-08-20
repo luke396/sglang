@@ -8,8 +8,8 @@ host-side capture pipeline (see ``hidden_host.py`` / ``hidden_sink.py``):
   hidden states ``[T, H]`` plus row->request attribution. No copies.
 - ``capture_verify_window`` (DSpark worker, forward stream, post-acceptance):
   pack one verify step's strided window into a capture-owned device twin.
-  Same-stream ordering is the CUDA-graph overwrite fence (invariant #6 of the
-  capture plan): the next replay queues behind the pack.
+  The pack runs on the forward stream, so the next graph replay queues
+  behind it — same-stream ordering IS the overwrite fence.
 - ``HiddenCaptureOutput.stage`` / ``HiddenVerifyCaptureOutput.stage``
   (scheduler, copy stream): async D2H into the pinned staging ring on a
   dedicated capture stream.
@@ -29,10 +29,11 @@ import contextlib
 import functools
 import hashlib
 import logging
-import math
+import random
 import re
 import threading
 import time
+import weakref
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import msgspec
@@ -52,7 +53,7 @@ from sglang.srt.state_capturer.hidden_host import (
     HiddenHostSidecar,
     HiddenStagingRing,
     HiddenVerifyD2HLauncher,
-    _StagingSeqCounter,
+    StagingSeqCounter,
 )
 from sglang.srt.state_capturer.hidden_sink import (
     HiddenExportJob,
@@ -76,15 +77,11 @@ logger = logging.getLogger(__name__)
 _SAFE_RID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
 # HBM token-slot budget for the verify twin pool when the geometry is not
-# pinned via env vars: slots = budget / verify_window_tokens (min 2). At
-# 16384 total slots and Qwen3-8B widths (K=5 aux + last, bf16) is ~800MB.
-# Warm/high-concurrency profiling exhausted the former 4096-token (8x512)
-# pool even after ready twins were reaped independently of sidecar finalize.
-# 8192 (16x512) covered that burst, but long-chunked prefill (16K inputs)
-# queues large staging D2H ahead of twin D2H on the copy path, delaying twin
-# recycling: the V6vsV7 formal matrix measured 13/16 in use — over the 0.80
-# degrade watermark with the pool never actually empty. 32x512 keeps that
-# measured burst under 0.45 occupancy.
+# pinned via env vars: slots = budget / verify_window_tokens (min 2). Must
+# cover the worst measured in-flight burst with margin below the degrade
+# watermark: large prefill D2H can delay twin recycling, so peak occupancy
+# exceeds steady state. 16384 tokens = 32 slots at a 512-token window
+# (~800MB at Qwen3-8B widths). Sizing measurements: PR #3/#6.
 _VERIFY_TWIN_BUDGET_TOKENS = 16384
 
 # Pinned-host token-slot budget for the staging ring when its geometry is not
@@ -93,12 +90,10 @@ _VERIFY_TWIN_BUDGET_TOKENS = 16384
 _STAGING_RING_BUDGET_TOKENS = 32768
 
 # Pinned-host token-slot budget for the verify staging ring (slot size = the
-# verify window). Verify shares no slots with prefill: a prefill slot's
-# finalize memcpy is hundreds of MB (tens of ms), and while it drains, decode
-# steps keep producing verify windows — in a shared ring a transient full
-# state dropped an ENTIRE verify batch (measured: 2 stage_full events lost
-# 75/300 samples at saturation). 16384 tokens = 32 slots at a 512-token
-# window (~0.8GB pinned), depth enough to absorb any prefill-finalize stall.
+# verify window). Verify must not share slots with prefill: a prefill
+# finalize memcpy takes tens of ms, and a shared ring going transiently full
+# during that drain drops whole verify batches. Depth must absorb a full
+# prefill-finalize stall. Sizing measurements: PR #3.
 _VERIFY_STAGING_BUDGET_TOKENS = 16384
 
 
@@ -137,27 +132,94 @@ def _resolve_staging_slot_tokens(*, server_args: ServerArgs) -> int:
 def _resolve_sidecar_capacity_tokens(
     *,
     num_tokens: int,
-    sample_rate: float,
     staging_slot_tokens: int,
     verify_window_tokens: int,
 ) -> int:
-    """V7 compact sidecar capacity, sized by sampling/in-flight volume.
+    """Compact sidecar capacity in tokens.
 
-    The full-rate token budget scales linearly with deterministic request
-    sampling. A floor keeps one maximum export or staging/verify window
+    Sized for full-rate capture (inside a sampling window every request is
+    captured). A floor keeps one maximum export or staging/verify window
     representable; saturation beyond the budget is an attributable miss and
     pressure-degraded window, never a reason to allocate the whole KV pool.
     """
-    scaled_budget = math.ceil(
-        envs.SGLANG_HIDDEN_CAPTURE_SIDECAR_TOKEN_BUDGET.get() * sample_rate
-    )
+    budget = envs.SGLANG_HIDDEN_CAPTURE_SIDECAR_TOKEN_BUDGET.get()
     floor = max(
         1,
         envs.SGLANG_HIDDEN_CAPTURE_MAX_EXPORT_TOKENS.get(),
         staging_slot_tokens,
         verify_window_tokens,
     )
-    return min(num_tokens, max(floor, scaled_budget))
+    return min(num_tokens, max(floor, budget))
+
+
+class _WindowSampler:
+    """Time-window request sampling: capture everything inside an open
+    window of ``window_s`` seconds once per ``period_s``-second cycle.
+
+    The in/out decision for a request is made the first time any gate sees
+    its rid and memoized for the request's whole lifetime, so a request never
+    straddles a window edge with half its rows captured. Each cycle draws a
+    fresh uniform window offset (unless ``phase_s`` pins it), so no
+    time-of-cycle is systematically over- or under-sampled.
+
+    Called from the scheduler thread only (all three gates run there); the
+    memo needs no lock. ``window_s == period_s`` captures every request.
+    """
+
+    def __init__(
+        self,
+        *,
+        window_s: float,
+        period_s: float,
+        phase_s: Optional[float] = None,
+        clock=time.monotonic,
+        rng=None,
+    ) -> None:
+        self.window_s = float(window_s)
+        self.period_s = float(period_s)
+        self._fixed_phase_s = None if phase_s is None else float(phase_s)
+        self._clock = clock
+        self._rng = rng if rng is not None else random.Random()
+        self._epoch_s = self._clock()
+        self._cycle_index = -1
+        self._cycle_offset_s = 0.0
+        self._decisions: Dict[str, bool] = {}
+
+    def _offset_for_cycle(self) -> float:
+        slack = self.period_s - self.window_s
+        if slack <= 0.0:
+            return 0.0
+        if self._fixed_phase_s is not None:
+            return min(self._fixed_phase_s, slack)
+        return self._rng.uniform(0.0, slack)
+
+    def window_open(self) -> bool:
+        elapsed = self._clock() - self._epoch_s
+        cycle = int(elapsed // self.period_s)
+        if cycle != self._cycle_index:
+            self._cycle_index = cycle
+            self._cycle_offset_s = self._offset_for_cycle()
+        in_cycle = elapsed - cycle * self.period_s
+        return self._cycle_offset_s <= in_cycle < self._cycle_offset_s + self.window_s
+
+    def sampled(self, rid: str) -> bool:
+        decision = self._decisions.get(rid)
+        if decision is None:
+            decision = self.window_open()
+            self._decisions[rid] = decision
+        return decision
+
+    def forget(self, rid: str) -> None:
+        self._decisions.pop(rid, None)
+
+    def snapshot(self) -> Dict[str, Any]:
+        return {
+            "window_open": self.window_open(),
+            "window_s": self.window_s,
+            "period_s": self.period_s,
+            "cycle_offset_s": self._cycle_offset_s,
+            "pending_decisions": len(self._decisions),
+        }
 
 
 def _serving_span(name: str):
@@ -256,11 +318,12 @@ class HiddenStatesCapturer:
         if sink_kind not in ("file", "mooncake"):
             _disabled(f"unknown SGLANG_HIDDEN_CAPTURE_SINK={sink_kind!r}")
             return None
-        sample_rate = envs.SGLANG_HIDDEN_CAPTURE_SAMPLE_RATE.get()
-        if not 0.0 < sample_rate <= 1.0:
+        sample_window_s = envs.SGLANG_HIDDEN_CAPTURE_WINDOW_S.get()
+        sample_period_s = envs.SGLANG_HIDDEN_CAPTURE_PERIOD_S.get()
+        if not 0.0 < sample_window_s <= sample_period_s:
             _disabled(
-                "SGLANG_HIDDEN_CAPTURE_SAMPLE_RATE must be in (0, 1], got "
-                f"{sample_rate}"
+                "sampling window requires 0 < WINDOW_S <= PERIOD_S, got "
+                f"window={sample_window_s}, period={sample_period_s}"
             )
             return None
         pressure_high = envs.SGLANG_HIDDEN_CAPTURE_DEGRADE_HIGH_WATERMARK.get()
@@ -317,7 +380,7 @@ class HiddenStatesCapturer:
         if getattr(server_args, "disable_cuda_graph", False):
             logger.warning(
                 "hidden state capture with CUDA graph disabled is unsupported/"
-                "experimental in V7; production capture must use graph-on"
+                "experimental; production capture must use graph-on"
             )
 
         verify_window_tokens = _resolve_verify_window_tokens(
@@ -326,7 +389,6 @@ class HiddenStatesCapturer:
         staging_slot_tokens = _resolve_staging_slot_tokens(server_args=server_args)
         sidecar_capacity_tokens = _resolve_sidecar_capacity_tokens(
             num_tokens=num_tokens,
-            sample_rate=sample_rate,
             staging_slot_tokens=staging_slot_tokens,
             verify_window_tokens=verify_window_tokens,
         )
@@ -395,7 +457,14 @@ class HiddenStatesCapturer:
         self.aux_width = num_aux_layers * hidden_size
         self.last_width = hidden_size
         self.dtype = model_config.dtype
-        self.sample_rate = envs.SGLANG_HIDDEN_CAPTURE_SAMPLE_RATE.get()
+        self.sampler = _WindowSampler(
+            window_s=envs.SGLANG_HIDDEN_CAPTURE_WINDOW_S.get(),
+            period_s=envs.SGLANG_HIDDEN_CAPTURE_PERIOD_S.get(),
+            phase_s=envs.SGLANG_HIDDEN_CAPTURE_PHASE_S.get(),
+        )
+        # Contract check state: weakref to the previous graph forward's aux
+        # (aux must be a fresh tensor every forward; see on_forward_end).
+        self._last_graph_aux: Optional[weakref.ref] = None
         self._accepting = threading.Event()
         self._accepting.set()
         self._close_lock = threading.Lock()
@@ -447,7 +516,7 @@ class HiddenStatesCapturer:
         # Prefill and verify rings share one enqueue-sequence counter (and
         # one capture stream), so the export barrier stays a single number
         # and the finalize thread can merge the rings in enqueue order.
-        self.staging_seq = _StagingSeqCounter()
+        self.staging_seq = StagingSeqCounter()
         self.ring = HiddenStagingRing(
             num_slots=ring_slots,
             slot_tokens=ring_slot_tokens,
@@ -606,11 +675,12 @@ class HiddenStatesCapturer:
         self.export_worker.start()
         logger.info(
             "hidden state capture enabled: sink=%s (dir=%s), aux_layer_ids=%s, "
-            "sample_rate=%.3f",
+            "sampling window=%.0fs/%.0fs",
             sink_kind,
             sink_dir,
             aux_layer_ids,
-            self.sample_rate,
+            self.sampler.window_s,
+            self.sampler.period_s,
         )
 
     def _build_sink(self, sink_kind: str, sink_dir: Optional[str], dp_rank: int):
@@ -781,6 +851,7 @@ class HiddenStatesCapturer:
             "critical_path": self.stats.critical_path_snapshot(),
             "serving_spans": self.stats.serving_span_snapshot(),
             "degradation": self.pressure_controller.snapshot(),
+            "sampling": self.sampler.snapshot(),
             "state": {
                 "accepting": self._accepting.is_set(),
                 "closed": self._closed,
@@ -896,6 +967,25 @@ class HiddenStatesCapturer:
             # next replay — clone it on the forward stream: same-stream
             # ordering is the overwrite fence (the next replay queues behind
             # the clone), identical in principle to the verify device twin.
+            #
+            # Runtime contract check: the clone asymmetry above is only
+            # correct while aux really is a fresh allocation per forward. If
+            # the model side ever returns a persistent buffer, a replay would
+            # overwrite rows we still reference — fail closed with
+            # attribution instead of exporting corrupted training data.
+            # A bare pointer compare is NOT enough: the caching allocator
+            # legitimately reuses a freed aux's address for the next
+            # forward's fresh tensor. Only "previous aux still alive at the
+            # same address" proves aliasing (live allocations never share an
+            # address with new ones), so the check holds a weakref.
+            prev_aux = (
+                self._last_graph_aux() if self._last_graph_aux is not None else None
+            )
+            if prev_aux is not None and prev_aux.data_ptr() == aux.data_ptr():
+                self.stats.bump("aux_not_fresh_miss_ct")
+                self.bookkeeper.mark_miss([rid for rid, _, _ in req_ranges])
+                return None
+            self._last_graph_aux = weakref.ref(aux)
             last = last.clone()
         return HiddenCaptureOutput(
             aux_hidden_states=aux,
@@ -930,8 +1020,8 @@ class HiddenStatesCapturer:
         step t+1's replay overwrites in place. The fence is same-stream
         ordering: this method packs the window into a capture-owned device
         twin ON THE CURRENT (forward) STREAM, so the next step's kernels queue
-        behind the pack — the plan's invariant #6 without stalling forward on
-        any D2H. The twin is then D2H'd off-stream by stage().
+        behind the pack, without stalling forward on any D2H. The twin is
+        then D2H'd off-stream by stage().
 
         The post-norm last hidden arrives strided on the dense verify path or
         compact (ragged) on the compact path. Committed-row mode reads the
@@ -1180,10 +1270,7 @@ class HiddenStatesCapturer:
     # ----------------------------------------------------------------- finish
 
     def _sampled(self, rid: str) -> bool:
-        if self.sample_rate >= 1.0:
-            return True
-        digest = hashlib.md5(rid.encode()).digest()
-        return int.from_bytes(digest[:8], "little") / 2**64 < self.sample_rate
+        return self.sampler.sampled(rid)
 
     @staticmethod
     def _sample_id_for(rid: str) -> str:
@@ -1302,9 +1389,11 @@ class HiddenStatesCapturer:
             if not self._accepting.is_set():
                 self.stats.bump("shutdown_admission_miss_ct")
                 self._settle_captured_rows(self.bookkeeper.pop(rid))
+                self.sampler.forget(rid)
                 continue
             if rid.startswith(HEALTH_CHECK_RID_PREFIX) or not self._sampled(rid):
                 self._settle_captured_rows(self.bookkeeper.pop(rid))
+                self.sampler.forget(rid)
                 continue
             if getattr(
                 self.sink, "prefix_enabled", False
@@ -1320,6 +1409,8 @@ class HiddenStatesCapturer:
             tokens = list(req.origin_input_ids) + list(req.output_ids_through_stop)
             prepared.append((req, prompt_len, num_rows, tokens))
 
+        for rid in cleanup_rids:
+            self.sampler.forget(rid)
         if cleanup_rids:
             global_barrier = self.ring.last_enqueued_seq
             for rid in cleanup_rids:
@@ -1337,6 +1428,7 @@ class HiddenStatesCapturer:
             global_barrier = self.ring.last_enqueued_seq
             for req, _prompt_len, _num_rows, _tokens in prepared:
                 self._submit_cleanup_job(req.rid, global_barrier)
+                self.sampler.forget(req.rid)
             return
         slot_ranges = [
             req_to_token_pool.req_to_token[req.req_pool_idx][:num_rows]
@@ -1360,6 +1452,7 @@ class HiddenStatesCapturer:
             global_barrier = self.ring.last_enqueued_seq
             for rid in rids:
                 self._submit_cleanup_job(rid, global_barrier)
+                self.sampler.forget(rid)
             return
         global_barrier = self.ring.last_enqueued_seq
         for (req, prompt_len, num_rows, tokens), slots in zip(prepared, snapshots):
@@ -1384,6 +1477,7 @@ class HiddenStatesCapturer:
                 prompt_len=prompt_len,
             )
             self.export_worker.submit(job)
+            self.sampler.forget(rid)
 
     @staticmethod
     def _prefix_context_supported(req: Req) -> bool:
@@ -1400,6 +1494,7 @@ class HiddenStatesCapturer:
         """Retract/abort: drop finalize records so a re-scheduled request's
         stale rows can't validate as its own."""
         self._settle_captured_rows(self.bookkeeper.invalidate(rid))
+        self.sampler.forget(rid)
 
 
 def get_global_hidden_capturer() -> Optional[HiddenStatesCapturer]:

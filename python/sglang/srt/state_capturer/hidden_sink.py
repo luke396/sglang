@@ -178,7 +178,7 @@ class HiddenExportJob(msgspec.Struct):
     # Rows [0, prompt_len) are prompt; the rest are verify-committed decode
     # rows. Recorded for downstream loss-mask reconstruction.
     prompt_len: int = 0
-    # Set by submit if the caller leaves it zero. It anchors the V7 critical
+    # Set by submit if the caller leaves it zero. It anchors the critical
     # path at finish-hook admission, including export-queue and barrier wait.
     enqueued_ns: int = 0
 

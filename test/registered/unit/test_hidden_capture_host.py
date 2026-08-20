@@ -141,9 +141,9 @@ class TestSplitRingFinalizeOrder(CustomTestCase):
 
     @staticmethod
     def _make_pair():
-        from sglang.srt.state_capturer.hidden_host import _StagingSeqCounter
+        from sglang.srt.state_capturer.hidden_host import StagingSeqCounter
 
-        seq = _StagingSeqCounter()
+        seq = StagingSeqCounter()
         prefill_ring = HiddenStagingRing(
             num_slots=2,
             slot_tokens=8,
@@ -2083,24 +2083,216 @@ class TestFileSink(CustomTestCase):
                 self.assertEqual(json.load(f)["model_path"], "a")
 
 
-class TestSamplingDeterminism(CustomTestCase):
-    def test_sampled_is_deterministic_and_rate_bounded(self):
+class TestWindowSampling(CustomTestCase):
+    """Time-window sampling: sticky per-rid decision, open/closed windows,
+    full capture when window == period, and memo cleanup."""
+
+    @staticmethod
+    def _sampler(window_s, period_s, phase_s=0.0, start=1000.0):
+        from sglang.srt.state_capturer.hidden_states import _WindowSampler
+
+        clock = SimpleNamespace(now=start)
+        sampler = _WindowSampler(
+            window_s=window_s,
+            period_s=period_s,
+            phase_s=phase_s,
+            clock=lambda: clock.now,
+        )
+        return sampler, clock
+
+    def test_decision_is_sticky_across_window_edge(self):
+        sampler, clock = self._sampler(window_s=10.0, period_s=100.0)
+        self.assertTrue(sampler.sampled("in-window"))
+        clock.now += 50.0  # window closed now
+        self.assertFalse(sampler.window_open())
+        # Sticky: the earlier decision survives the edge.
+        self.assertTrue(sampler.sampled("in-window"))
+        # A new rid seen outside the window is rejected — and stays rejected
+        # even after the next window opens.
+        self.assertFalse(sampler.sampled("out-of-window"))
+        clock.now += 51.0  # next cycle, window open again (phase 0)
+        self.assertTrue(sampler.window_open())
+        self.assertFalse(sampler.sampled("out-of-window"))
+
+    def test_full_capture_when_window_equals_period(self):
+        sampler, clock = self._sampler(window_s=100.0, period_s=100.0)
+        for step in range(7):
+            clock.now += 33.0
+            self.assertTrue(sampler.sampled(f"rid-{step}"))
+
+    def test_forget_releases_memo(self):
+        sampler, clock = self._sampler(window_s=10.0, period_s=100.0)
+        self.assertTrue(sampler.sampled("r1"))
+        self.assertEqual(sampler.snapshot()["pending_decisions"], 1)
+        sampler.forget("r1")
+        self.assertEqual(sampler.snapshot()["pending_decisions"], 0)
+        # Re-seen after forget outside the window: fresh (rejecting) decision.
+        clock.now += 50.0
+        self.assertFalse(sampler.sampled("r1"))
+
+    def test_fixed_phase_shifts_window(self):
+        sampler, clock = self._sampler(window_s=10.0, period_s=100.0, phase_s=40.0)
+        self.assertFalse(sampler.window_open())  # t=0 < offset 40
+        clock.now += 45.0
+        self.assertTrue(sampler.window_open())  # 40 <= 45 < 50
+        clock.now += 10.0
+        self.assertFalse(sampler.window_open())  # 55 >= 50
+
+
+class TestGraphAuxFreshContract(CustomTestCase):
+    """Runtime contract (PR #6 review): the graph-path clone asymmetry in
+    on_forward_end (clone last, not aux) is only correct while the model side
+    returns a FRESH aux tensor every forward. If aux ever becomes a
+    persistent buffer (same address two forwards in a row), the next replay
+    would overwrite rows we still reference — the capturer must fail closed
+    with attribution instead of exporting corrupted data."""
+
+    @staticmethod
+    def _capturer():
         from sglang.srt.state_capturer.hidden_states import HiddenStatesCapturer
 
-        capturer = HiddenStatesCapturer.__new__(HiddenStatesCapturer)
-        capturer.sample_rate = 0.5
-        rids = [f"rid-{i}" for i in range(2000)]
-        picks = [HiddenStatesCapturer._sampled(capturer, rid) for rid in rids]
-        # Deterministic across calls.
-        self.assertEqual(
-            picks, [HiddenStatesCapturer._sampled(capturer, rid) for rid in rids]
+        capturer = object.__new__(HiddenStatesCapturer)
+        capturer._accepting = threading.Event()
+        capturer._accepting.set()
+        capturer.stats = HiddenCaptureStats()
+        capturer.bookkeeper = HiddenCaptureBookkeeper()
+        capturer.sampler = SimpleNamespace(
+            sampled=lambda rid: True, forget=lambda rid: None
         )
-        rate = sum(picks) / len(picks)
-        self.assertAlmostEqual(rate, 0.5, delta=0.05)
+        capturer.pressure_controller = None  # _capture_allowed -> True
+        capturer._last_graph_aux = None
+        return capturer
 
-        capturer.sample_rate = 1.0
-        self.assertTrue(
-            all(HiddenStatesCapturer._sampled(capturer, r) for r in rids[:10])
+    @staticmethod
+    def _forward_batch(rids, extend_lens):
+        num_rows = sum(extend_lens)
+        mode = SimpleNamespace(
+            is_extend_or_draft_extend_or_mixed=lambda: True,
+            is_split_prefill=lambda: False,
+        )
+        return SimpleNamespace(
+            forward_mode=mode,
+            rids=rids,
+            extend_seq_lens_cpu=extend_lens,
+            out_cache_loc=torch.arange(num_rows, dtype=torch.int64),
+            input_ids=torch.zeros(num_rows, dtype=torch.int64),
+        )
+
+    def test_stale_aux_pointer_fails_closed_with_counter(self):
+        capturer = self._capturer()
+        aux = torch.zeros(2, AUX_WIDTH)
+        last = torch.zeros(2, LAST_WIDTH)
+        batch = self._forward_batch(["r1"], [2])
+        out1 = capturer.on_forward_end(
+            forward_batch=batch,
+            logits_output=SimpleNamespace(hidden_states=aux, last_hidden_states=last),
+            can_run_graph=True,
+        )
+        self.assertIsNotNone(out1)
+        self.assertEqual(capturer.stats.aux_not_fresh_miss_ct, 0)
+
+        # Same aux address on the next graph forward: reject and attribute.
+        batch2 = self._forward_batch(["r2"], [2])
+        out2 = capturer.on_forward_end(
+            forward_batch=batch2,
+            logits_output=SimpleNamespace(hidden_states=aux, last_hidden_states=last),
+            can_run_graph=True,
+        )
+        self.assertIsNone(out2)
+        self.assertEqual(capturer.stats.aux_not_fresh_miss_ct, 1)
+        self.assertTrue(capturer.bookkeeper.is_missed("r2"))
+
+        # A fresh aux recovers capture.
+        fresh_aux = torch.zeros(2, AUX_WIDTH)
+        batch3 = self._forward_batch(["r3"], [2])
+        out3 = capturer.on_forward_end(
+            forward_batch=batch3,
+            logits_output=SimpleNamespace(
+                hidden_states=fresh_aux, last_hidden_states=last
+            ),
+            can_run_graph=True,
+        )
+        self.assertIsNotNone(out3)
+
+    def test_allocator_address_reuse_is_not_rejected(self):
+        """Regression (measured in the profile run): the caching allocator
+        reuses a FREED aux's address for the next forward's fresh tensor. A
+        bare pointer compare misread that as a persistent buffer and dropped
+        real samples during warmup. Only "previous aux still alive at the
+        same address" proves aliasing."""
+        import weakref
+
+        capturer = self._capturer()
+        aux = torch.zeros(2, AUX_WIDTH)
+        last = torch.zeros(2, LAST_WIDTH)
+        out = capturer.on_forward_end(
+            forward_batch=self._forward_batch(["r1"], [2]),
+            logits_output=SimpleNamespace(hidden_states=aux, last_hidden_states=last),
+            can_run_graph=True,
+        )
+        self.assertIsNotNone(out)
+        # Simulate the previous aux being freed: its weakref goes dead, and a
+        # new fresh tensor may legitimately land on any address (including
+        # the old one). The check must pass.
+        stale_ptr = aux.data_ptr()
+        del out, aux
+        self.assertIsNone(capturer._last_graph_aux())
+        fresh = torch.zeros(2, AUX_WIDTH)
+        out2 = capturer.on_forward_end(
+            forward_batch=self._forward_batch(["r2"], [2]),
+            logits_output=SimpleNamespace(hidden_states=fresh, last_hidden_states=last),
+            can_run_graph=True,
+        )
+        self.assertIsNotNone(out2)
+        self.assertEqual(capturer.stats.aux_not_fresh_miss_ct, 0)
+        del stale_ptr, weakref  # silence unused warnings
+
+    def test_eager_path_allows_stable_aux_pointer(self):
+        # Without graph replay there is no overwrite hazard; a reused eager
+        # buffer must not be rejected.
+        capturer = self._capturer()
+        aux = torch.zeros(2, AUX_WIDTH)
+        last = torch.zeros(2, LAST_WIDTH)
+        for step in range(2):
+            out = capturer.on_forward_end(
+                forward_batch=self._forward_batch([f"r{step}"], [2]),
+                logits_output=SimpleNamespace(
+                    hidden_states=aux, last_hidden_states=last
+                ),
+                can_run_graph=False,
+            )
+            self.assertIsNotNone(out)
+        self.assertEqual(capturer.stats.aux_not_fresh_miss_ct, 0)
+
+
+class TestVerifyCaptureHookOrder(CustomTestCase):
+    """Ordering contract (PR #6 review): in the DSpark worker's verify step,
+    capture_verify_window must run BEFORE logits_output.hidden_states is set
+    to None. Breaking the order silently loses every verify row (coverage
+    drop with no local error), so this test locks the statement order in the
+    worker source itself."""
+
+    def test_verify_capture_runs_before_hidden_refs_drop(self):
+        import inspect
+
+        from sglang.srt.speculative.dspark_components import dspark_worker_v2
+
+        source = inspect.getsource(dspark_worker_v2)
+        capture_at = source.index("capture_verify_window(")
+        # The reference drop that follows the verify capture call.
+        drop_at = source.index("logits_output.hidden_states = None", capture_at)
+        self.assertLess(
+            capture_at,
+            drop_at,
+            "capture_verify_window must precede the hidden_states=None drop",
+        )
+        # The capture call must not be preceded (in the same verify step) by
+        # a hidden_states drop between the acceptance computation and it.
+        verify_at = source.rindex("def ", 0, capture_at)
+        self.assertNotIn(
+            "logits_output.hidden_states = None",
+            source[verify_at:capture_at],
+            "hidden_states reference dropped before capture_verify_window",
         )
 
 
@@ -2182,7 +2374,9 @@ class TestSnapshotKvSlots(CustomTestCase):
         capturer._accepting.set()
         capturer.stats = HiddenCaptureStats()
         capturer.bookkeeper = HiddenCaptureBookkeeper()
-        capturer.sample_rate = 1.0
+        capturer.sampler = SimpleNamespace(
+            sampled=lambda rid: True, forget=lambda rid: None
+        )
         capturer.sink = SimpleNamespace(prefix_enabled=False)
         capturer.snapshot_stream = None
         capturer._snapshot_buf = None
@@ -2240,7 +2434,9 @@ class TestSnapshotKvSlots(CustomTestCase):
         capturer._accepting.set()
         capturer.stats = HiddenCaptureStats()
         capturer.bookkeeper = HiddenCaptureBookkeeper()
-        capturer.sample_rate = 1.0
+        capturer.sampler = SimpleNamespace(
+            sampled=lambda rid: True, forget=lambda rid: None
+        )
         capturer.sink = SimpleNamespace(prefix_enabled=False)
         capturer.ring = SimpleNamespace(last_enqueued_seq=-1)
         jobs = []

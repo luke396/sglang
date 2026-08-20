@@ -981,10 +981,16 @@ class Envs:
     # Directory for the per-sample training-data file sink. Required: capture
     # is disabled at startup when unset.
     SGLANG_HIDDEN_CAPTURE_DIR = EnvStr(None)
-    # Deterministic request fraction captured/exported. V7 applies the same
-    # rid hash at forward/verify and finish, so unsampled rows never enter the
-    # compact sidecar (a mixed staging segment may still D2H as one unit).
-    SGLANG_HIDDEN_CAPTURE_SAMPLE_RATE = EnvFloat(1.0)
+    # Time-window sampling: capture every request that ARRIVES inside an open
+    # window of WINDOW_S seconds once per PERIOD_S-second cycle (sticky per
+    # request: the in/out decision is made once and reused for its whole
+    # lifetime). WINDOW_S == PERIOD_S captures everything. The window offset
+    # within each cycle is drawn uniformly at random unless PHASE_S pins it
+    # (multi-instance phase staggering). Requires 0 < WINDOW_S <= PERIOD_S;
+    # violations disable capture at startup.
+    SGLANG_HIDDEN_CAPTURE_WINDOW_S = EnvFloat(600.0)
+    SGLANG_HIDDEN_CAPTURE_PERIOD_S = EnvFloat(3600.0)
+    SGLANG_HIDDEN_CAPTURE_PHASE_S = EnvFloat(None)
     # Pinned staging ring geometry overrides. By default both adapt at
     # startup: slot size = one forward's staged-row bound
     # (chunked_prefill_size, or max_prefill_tokens when chunking is disabled,
@@ -1006,12 +1012,10 @@ class Envs:
     # Graceful scheduler shutdown budget for draining D2H/finalize/export and
     # joining capture workers before registered Mooncake buffers are released.
     SGLANG_HIDDEN_CAPTURE_SHUTDOWN_TIMEOUT_S = EnvFloat(30.0)
-    # Sparse sidecar payload budget at sample_rate=1. The actual compact-row
-    # capacity scales with SAMPLE_RATE and is floored so one maximum-size
-    # export / staging window always fits; it is capped by the KV pool. This
-    # replaces V6's one-hidden-row-per-KV-slot preallocation. 256K keeps the
-    # standard 48-request, 4.6K+512 warm workload below the 80% admission
-    # watermark (measured leased-row HWM: 142K); 128K degraded at 106K.
+    # Sidecar payload budget in tokens. Sized for full-rate capture (inside a
+    # sampling window every request is captured) and floored so one
+    # maximum-size export / staging window always fits; capped by the KV
+    # pool. Sizing evidence: PR #3/#6 review threads.
     SGLANG_HIDDEN_CAPTURE_SIDECAR_TOKEN_BUDGET = EnvInt(262144)
     # Upper bound on compact payload plus the small KV-cardinality identity
     # maps; exceeding it disables capture at startup.
