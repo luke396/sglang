@@ -52,8 +52,8 @@ from sglang.srt.state_capturer.hidden_host import (
     HiddenFinalizeWorker,
     HiddenHostSidecar,
     HiddenStagingRing,
-    HiddenVerifyD2HLauncher,
     StagingSeqCounter,
+    verify_blob_bytes,
 )
 from sglang.srt.state_capturer.hidden_sink import (
     HiddenExportJob,
@@ -475,12 +475,11 @@ class HiddenStatesCapturer:
         # Dedicated stream for capture D2H. The scheduler's copy stream is
         # FIFO: queueing capture's large copies there would make the NEXT
         # step's (tiny) result copies — and thus its copy_done — wait behind
-        # them, leaking capture cost into serving tail latency.
+        # them, leaking capture cost into serving tail latency. The scheduler
+        # thread is the ONLY submitter on this stream (PyTorch stream
+        # submission is thread-local), so event completion order on it equals
+        # enqueue order — the rings' ordered polling depends on this.
         self.capture_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
-        # PyTorch stream submission is thread-local. Serialize the scheduler's
-        # header/prefill submissions with the compact verify launch worker so
-        # host enqueue order on the shared capture stream is explicit.
-        self._capture_launch_lock = threading.Lock()
         # Finish-hook kv-slot snapshots: a dedicated stream + reusable pinned
         # buffer. A plain .cpu() on the scheduler thread is a synchronous
         # PAGEABLE D2H that serializes behind whatever the copy engine is
@@ -589,20 +588,6 @@ class HiddenStatesCapturer:
             stats_prefix="verify",
             max_verify_reqs=512,
         )
-        row_bytes = (self.aux_width + self.last_width) * self.dtype.itemsize + 16
-        self.verify_launcher = (
-            HiddenVerifyD2HLauncher(
-                ring=self.verify_ring,
-                twin_pool=self.twin_pool,
-                bookkeeper=self.bookkeeper,
-                stats=self.stats,
-                capture_stream=self.capture_stream,
-                capture_launch_lock=self._capture_launch_lock,
-                row_bytes=row_bytes,
-            )
-            if self.twin_pool is not None
-            else None
-        )
         self.finalize_worker = HiddenFinalizeWorker(
             ring=self.ring,
             verify_ring=self.verify_ring,
@@ -669,8 +654,6 @@ class HiddenStatesCapturer:
         # Start an unavailable-Mooncake window during initialization rather
         # than waiting for the first request hook to notice it.
         self.pressure_controller.refresh(self._pressure_signals())
-        if self.verify_launcher is not None:
-            self.verify_launcher.start()
         self.finalize_worker.start()
         self.export_worker.start()
         logger.info(
@@ -726,22 +709,9 @@ class HiddenStatesCapturer:
 
             self._accepting.clear()
             self.export_worker.stop_admission()
-            if self.verify_launcher is not None:
-                self.verify_launcher.stop()
             self.finalize_worker.stop()
             self.export_worker.stop()
             deadline = time.monotonic() + max(0.0, timeout_s)
-
-            launcher_done = True
-            if self.verify_launcher is not None:
-                launcher_done = self.verify_launcher.join(
-                    max(0.0, deadline - time.monotonic())
-                )
-                if not launcher_done:
-                    self.stats.bump(
-                        "shutdown_verify_launcher_timeout_miss_ct",
-                        max(1, self.verify_launcher.pending_count),
-                    )
 
             finalize_done = self.finalize_worker.join(
                 max(0.0, deadline - time.monotonic())
@@ -759,7 +729,7 @@ class HiddenStatesCapturer:
                     max(1, self.export_worker.pending_count),
                 )
 
-            if launcher_done and finalize_done and export_done:
+            if finalize_done and export_done:
                 close_sink = getattr(self.sink, "close", None)
                 if callable(close_sink):
                     close_sink()
@@ -855,16 +825,6 @@ class HiddenStatesCapturer:
             "state": {
                 "accepting": self._accepting.is_set(),
                 "closed": self._closed,
-                "verify_launcher_pending": (
-                    self.verify_launcher.pending_count
-                    if self.verify_launcher is not None
-                    else 0
-                ),
-                "verify_launcher_active": (
-                    self.verify_launcher._active
-                    if self.verify_launcher is not None
-                    else 0
-                ),
                 "prefill_ring_inflight": self.ring.inflight_count,
                 "verify_ring_inflight": self.verify_ring.inflight_count,
                 "finalize_worker_active": self.finalize_worker._active,
@@ -872,11 +832,6 @@ class HiddenStatesCapturer:
                 "export_worker_active": self.export_worker._active,
                 "last_enqueued_seq": self.ring.last_enqueued_seq,
                 "last_finalized_seq": self.finalize_worker.last_finalized_seq,
-                "verify_launcher_alive": (
-                    _alive(self.verify_launcher)
-                    if self.verify_launcher is not None
-                    else False
-                ),
                 "finalize_worker_alive": _alive(self.finalize_worker),
                 "export_worker_alive": _alive(self.export_worker),
                 "bookkeeper": self.bookkeeper.state_snapshot(),
@@ -1089,6 +1044,7 @@ class HiddenStatesCapturer:
                 pack_committed_verify_rows_into,
             )
 
+            views = self.twin_pool.views(twin, bs=bs, stride=stride)
             pack_committed_verify_rows_into(
                 aux_strided=aux_strided,
                 last_strided=last_strided,
@@ -1099,13 +1055,12 @@ class HiddenStatesCapturer:
                 commit_lens=capture_commit_lens,
                 bs=bs,
                 stride=stride,
-                out_aux=twin.aux,
-                out_last=twin.last,
-                out_cache_loc=twin.cache_loc,
-                out_tokens=twin.tokens,
-                out_commit_lens=twin.commit_lens,
+                out_aux=views.aux,
+                out_last=views.last,
+                out_cache_loc=views.cache_loc,
+                out_tokens=views.tokens,
+                out_commit_lens=views.commit_lens,
                 out_commit_offsets=twin.commit_offsets,
-                out_total_rows=twin.total_rows,
                 out_verify_offsets=twin.verify_offsets,
             )
             twin.fence_event.record()
@@ -1159,30 +1114,36 @@ class HiddenStatesCapturer:
 
         num_rows = output.num_reqs * output.stride
         self.stats.bump("verify_candidate_rows_staged_ct", num_rows)
-        header_submitted_ns = time.monotonic_ns()
-        with self._capture_launch_lock:
-            if self.capture_stream is not None:
-                self.capture_stream.wait_event(output.twin.fence_event)
-                stream_ctx = torch.cuda.stream(self.capture_stream)
-            else:
-                stream_ctx = contextlib.nullcontext()
-            with stream_ctx:
-                slot.commit_lens[: output.num_reqs].copy_(
-                    output.twin.commit_lens[: output.num_reqs],
-                    non_blocking=True,
-                )
-                slot.total_rows.copy_(output.twin.total_rows, non_blocking=True)
-                slot.header_event.record()
-        ring_seq = self.verify_ring.reserve_verify_compact(
-            slot,
-            twin=output.twin,
-            rids=output.rids,
-            stride=output.stride,
-            num_reqs=output.num_reqs,
-            header_submitted_ns=header_submitted_ns,
-        )
+        if self.capture_stream is not None:
+            self.capture_stream.wait_event(output.twin.fence_event)
+            stream_ctx = torch.cuda.stream(self.capture_stream)
+        else:
+            stream_ctx = contextlib.nullcontext()
+        with stream_ctx:
+            ring_seq = self.verify_ring.enqueue_verify_compact(
+                slot,
+                twin=output.twin,
+                rids=output.rids,
+                stride=output.stride,
+                num_reqs=output.num_reqs,
+            )
         self.bookkeeper.record_enqueued(output.admitted_rids, ring_seq)
-        self.verify_launcher.submit(slot)
+        # Upper-bound transfer: the whole bs x stride window plus the
+        # commit_lens header moves in one copy (accepted cost; issue #10
+        # red line 4 — precise-length transfer is the retired two-phase
+        # design). rows_staged tracks copied rows; committed rows are
+        # counted at finalize from the arrived commit_lens.
+        self.stats.bump("rows_staged_ct", num_rows)
+        self.stats.bump(
+            "verify_d2h_bytes_ct",
+            verify_blob_bytes(
+                bs=output.num_reqs,
+                n_rows=num_rows,
+                aux_width=self.aux_width,
+                last_width=self.last_width,
+                dtype=self.dtype,
+            ),
+        )
 
     # ---------------------------------------------------------------- staging
 
@@ -1230,38 +1191,37 @@ class HiddenStatesCapturer:
             self.bookkeeper.mark_miss(affected_rids)
             return
 
-        with self._capture_launch_lock:
-            if self.capture_stream is not None:
-                self.capture_stream.wait_stream(torch.cuda.current_stream())
-                stream_ctx = torch.cuda.stream(self.capture_stream)
-            else:
-                stream_ctx = contextlib.nullcontext()
-            with stream_ctx:
-                staged_rows = 0
-                for seg, slot in zip(segment_indexes, slots):
-                    seg_start = seg * slot_tokens
-                    seg_end = min(seg_start + slot_tokens, num_rows)
-                    staged_rows += seg_end - seg_start
-                    seg_ranges = [
-                        (
-                            rid,
-                            max(r0, seg_start) - seg_start,
-                            min(r1, seg_end) - seg_start,
-                        )
-                        for rid, r0, r1 in output.req_ranges
-                        if r0 < seg_end and r1 > seg_start
-                    ]
-                    ring_seq = self.ring.enqueue_segment(
-                        slot,
-                        aux_rows=output.aux_hidden_states[seg_start:seg_end],
-                        last_rows=output.last_hidden_states[seg_start:seg_end],
-                        cache_locs=output.out_cache_loc[seg_start:seg_end],
-                        tokens=output.input_tokens[seg_start:seg_end],
-                        req_ranges=seg_ranges,
+        if self.capture_stream is not None:
+            self.capture_stream.wait_stream(torch.cuda.current_stream())
+            stream_ctx = torch.cuda.stream(self.capture_stream)
+        else:
+            stream_ctx = contextlib.nullcontext()
+        with stream_ctx:
+            staged_rows = 0
+            for seg, slot in zip(segment_indexes, slots):
+                seg_start = seg * slot_tokens
+                seg_end = min(seg_start + slot_tokens, num_rows)
+                staged_rows += seg_end - seg_start
+                seg_ranges = [
+                    (
+                        rid,
+                        max(r0, seg_start) - seg_start,
+                        min(r1, seg_end) - seg_start,
                     )
-                    self.bookkeeper.record_enqueued(
-                        [rid for rid, _, _ in seg_ranges], ring_seq
-                    )
+                    for rid, r0, r1 in output.req_ranges
+                    if r0 < seg_end and r1 > seg_start
+                ]
+                ring_seq = self.ring.enqueue_segment(
+                    slot,
+                    aux_rows=output.aux_hidden_states[seg_start:seg_end],
+                    last_rows=output.last_hidden_states[seg_start:seg_end],
+                    cache_locs=output.out_cache_loc[seg_start:seg_end],
+                    tokens=output.input_tokens[seg_start:seg_end],
+                    req_ranges=seg_ranges,
+                )
+                self.bookkeeper.record_enqueued(
+                    [rid for rid, _, _ in seg_ranges], ring_seq
+                )
         self.stats.bump("rows_staged_ct", staged_rows)
         self.stats.bump("prefill_rows_staged_ct", staged_rows)
         row_bytes = (self.aux_width + self.last_width) * self.dtype.itemsize + 16

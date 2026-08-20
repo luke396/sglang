@@ -3,8 +3,11 @@
 The verify producer owns fixed-capacity, capture-private device twins.  This
 module packs only request ``i``'s ``[0, commit_lens[i])`` rows into the
 contiguous prefix of such a twin without reading a device scalar on the host.
-The total row count stays in a one-element device tensor and is copied to a
-pinned header later by the two-phase D2H path.
+The host never reads a device total: the packed twin (commit_lens included)
+travels to pinned memory in one upper-bound-length D2H copy, and the finalize
+thread derives the committed row count by summing the pinned commit_lens.
+Output tensors may be strided views into a single contiguous blob; the
+kernels take explicit output row strides.
 
 There are two source layouts for the post-norm hidden state:
 
@@ -32,7 +35,6 @@ def _build_commit_offsets_kernel(
     bound_lens_ptr,
     out_lens_ptr,
     out_offsets_ptr,
-    total_rows_ptr,
     bs,
     stride,
     HAS_BOUND: tl.constexpr,
@@ -49,7 +51,6 @@ def _build_commit_offsets_kernel(
     inclusive = tl.cumsum(lens, axis=0)
     tl.store(out_lens_ptr + offs, lens, mask=mask)
     tl.store(out_offsets_ptr + offs, inclusive - lens, mask=mask)
-    tl.store(total_rows_ptr, tl.sum(lens, axis=0))
 
 
 @triton.jit
@@ -145,7 +146,6 @@ def _validate_pack_args(
     out_tokens: torch.Tensor,
     out_commit_lens: torch.Tensor,
     out_commit_offsets: torch.Tensor,
-    out_total_rows: torch.Tensor,
     out_verify_offsets: torch.Tensor,
 ) -> bool:
     if bs <= 0 or stride <= 0:
@@ -167,7 +167,6 @@ def _validate_pack_args(
         out_commit_lens.numel() < bs
         or out_commit_offsets.numel() < bs
         or out_verify_offsets.numel() < bs
-        or out_total_rows.numel() < 1
     ):
         raise ValueError("output header tensors do not cover bs requests")
     compact = last_strided is None
@@ -198,7 +197,6 @@ def _pack_committed_rows_cpu(
     out_tokens: torch.Tensor,
     out_commit_lens: torch.Tensor,
     out_commit_offsets: torch.Tensor,
-    out_total_rows: torch.Tensor,
     out_verify_offsets: torch.Tensor,
 ) -> None:
     compact = last_strided is None
@@ -213,8 +211,6 @@ def _pack_committed_rows_cpu(
     offsets = torch.cumsum(lens, dim=0) - lens
     out_commit_lens[:bs].copy_(lens.to(out_commit_lens.dtype))
     out_commit_offsets[:bs].copy_(offsets.to(out_commit_offsets.dtype))
-    total = int(lens.sum().item())
-    out_total_rows[0] = total
 
     dst = 0
     for req in range(bs):
@@ -250,7 +246,6 @@ def pack_committed_verify_rows_into(
     out_tokens: torch.Tensor,
     out_commit_lens: torch.Tensor,
     out_commit_offsets: torch.Tensor,
-    out_total_rows: torch.Tensor,
     out_verify_offsets: torch.Tensor,
 ) -> None:
     """Pack committed rows into preallocated output tensors.
@@ -274,7 +269,6 @@ def pack_committed_verify_rows_into(
         out_tokens=out_tokens,
         out_commit_lens=out_commit_lens,
         out_commit_offsets=out_commit_offsets,
-        out_total_rows=out_total_rows,
         out_verify_offsets=out_verify_offsets,
     )
     if not aux_strided.is_cuda:
@@ -294,8 +288,7 @@ def pack_committed_verify_rows_into(
             out_tokens=out_tokens,
             out_commit_lens=out_commit_lens,
             out_commit_offsets=out_commit_offsets,
-            out_total_rows=out_total_rows,
-            out_verify_offsets=out_verify_offsets,
+                out_verify_offsets=out_verify_offsets,
         )
         return
 
@@ -311,7 +304,6 @@ def pack_committed_verify_rows_into(
         out_tokens,
         out_commit_lens,
         out_commit_offsets,
-        out_total_rows,
         out_verify_offsets,
     )
     if any(t.device != device for t in tensors):
@@ -325,7 +317,6 @@ def pack_committed_verify_rows_into(
         verify_lens if compact else commit_lens,
         out_commit_lens,
         out_commit_offsets,
-        out_total_rows,
         bs,
         stride,
         HAS_BOUND=compact,
