@@ -99,7 +99,7 @@ def _sha256(path):
 
 def _server_command(args, port):
     return [
-        sys.executable,
+        args.server_python,
         "-m",
         "sglang.launch_server",
         "--model-path",
@@ -150,6 +150,11 @@ def _leg_env(args, arm, store_id):
                 # Full-rate capture: every arrival is inside the window.
                 "SGLANG_HIDDEN_CAPTURE_WINDOW_S": "3600",
                 "SGLANG_HIDDEN_CAPTURE_PERIOD_S": "3600",
+                # Long-prompt workloads must export, not sample_too_large-miss
+                # (default 16384 silently drops every 16-32k request, leaving
+                # the export stage unmeasured; the 2026-08-20 session hit this
+                # with 13/14 misses).
+                "SGLANG_HIDDEN_CAPTURE_MAX_EXPORT_TOKENS": "32768",
                 "MOONCAKE_MASTER": f"127.0.0.1:{args.master_port}",
                 "MOONCAKE_PROTOCOL": "tcp",
                 "MOONCAKE_GLOBAL_SEGMENT_SIZE": args.mooncake_segment_size,
@@ -301,7 +306,7 @@ def run_leg(args, matrix, arm, leg_dir):
     nsys = None
     server_log = open(os.path.join(leg_dir, "server.log"), "w")
     if arm == "on":
-        master_bin = matrix.MASTER_BIN
+        master_bin = args.master_bin or matrix.MASTER_BIN
         master = subprocess.Popen(
             [
                 master_bin,
@@ -512,10 +517,27 @@ def main():
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--port", type=int, default=21600)
     parser.add_argument("--master-port", type=int, default=50200)
-    parser.add_argument("--mooncake-segment-size", default="16gb")
+    parser.add_argument(
+        "--mooncake-segment-size",
+        default="64gb",
+        help="sized above one run's full export volume, or the store's "
+        "eviction watermark rejects puts mid-run and coverage measures the "
+        "bench store instead of the capture pipeline (40 x ~20k-token "
+        "samples x ~49KB/row is ~38GB)",
+    )
     parser.add_argument("--model-path", default="Qwen/Qwen3-8B")
     parser.add_argument("--draft-model-path",
                         default="deepseek-ai/dspark_qwen3_8b_block7")
+    parser.add_argument(
+        "--server-python",
+        default=sys.executable,
+        help="interpreter for the server process (a venv whose mooncake "
+        "version satisfies the capture sink; PYTHONPATH still points at "
+        "this repo)",
+    )
+    parser.add_argument("--master-bin",
+                        help="mooncake_master binary (default: alongside the "
+                        "benchmark-side mooncake package)")
     parser.add_argument("--out", help="leg artifact directory")
     parser.add_argument("--report", nargs=2, metavar=("ON_JSON", "OFF_JSON"),
                         help="paired bare-mode TTFT/ITL delta report")
