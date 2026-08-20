@@ -76,6 +76,16 @@ COPY_SIZE_BUCKETS = (
 )
 # OS names set via prctl by the capture workers (15-char comm limit).
 CAPTURE_WORKER_OS_NAMES = ("hcap-d2h-launch", "hcap-finalize")
+# Blocking waits: their duration is time spent waiting on the GPU, not host
+# CPU work, and it varies with workload timing — excluded from the host-cost
+# total (still listed in the per-API delta table).
+BLOCKING_WAIT_APIS = (
+    "cudaEventSynchronize",
+    "cudaStreamSynchronize",
+    "cudaDeviceSynchronize",
+    "cuStreamSynchronize",
+    "cuCtxSynchronize",
+)
 DTOH = 2  # ENUM_CUDA_MEMCPY_OPER: CUDA_MEMCPY_KIND_DTOH
 
 
@@ -435,8 +445,12 @@ def _print_delta(deltas, arm_a, arm_b, parity, normalizers_a, top_apis):
         )
     per_request = normalizers_a.get("per_request")
     if per_request:
-        host_ms = sum(row["ms_delta"] for row in deltas)
-        print(f"   host API time delta total: {host_ms:+.1f}ms "
+        host_ms = sum(
+            row["ms_delta"]
+            for row in deltas
+            if not row["api"].startswith(BLOCKING_WAIT_APIS)
+        )
+        print(f"   host API time delta total (excl. blocking waits): {host_ms:+.1f}ms "
               f"= {host_ms / per_request:+.2f}ms/request ({per_request} requests)")
     print("== capture worker threads (arm A) ==")
     for name, info in capture_worker_rows(arm_a).items():
