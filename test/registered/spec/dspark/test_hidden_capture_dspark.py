@@ -266,6 +266,8 @@ class TestHiddenCaptureDSpark(CustomTestCase):
             other_args=_dspark_server_args(),
             env={
                 **os.environ,
+                "SGLANG_HIDDEN_CAPTURE_WINDOW_S": "3600",
+                "SGLANG_HIDDEN_CAPTURE_PERIOD_S": "3600",
                 "SGLANG_RAGGED_VERIFY_MODE": "compact",
                 "SGLANG_HIDDEN_CAPTURE_DIR": cls.capture_dir,
             },
@@ -522,6 +524,8 @@ class TestHiddenCaptureGraphOnMooncake(CustomTestCase):
             other_args=_dspark_server_args(prefill_graph=True),
             env={
                 **os.environ,
+                "SGLANG_HIDDEN_CAPTURE_WINDOW_S": "3600",
+                "SGLANG_HIDDEN_CAPTURE_PERIOD_S": "3600",
                 "SGLANG_RAGGED_VERIFY_MODE": "compact",
                 "SGLANG_HIDDEN_CAPTURE_SINK": "mooncake",
                 "SGLANG_HIDDEN_CAPTURE_STORE_ID": cls.STORE_ID,
@@ -714,6 +718,8 @@ class TestHiddenCaptureNonCompactVerify(CustomTestCase):
             other_args=_dspark_server_args(),
             env={
                 **os.environ,
+                "SGLANG_HIDDEN_CAPTURE_WINDOW_S": "3600",
+                "SGLANG_HIDDEN_CAPTURE_PERIOD_S": "3600",
                 "SGLANG_RAGGED_VERIFY_MODE": "static",
                 "SGLANG_HIDDEN_CAPTURE_DIR": cls.capture_dir,
             },
@@ -781,6 +787,8 @@ class TestHiddenCaptureMissSemantics(CustomTestCase):
             other_args=_dspark_server_args(),
             env={
                 **os.environ,
+                "SGLANG_HIDDEN_CAPTURE_WINDOW_S": "3600",
+                "SGLANG_HIDDEN_CAPTURE_PERIOD_S": "3600",
                 "SGLANG_RAGGED_VERIFY_MODE": "compact",
                 "SGLANG_HIDDEN_CAPTURE_DIR": cls.capture_dir,
                 # 1 slot x 8 tokens cannot hold a 128-token chunk.
@@ -853,6 +861,8 @@ class TestHiddenCaptureDPReplicas(CustomTestCase):
             other_args=_dspark_server_args() + ["--dp", "2"],
             env={
                 **os.environ,
+                "SGLANG_HIDDEN_CAPTURE_WINDOW_S": "3600",
+                "SGLANG_HIDDEN_CAPTURE_PERIOD_S": "3600",
                 "SGLANG_RAGGED_VERIFY_MODE": "compact",
                 "SGLANG_HIDDEN_CAPTURE_SINK": "mooncake",
                 "SGLANG_HIDDEN_CAPTURE_STORE_ID": cls.STORE_ID,
