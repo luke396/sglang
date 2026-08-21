@@ -3,15 +3,18 @@
 Data path::
 
     prefill forward -> async D2H of newly computed rows into pinned slots
-    verify forward  -> GPU pack of committed rows -> two-phase header/payload D2H
+    verify forward  -> GPU pack of committed rows into a device twin blob
+        -> one upper-bound-length D2H of the whole blob (single copy/event)
         -> HiddenFinalizeWorker (global-seq event gate; sole sidecar writer)
         -> HiddenHostSidecar    (bounded sparse payload cache)
         -> export thread        (segment reuse plus direct suffix gather)
 
-Threads: scheduler (staging enqueue, finish snapshots), the compact-verify
-payload launcher, one finalize thread (sole sidecar writer), one export
-thread (reader). Concurrency and identity rules live on the classes that
-own them: ``HiddenHostSidecar`` (pin/COW fence, generation identity),
+Threads: scheduler (staging enqueue, finish snapshots), one finalize thread
+(sole sidecar writer), one export thread (reader). The scheduler is the ONLY
+submitter on the capture stream, so per-ring event completion order equals
+enqueue order — reap/finalize polling exploits this (first pending event ends
+the scan). Concurrency and identity rules live on the classes that own them:
+``HiddenHostSidecar`` (pin/COW fence, generation identity),
 ``HiddenStagingRing`` (event-gated FIFO), ``HiddenFinalizeWorker`` (global
 sequence order). Package glossary: ``state_capturer/__init__.py``.
 
@@ -21,7 +24,6 @@ never backpressures or corrupts serving.
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import threading
 import time
@@ -59,6 +61,76 @@ _STATS_LOG_INTERVAL_S = 30.0
 _BOOKKEEPING_TTL_S = 600.0
 
 
+def _align16(nbytes: int) -> int:
+    return (nbytes + 15) & ~15
+
+
+class _VerifyBlobViews(msgspec.Struct):
+    """Typed views into one verify step's contiguous byte blob."""
+
+    commit_lens: torch.Tensor  # [bs] int32
+    aux: torch.Tensor  # [n_rows, aux_width]
+    last: torch.Tensor  # [n_rows, last_width]
+    cache_loc: torch.Tensor  # [n_rows] int64
+    tokens: torch.Tensor  # [n_rows] int64
+    copy_bytes: int
+
+
+def verify_blob_bytes(
+    *, bs: int, n_rows: int, aux_width: int, last_width: int, dtype: torch.dtype
+) -> int:
+    """Byte length of the verify blob layout for one step's upper bound."""
+    return (
+        _align16(bs * torch.int32.itemsize)
+        + _align16(n_rows * aux_width * dtype.itemsize)
+        + _align16(n_rows * last_width * dtype.itemsize)
+        + _align16(n_rows * torch.int64.itemsize)
+        + _align16(n_rows * torch.int64.itemsize)
+    )
+
+
+def verify_blob_views(
+    blob: torch.Tensor,
+    *,
+    bs: int,
+    stride: int,
+    aux_width: int,
+    last_width: int,
+    dtype: torch.dtype,
+) -> _VerifyBlobViews:
+    """Carve one verify step's typed views out of a contiguous byte blob.
+
+    Layout (16-byte-aligned sections, sized by this step's host-known upper
+    bound ``n_rows = bs * stride``): commit_lens | aux | last | cache_loc |
+    tokens. The device twin and the pinned staging slot use the same layout,
+    so one length-bounded byte copy transfers every field — commit_lens is a
+    plain field of the block, with no separate copy, event, or ordering.
+    """
+    n_rows = bs * stride
+    offset = 0
+
+    def _take(numel: int, section_dtype: torch.dtype) -> torch.Tensor:
+        nonlocal offset
+        nbytes = numel * section_dtype.itemsize
+        view = blob[offset : offset + nbytes].view(section_dtype)
+        offset = _align16(offset + nbytes)
+        return view
+
+    commit_lens = _take(bs, torch.int32)
+    aux = _take(n_rows * aux_width, dtype).view(n_rows, aux_width)
+    last = _take(n_rows * last_width, dtype).view(n_rows, last_width)
+    cache_loc = _take(n_rows, torch.int64)
+    tokens = _take(n_rows, torch.int64)
+    return _VerifyBlobViews(
+        commit_lens=commit_lens,
+        aux=aux,
+        last=last,
+        cache_loc=cache_loc,
+        tokens=tokens,
+        copy_bytes=offset,
+    )
+
+
 class _NullEvent:
     """Event stand-in for CPU-only unit tests: enqueue copies are synchronous."""
 
@@ -77,21 +149,21 @@ class HiddenCaptureStats:
         self.rows_staged_ct = 0
         self.prefill_rows_staged_ct = 0
         self.verify_candidate_rows_staged_ct = 0
-        self.verify_payload_rows_staged_ct = 0
         self.prefill_d2h_bytes_ct = 0
         self.verify_d2h_bytes_ct = 0
         self.verify_pack_ns_ct = 0
-        self.verify_header_roundtrip_ns_ct = 0
-        self.verify_payload_launch_ns_ct = 0
-        self.verify_payload_d2h_ns_ct = 0
         self.verify_twin_hold_ns_ct = 0
-        self.verify_header_queue_high_water_ct = 0
         self.verify_twin_high_water_ct = 0
-        self.verify_launch_failed_miss_ct = 0
         self.slots_finalized_ct = 0
         self.prefill_rows_finalized_ct = 0
+        self.prefill_finalize_slow_gather_ct = 0
         self.finalize_prefill_busy_ns_ct = 0
         self.finalize_verify_busy_ns_ct = 0
+        # Settlement backlog observability (#9): max enqueue-to-finalize seq
+        # distance, and max event-completed-but-unsettled slots held behind
+        # the strict global-order settle point.
+        self.finalize_lag_high_water_ct = 0
+        self.finalize_hol_blocked_slots_high_water_ct = 0
         self.prefill_ring_high_water_ct = 0
         self.verify_ring_high_water_ct = 0
         self.export_queue_high_water_ct = 0
@@ -238,7 +310,6 @@ class HiddenCaptureStats:
         self.capture_degraded_verify_twin_ct = 0
         self.capture_degraded_sidecar_ct = 0
         self.shutdown_admission_miss_ct = 0
-        self.shutdown_verify_launcher_timeout_miss_ct = 0
         self.shutdown_finalize_timeout_miss_ct = 0
         self.shutdown_export_timeout_miss_ct = 0
 
@@ -549,16 +620,18 @@ class HiddenCapturePressureController:
 
 class _StagingSlot(msgspec.Struct):
     index: int
-    aux: torch.Tensor  # pinned [slot_tokens, aux_width]
-    last: torch.Tensor  # pinned [slot_tokens, last_width]
-    cache_loc: torch.Tensor  # pinned [slot_tokens] int64
-    tokens: torch.Tensor  # pinned [slot_tokens] int64
     event: Any
-    # Verify compact D2H uses two events: header is a tiny commit-lens/total
-    # copy; event remains the only payload-readiness event observed by the
-    # finalizer. payload_start_event exists only for timing.
-    header_event: Any = None
-    payload_start_event: Any = None
+    # Prefill slots own four pinned tensors. Verify slots own one pinned
+    # byte blob instead; aux/last/cache_loc/tokens/commit_lens become
+    # per-step views carved into it at enqueue (see verify_blob_views).
+    aux: Optional[torch.Tensor] = None  # pinned [slot_tokens, aux_width]
+    last: Optional[torch.Tensor] = None  # pinned [slot_tokens, last_width]
+    cache_loc: Optional[torch.Tensor] = None  # pinned [slot_tokens] int64
+    tokens: Optional[torch.Tensor] = None  # pinned [slot_tokens] int64
+    blob: Optional[torch.Tensor] = None  # pinned [blob_bytes] uint8
+    # True once event.query() returned True; a fired event never un-fires,
+    # so it is queried at most once per enqueue.
+    event_done: bool = False
     num_rows: int = 0
     ring_seq: int = -1
     # Prefill slots: [(rid, start_row, end_row)] within [0, num_rows).
@@ -566,38 +639,36 @@ class _StagingSlot(msgspec.Struct):
     # Verify slots: request i owns rows [i*stride, (i+1)*stride); only the
     # first commit_lens[i] of them are committed (selected at finalize).
     kind: str = "prefill"
-    commit_lens: Optional[torch.Tensor] = None  # pinned [num_reqs] int32
-    total_rows: Optional[torch.Tensor] = None  # pinned [1] int32
+    commit_lens: Optional[torch.Tensor] = None  # view into blob [num_reqs] int32
     rids: List[str] = []
     stride: int = 0
     num_reqs: int = 0
     # Device twin borrowed for this verify enqueue; released at finalize.
     twin: Optional[_DeviceTwin] = None
-    payload_enqueued: bool = False
     timing_accounted: bool = False
-    header_submitted_ns: int = 0
 
 
 class _DeviceTwin(msgspec.Struct):
-    """Capture-owned HBM buffers for one verify step's strided window.
+    """Capture-owned HBM blob for one verify step's strided window.
 
     The worker packs the (graph/persistent) verify outputs into a twin on the
     forward stream — same-stream ordering IS the overwrite fence: step t+1's
     replay queues behind the pack, so the persistent source can't be
     rewritten under the copy, and the forward stream never waits on D2H
     (which reads the twin, not the source).
+
+    All packed fields (commit_lens header plus payload sections) live in one
+    contiguous byte blob laid out per step by ``verify_blob_views``, so the
+    whole step travels to the pinned slot in a single length-bounded copy.
+    ``commit_offsets``/``verify_offsets`` are pack-kernel scratch only and
+    never leave the device.
     """
 
     index: int
-    aux: torch.Tensor  # [twin_tokens, aux_width] device
-    last: torch.Tensor  # [twin_tokens, last_width] device
-    cache_loc: torch.Tensor  # [twin_tokens] int64 device
-    tokens: torch.Tensor  # [twin_tokens] int64 device
-    commit_lens: torch.Tensor  # [max_reqs] int32 device
+    blob: torch.Tensor  # [blob_bytes] uint8 device
+    commit_offsets: torch.Tensor  # [max_reqs] int32 device (pack scratch)
+    verify_offsets: torch.Tensor  # [max_reqs] int32 device (pack scratch)
     fence_event: Any = None  # recorded on the forward stream after the pack
-    commit_offsets: Optional[torch.Tensor] = None  # [max_reqs] int32 device
-    verify_offsets: Optional[torch.Tensor] = None  # [max_reqs] int32 device
-    total_rows: Optional[torch.Tensor] = None  # [1] int32 device
     pack_start_event: Any = None
     borrowed_ns: int = 0
 
@@ -621,6 +692,16 @@ class DeviceTwinPool:
         self.twin_tokens = twin_tokens
         self.max_reqs = max_reqs
         self.num_twins = num_twins
+        self.aux_width = aux_width
+        self.last_width = last_width
+        self.dtype = dtype
+        self.blob_bytes = verify_blob_bytes(
+            bs=max_reqs,
+            n_rows=twin_tokens,
+            aux_width=aux_width,
+            last_width=last_width,
+            dtype=dtype,
+        )
         self._lock = threading.Lock()
         self._free: List[_DeviceTwin] = []
         self._in_use = 0
@@ -629,20 +710,8 @@ class DeviceTwinPool:
             self._free.append(
                 _DeviceTwin(
                     index=i,
-                    aux=torch.empty(
-                        (twin_tokens, aux_width), dtype=dtype, device=device
-                    ),
-                    last=torch.empty(
-                        (twin_tokens, last_width), dtype=dtype, device=device
-                    ),
-                    cache_loc=torch.empty(
-                        (twin_tokens,), dtype=torch.int64, device=device
-                    ),
-                    tokens=torch.empty(
-                        (twin_tokens,), dtype=torch.int64, device=device
-                    ),
-                    commit_lens=torch.empty(
-                        (max_reqs,), dtype=torch.int32, device=device
+                    blob=torch.empty(
+                        (self.blob_bytes,), dtype=torch.uint8, device=device
                     ),
                     commit_offsets=torch.empty(
                         (max_reqs,), dtype=torch.int32, device=device
@@ -650,7 +719,6 @@ class DeviceTwinPool:
                     verify_offsets=torch.empty(
                         (max_reqs,), dtype=torch.int32, device=device
                     ),
-                    total_rows=torch.empty((1,), dtype=torch.int32, device=device),
                     fence_event=(
                         torch.cuda.Event(enable_timing=True)
                         if use_cuda_events
@@ -666,26 +734,25 @@ class DeviceTwinPool:
         self.allocated_bytes = sum(
             tensor.numel() * tensor.element_size()
             for twin in self._free
-            for tensor in (
-                twin.aux,
-                twin.last,
-                twin.cache_loc,
-                twin.tokens,
-                twin.commit_lens,
-                twin.commit_offsets,
-                twin.verify_offsets,
-                twin.total_rows,
-            )
+            for tensor in (twin.blob, twin.commit_offsets, twin.verify_offsets)
         )
-        size_mb = (
-            num_twins * twin_tokens * (aux_width + last_width) * dtype.itemsize
-        ) / (1024 * 1024)
+        size_mb = (num_twins * self.blob_bytes) / (1024 * 1024)
         logger.info(
             "Hidden capture DeviceTwinPool allocated: %d twins x %d tokens, "
             "%.0f MB HBM",
             num_twins,
             twin_tokens,
             size_mb,
+        )
+
+    def views(self, twin: _DeviceTwin, *, bs: int, stride: int) -> _VerifyBlobViews:
+        return verify_blob_views(
+            twin.blob,
+            bs=bs,
+            stride=stride,
+            aux_width=self.aux_width,
+            last_width=self.last_width,
+            dtype=self.dtype,
         )
 
     def try_acquire(self) -> Optional[_DeviceTwin]:
@@ -716,11 +783,11 @@ class StagingSeqCounter:
 
     Prefill and verify stage through separate rings (capacity isolation), but
     the export barrier must stay one number and finalize must settle slots in
-    enqueue order. A shared counter gives every slot a global seq. Compact
-    verify reserves its seq before the background worker launches the payload,
-    so a younger prefill event may become ready first; the finalizer therefore
-    uses the seq as a strict oldest-first gate instead of assuming readiness is
-    monotonic.
+    enqueue order. A shared counter gives every slot a global seq. All copies
+    are submitted by the scheduler thread on one capture stream, so the seq
+    order is also the stream submission order; the finalizer still gates on
+    the seq (not on readiness) so the settlement order is explicit rather
+    than inferred.
     """
 
     def __init__(self) -> None:
@@ -761,6 +828,10 @@ class HiddenStagingRing:
         max_verify_reqs: int = 0,
     ) -> None:
         self.slot_tokens = slot_tokens
+        self.max_verify_reqs = max_verify_reqs
+        self._aux_width = aux_width
+        self._last_width = last_width
+        self._dtype = dtype
         self._lock = threading.Lock()
         self._free: deque[_StagingSlot] = deque()
         self._inflight: deque[_StagingSlot] = deque()
@@ -769,58 +840,52 @@ class HiddenStagingRing:
         self._stats_prefix = stats_prefix
         self.num_slots = num_slots
 
-        def _pinned(shape: Tuple[int, ...], dt: torch.dtype) -> torch.Tensor:
-            return torch.empty(shape, dtype=dt, pin_memory=pin_memory)
+        def _event() -> Any:
+            return torch.cuda.Event() if use_cuda_events else _NullEvent()
 
-        for i in range(num_slots):
-            self._free.append(
-                _StagingSlot(
-                    index=i,
-                    aux=_pinned((slot_tokens, aux_width), dtype),
-                    last=_pinned((slot_tokens, last_width), dtype),
-                    cache_loc=_pinned((slot_tokens,), torch.int64),
-                    tokens=_pinned((slot_tokens,), torch.int64),
-                    event=(
-                        torch.cuda.Event(enable_timing=stats_prefix == "verify")
-                        if use_cuda_events
-                        else _NullEvent()
-                    ),
-                    header_event=(
-                        torch.cuda.Event()
-                        if use_cuda_events and max_verify_reqs > 0
-                        else _NullEvent()
-                    ),
-                    payload_start_event=(
-                        torch.cuda.Event(enable_timing=True)
-                        if use_cuda_events and max_verify_reqs > 0
-                        else _NullEvent()
-                    ),
-                    commit_lens=(
-                        _pinned((max_verify_reqs,), torch.int32)
-                        if max_verify_reqs > 0
-                        else None
-                    ),
-                    total_rows=(
-                        _pinned((1,), torch.int32) if max_verify_reqs > 0 else None
-                    ),
+        if max_verify_reqs > 0:
+            # Verify slots: one pinned byte blob per slot; typed views are
+            # carved per step by enqueue_verify_compact.
+            blob_bytes = verify_blob_bytes(
+                bs=max_verify_reqs,
+                n_rows=slot_tokens,
+                aux_width=aux_width,
+                last_width=last_width,
+                dtype=dtype,
+            )
+            for i in range(num_slots):
+                self._free.append(
+                    _StagingSlot(
+                        index=i,
+                        event=_event(),
+                        blob=torch.empty(
+                            (blob_bytes,), dtype=torch.uint8, pin_memory=pin_memory
+                        ),
+                    )
                 )
+            self.allocated_bytes = num_slots * blob_bytes
+        else:
+
+            def _pinned(shape: Tuple[int, ...], dt: torch.dtype) -> torch.Tensor:
+                return torch.empty(shape, dtype=dt, pin_memory=pin_memory)
+
+            for i in range(num_slots):
+                self._free.append(
+                    _StagingSlot(
+                        index=i,
+                        event=_event(),
+                        aux=_pinned((slot_tokens, aux_width), dtype),
+                        last=_pinned((slot_tokens, last_width), dtype),
+                        cache_loc=_pinned((slot_tokens,), torch.int64),
+                        tokens=_pinned((slot_tokens,), torch.int64),
+                    )
+                )
+            self.allocated_bytes = sum(
+                tensor.numel() * tensor.element_size()
+                for slot in self._free
+                for tensor in (slot.aux, slot.last, slot.cache_loc, slot.tokens)
             )
-        self.allocated_bytes = sum(
-            tensor.numel() * tensor.element_size()
-            for slot in self._free
-            for tensor in (
-                slot.aux,
-                slot.last,
-                slot.cache_loc,
-                slot.tokens,
-                slot.commit_lens,
-                slot.total_rows,
-            )
-            if tensor is not None
-        )
-        size_gb = (
-            num_slots * slot_tokens * (aux_width + last_width) * dtype.itemsize
-        ) / _GB
+        size_gb = self.allocated_bytes / _GB
         logger.info(
             "HiddenStagingRing allocated: %d slots x %d tokens, pinned %.2f GB",
             num_slots,
@@ -840,7 +905,7 @@ class HiddenStagingRing:
         with self._lock:
             return self._inflight[0].ring_seq if self._inflight else None
 
-    def reserve_verify_compact(
+    def enqueue_verify_compact(
         self,
         slot: _StagingSlot,
         *,
@@ -848,40 +913,53 @@ class HiddenStagingRing:
         rids: List[str],
         stride: int,
         num_reqs: int,
-        header_submitted_ns: int,
     ) -> int:
-        """Register a two-phase compact verify transfer before payload D2H.
+        """Issue the single async D2H of a packed twin blob and commit the
+        slot in-flight.
 
-        The header copy has already been issued into ``slot.commit_lens`` and
-        ``slot.total_rows``.  Registering the global sequence here makes a
-        finish barrier include this step even while the launch worker is
-        waiting for the header.  ``payload_enqueued`` deliberately remains
-        false so a stale event from a previous slot use can never look ready.
+        Runs on the caller's current stream (the capture stream, already
+        fenced behind the twin's pack). One upper-bound-length byte copy
+        moves commit_lens and every payload section together; one event
+        gates readiness. The committed row count is derived by the finalizer
+        from the pinned commit_lens — nothing here reads device data.
+
+        Failure contract: every operation that can raise precedes the ring
+        registration, so on exception the slot is NOT in flight and the
+        caller still owns both the slot and the twin (drop-sample cleanup).
         """
+        views = verify_blob_views(
+            slot.blob,
+            bs=num_reqs,
+            stride=stride,
+            aux_width=self._aux_width,
+            last_width=self._last_width,
+            dtype=self._dtype,
+        )
+        slot.blob[: views.copy_bytes].copy_(
+            twin.blob[: views.copy_bytes], non_blocking=True
+        )
+        slot.event.record()
+
         slot.kind = "verify_compact"
-        slot.num_rows = 0
+        slot.commit_lens = views.commit_lens
+        slot.aux = views.aux
+        slot.last = views.last
+        slot.cache_loc = views.cache_loc
+        slot.tokens = views.tokens
+        slot.num_rows = 0  # derived from commit_lens at finalize
         slot.req_ranges = []
         slot.rids = rids
         slot.stride = stride
         slot.num_reqs = num_reqs
         slot.twin = twin
-        slot.payload_enqueued = False
+        slot.event_done = False
         slot.timing_accounted = False
-        slot.header_submitted_ns = header_submitted_ns
         with self._lock:
             slot.ring_seq = self._seq.next_seq()
             self._inflight.append(slot)
             inflight = len(self._inflight)
         self._observe_high_water(inflight)
         return slot.ring_seq
-
-    def mark_verify_payload_enqueued(
-        self, slot: _StagingSlot, *, num_rows: int
-    ) -> None:
-        """Publish the payload event after the launch worker records it."""
-        with self._lock:
-            slot.num_rows = num_rows
-            slot.payload_enqueued = True
 
     def enqueue_segment(
         self,
@@ -918,6 +996,7 @@ class HiddenStagingRing:
 
         slot.num_rows = num_rows
         slot.req_ranges = req_ranges
+        slot.event_done = False
         with self._lock:
             slot.ring_seq = self._seq.next_seq()
             self._inflight.append(slot)
@@ -931,15 +1010,27 @@ class HiddenStagingRing:
                 f"{self._stats_prefix}_ring_high_water_ct", inflight
             )
 
+    def _slot_ready_locked(self, slot: _StagingSlot) -> bool:
+        """Query a slot's copy event at most once after it fires.
+
+        A recorded CUDA event never un-fires, so the first True is memoized
+        in ``event_done`` and later polls cost a flag read instead of a
+        ``cudaEventQuery`` call.
+        """
+        if slot.event_done:
+            return True
+        if slot.event.query():
+            slot.event_done = True
+            return True
+        return False
+
     def pop_ready(self) -> Optional[_StagingSlot]:
         """Oldest in-flight slot whose D2H completed, preserving FIFO order."""
         with self._lock:
             if not self._inflight:
                 return None
             slot = self._inflight[0]
-            if (
-                slot.kind.startswith("verify") and not slot.payload_enqueued
-            ) or not slot.event.query():
+            if not self._slot_ready_locked(slot):
                 return None
             self._account_verify_completion_locked(slot)
             return self._inflight.popleft()
@@ -959,25 +1050,40 @@ class HiddenStagingRing:
         A twin's data is dead the moment its slot's copy event fires; waiting
         for the slot to reach the finalize queue head (and for finalize's
         sidecar memcpy — hundreds of MB for prefill slots) holds twins for
-        tens of ms longer than needed and starves verify capture. Two-phase
-        host launches can invert event readiness relative to ring seq, so the
-        scan checks every borrowed twin instead of stopping at the first miss.
+        tens of ms longer than needed and starves verify capture. The
+        scheduler is the sole submitter on the capture stream, so event
+        completion order equals enqueue order within this ring: the first
+        pending slot ends the scan, and everything before it is complete.
         """
         reaped = 0
         with self._lock:
             for slot in self._inflight:
+                if not self._slot_ready_locked(slot):
+                    break
                 if slot.twin is None:
-                    continue
-                if not slot.payload_enqueued or not slot.event.query():
-                    # Header/payload launch can interleave with prefill on the
-                    # shared stream, so do not assume a later slot is pending;
-                    # simply leave this twin borrowed and inspect the rest.
                     continue
                 self._account_verify_completion_locked(slot)
                 twin_pool.release(slot.twin)
                 slot.twin = None
                 reaped += 1
         return reaped
+
+    def count_ready_prefix(self) -> int:
+        """Completed oldest-first in-flight slots in this ring.
+
+        Single-submitter ordering makes readiness a prefix property, and
+        ``event_done`` memoization means at most one new ``cudaEventQuery``
+        per call. Used by the finalizer's head-of-line observability: slots
+        counted here while the *other* ring holds the pending global head are
+        completed work pinned behind strict global-order settlement.
+        """
+        with self._lock:
+            ready = 0
+            for slot in self._inflight:
+                if not self._slot_ready_locked(slot):
+                    break
+                ready += 1
+            return ready
 
     def _account_verify_completion_locked(self, slot: _StagingSlot) -> None:
         if (
@@ -1001,14 +1107,6 @@ class HiddenStagingRing:
                     )
                 except Exception:
                     logger.debug("verify pack timing event unavailable", exc_info=True)
-        if hasattr(slot.payload_start_event, "elapsed_time"):
-            try:
-                self._stats.bump(
-                    "verify_payload_d2h_ns_ct",
-                    int(slot.payload_start_event.elapsed_time(slot.event) * 1e6),
-                )
-            except Exception:
-                logger.debug("verify payload timing event unavailable", exc_info=True)
         slot.timing_accounted = True
 
     def release(self, slot: _StagingSlot) -> None:
@@ -1020,183 +1118,17 @@ class HiddenStagingRing:
         slot.stride = 0
         slot.num_reqs = 0
         slot.twin = None
-        slot.payload_enqueued = False
+        slot.event_done = False
         slot.timing_accounted = False
-        slot.header_submitted_ns = 0
+        if slot.blob is not None:
+            # Verify slot: drop the per-step views into the blob.
+            slot.aux = None
+            slot.last = None
+            slot.cache_loc = None
+            slot.tokens = None
+            slot.commit_lens = None
         with self._lock:
             self._free.append(slot)
-
-
-class HiddenVerifyD2HLauncher:
-    """FIFO background launcher for compact verify payload D2H.
-
-    The scheduler only issues the small device-header copy and registers the
-    ring sequence.  This worker waits for that header off the serving path,
-    reads the pinned total, then submits an actual-length payload copy.  Ring
-    readiness remains gated exclusively by the payload event.
-    """
-
-    def __init__(
-        self,
-        *,
-        ring: HiddenStagingRing,
-        twin_pool: DeviceTwinPool,
-        bookkeeper: HiddenCaptureBookkeeper,
-        stats: HiddenCaptureStats,
-        capture_stream: Any,
-        capture_launch_lock: threading.Lock,
-        row_bytes: int,
-        poll_interval_s: float = 0.0005,
-    ) -> None:
-        self.ring = ring
-        self.twin_pool = twin_pool
-        self.bookkeeper = bookkeeper
-        self.stats = stats
-        self.capture_stream = capture_stream
-        self.capture_launch_lock = capture_launch_lock
-        self.row_bytes = row_bytes
-        self._poll_interval_s = poll_interval_s
-        self._cv = threading.Condition()
-        self._pending: deque[_StagingSlot] = deque()
-        self._stop_requested = False
-        self._thread: Optional[threading.Thread] = None
-        self._active = 0
-
-    def start(self) -> None:
-        self._thread = threading.Thread(
-            target=self._run, name="hidden-verify-d2h-launch", daemon=True
-        )
-        self._thread.start()
-
-    def submit(self, slot: _StagingSlot) -> None:
-        with self._cv:
-            self._pending.append(slot)
-            depth = len(self._pending)
-            self._cv.notify()
-        self.stats.observe_max("verify_header_queue_high_water_ct", depth)
-
-    def stop(self) -> None:
-        """Request shutdown; the worker drains pending slots before exiting."""
-        with self._cv:
-            self._stop_requested = True
-            self._cv.notify_all()
-
-    def join(self, timeout_s: Optional[float] = None) -> bool:
-        if self._thread is None:
-            return True
-        self._thread.join(timeout=timeout_s)
-        return not self._thread.is_alive()
-
-    @property
-    def pending_count(self) -> int:
-        with self._cv:
-            return len(self._pending)
-
-    def _run(self) -> None:
-        _set_os_thread_name("hcap-d2h-launch")
-        while True:
-            with self._cv:
-                while not self._pending and not self._stop_requested:
-                    self._cv.wait(timeout=0.1)
-                if self._stop_requested and not self._pending:
-                    break
-                slot = self._pending[0]
-
-            if not slot.header_event.query():
-                time.sleep(self._poll_interval_s)
-                continue
-
-            with self._cv:
-                self._pending.popleft()
-            try:
-                self._active = 1
-                self._launch_payload(slot)
-            except Exception:
-                logger.exception(
-                    "hidden compact verify payload launch failed; dropping step"
-                )
-                self.stats.bump("verify_launch_failed_miss_ct")
-                self.bookkeeper.mark_miss(slot.rids)
-                self._complete_failed_slot(slot)
-            finally:
-                self._active = 0
-
-    def _launch_payload(self, slot: _StagingSlot) -> None:
-        if slot.commit_lens is None or slot.total_rows is None or slot.twin is None:
-            raise RuntimeError("compact verify slot is missing header/twin storage")
-        commit_lens = slot.commit_lens[: slot.num_reqs].tolist()
-        total_rows = int(slot.total_rows[0])
-        if (
-            any(length < 0 or length > slot.stride for length in commit_lens)
-            or sum(commit_lens) != total_rows
-            or total_rows > self.ring.slot_tokens
-        ):
-            raise RuntimeError(
-                "invalid compact verify header: "
-                f"lens={commit_lens}, total={total_rows}, "
-                f"capacity={self.ring.slot_tokens}"
-            )
-
-        now_ns = time.monotonic_ns()
-        if slot.header_submitted_ns:
-            self.stats.bump(
-                "verify_header_roundtrip_ns_ct",
-                max(0, now_ns - slot.header_submitted_ns),
-            )
-        launch_started_ns = now_ns
-        twin = slot.twin
-        with self.capture_launch_lock:
-            stream_ctx = (
-                torch.cuda.stream(self.capture_stream)
-                if self.capture_stream is not None
-                else contextlib.nullcontext()
-            )
-            with stream_ctx:
-                slot.payload_start_event.record()
-                if total_rows:
-                    slot.aux[:total_rows].copy_(
-                        twin.aux[:total_rows], non_blocking=True
-                    )
-                    slot.last[:total_rows].copy_(
-                        twin.last[:total_rows], non_blocking=True
-                    )
-                    slot.cache_loc[:total_rows].copy_(
-                        twin.cache_loc[:total_rows], non_blocking=True
-                    )
-                    slot.tokens[:total_rows].copy_(
-                        twin.tokens[:total_rows], non_blocking=True
-                    )
-                slot.event.record()
-        # Publish readiness only after the payload event has been recorded;
-        # otherwise the finalizer could observe a stale event from slot reuse.
-        self.ring.mark_verify_payload_enqueued(slot, num_rows=total_rows)
-        self.stats.bump(
-            "verify_payload_launch_ns_ct", time.monotonic_ns() - launch_started_ns
-        )
-        self.stats.bump("rows_staged_ct", total_rows)
-        self.stats.bump("verify_payload_rows_staged_ct", total_rows)
-        self.stats.bump(
-            "verify_d2h_bytes_ct",
-            total_rows * self.row_bytes + (slot.num_reqs + 1) * torch.int32.itemsize,
-        )
-
-    def _complete_failed_slot(self, slot: _StagingSlot) -> None:
-        if slot.commit_lens is not None:
-            slot.commit_lens[: slot.num_reqs].zero_()
-        if slot.total_rows is not None:
-            slot.total_rows.zero_()
-        with self.capture_launch_lock:
-            if self.capture_stream is not None and slot.twin is not None:
-                self.capture_stream.wait_event(slot.twin.fence_event)
-            stream_ctx = (
-                torch.cuda.stream(self.capture_stream)
-                if self.capture_stream is not None
-                else contextlib.nullcontext()
-            )
-            with stream_ctx:
-                slot.payload_start_event.record()
-                slot.event.record()
-        self.ring.mark_verify_payload_enqueued(slot, num_rows=0)
 
 
 class SidecarCapacityError(RuntimeError):
@@ -1964,10 +1896,8 @@ class HiddenFinalizeWorker:
     Sole writer of the sidecar arrays. Advances ``last_finalized_seq`` so the
     export thread's ring barrier (``last_finalized_seq >= snapshot``) implies
     every slot enqueued at or before the snapshot has settled. Prefill and
-    verify rings share one seq counter, but compact verify's host-side second
-    launch can make event readiness non-monotonic. The finalizer therefore
-    gates on the globally oldest in-flight sequence and waits through such an
-    inversion instead of exposing a settlement hole.
+    verify rings share one seq counter; the finalizer gates on the globally
+    oldest in-flight sequence so settlement never exposes a hole.
     """
 
     def __init__(
@@ -1995,6 +1925,11 @@ class HiddenFinalizeWorker:
         self._stats_log_interval_s = stats_log_interval_s
         self._last_stats_log_s = time.monotonic()
         self._last_stats_snapshot: Optional[Dict[str, int]] = None
+        # The head-of-line probe issues up to one event query per ring; keep
+        # it off the 1ms idle cadence so observability never rivals the
+        # settle path's own polling cost.
+        self._backlog_probe_interval_s = 0.05
+        self._last_backlog_probe_s = 0.0
         self._stop_requested = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._active = 0
@@ -2025,11 +1960,11 @@ class HiddenFinalizeWorker:
     def _pop_next_ready(self) -> Optional[Tuple[_StagingSlot, HiddenStagingRing]]:
         """Ready head of whichever ring holds the globally oldest slot.
 
-        Strict seq order across rings is a correctness barrier. In the compact
-        two-phase path an older verify slot can still be awaiting its host-side
-        payload launch while a younger prefill copy is already complete. We
-        deliberately wait for the older head: exporting the younger slot first
-        would let a request barrier observe a hole in global settlement.
+        Strict seq order across rings is a correctness barrier: exporting a
+        younger slot first would let a request barrier observe a hole in
+        global settlement. Within one ring, the single capture-stream
+        submitter makes readiness follow enqueue order; across rings the seq
+        decides which head must settle next.
         """
         if self.verify_ring is None:
             slot = self.ring.pop_ready()
@@ -2058,6 +1993,7 @@ class HiddenFinalizeWorker:
                 self.verify_ring.reap_ready_twins(self.twin_pool)
             popped = self._pop_next_ready()
             if popped is None:
+                self._observe_backlog()
                 time.sleep(self._poll_interval_s)
                 continue
             slot, source_ring = popped
@@ -2093,6 +2029,34 @@ class HiddenFinalizeWorker:
                     self.twin_pool.release(slot.twin)
                 source_ring.release(slot)
                 self.last_finalized_seq = seq
+
+    def _observe_backlog(self) -> None:
+        """Record settlement-backlog high-water marks while blocked.
+
+        ``finalize_lag_high_water_ct`` is the max enqueue-to-finalize seq
+        distance; ``finalize_hol_blocked_slots_high_water_ct`` is the max
+        number of copy-complete slots pinned behind a pending global head by
+        strict in-order settlement (#9's core structural judgment input).
+        Only sampled on idle iterations and rate-limited, so the counters'
+        own event queries never rival the settle path's polling cost.
+        """
+        now = time.monotonic()
+        if now - self._last_backlog_probe_s < self._backlog_probe_interval_s:
+            return
+        self._last_backlog_probe_s = now
+        lag = self.ring.last_enqueued_seq - self.last_finalized_seq
+        if lag > 0:
+            self.stats.observe_max("finalize_lag_high_water_ct", lag)
+        if self.verify_ring is None:
+            return
+        # _pop_next_ready returned None with work in flight => the globally
+        # oldest slot's copy is pending. Every completed slot in either ring
+        # is settlement-blocked behind it.
+        blocked = self.ring.count_ready_prefix() + self.verify_ring.count_ready_prefix()
+        if blocked > 0:
+            self.stats.observe_max(
+                "finalize_hol_blocked_slots_high_water_ct", blocked
+            )
 
     def _maybe_log_stats(self) -> None:
         """Time-based periodic stats emission (finalize thread, off the hot
@@ -2147,6 +2111,7 @@ class HiddenFinalizeWorker:
             tokens = slot.tokens[:num_rows]
         else:
             keep_idx = torch.tensor(keep, dtype=torch.long)
+            self.stats.bump("prefill_finalize_slow_gather_ct")
             slots = slot.cache_loc[keep_idx]
             aux_rows = slot.aux[keep_idx]
             last_rows = slot.last[keep_idx]
@@ -2175,17 +2140,22 @@ class HiddenFinalizeWorker:
         return len(keep)
 
     def _finalize_verify_slot(self, slot: _StagingSlot) -> None:
-        """Commit compact verify rows: the payload launcher already packed
-        exactly the committed prefix of every request (request i's rows are
-        contiguous at [sum(commit_lens[:i]), sum(commit_lens[:i+1]))), so the
-        whole payload enters the sidecar."""
+        """Commit compact verify rows: the pack kernel placed exactly the
+        committed prefix of every request (request i's rows are contiguous at
+        [sum(commit_lens[:i]), sum(commit_lens[:i+1]))), so the committed
+        prefix of the payload enters the sidecar. The row count is derived
+        from the pinned commit_lens — it arrived in the same copy as the
+        payload, so it is trustworthy exactly when the payload is."""
         commit_lens = slot.commit_lens[: slot.num_reqs].tolist()
-        num_rows = slot.num_rows
-        if sum(commit_lens) != num_rows:
+        if any(length < 0 or length > slot.stride for length in commit_lens):
             raise RuntimeError(
-                "compact verify payload/header mismatch: "
-                f"rows={num_rows}, commit_lens={commit_lens}"
+                f"invalid compact verify commit_lens: {commit_lens}, "
+                f"stride={slot.stride}"
             )
+        # Per-request bound length <= stride caps the sum at the payload
+        # views' n_rows = num_reqs * stride, so no separate capacity check.
+        num_rows = sum(commit_lens)
+        slot.num_rows = num_rows
         if num_rows:
             slots = slot.cache_loc[:num_rows]
             gens = self.sidecar.write_rows(

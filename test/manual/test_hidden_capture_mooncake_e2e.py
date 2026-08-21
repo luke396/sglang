@@ -410,8 +410,6 @@ def _fault_quiescent(snapshots):
         if any(
             int(state.get(name, 0))
             for name in (
-                "verify_launcher_pending",
-                "verify_launcher_active",
                 "prefill_ring_inflight",
                 "verify_ring_inflight",
                 "finalize_worker_active",

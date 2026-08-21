@@ -22,7 +22,6 @@ from sglang.srt.state_capturer.hidden_host import (
     HiddenFinalizeWorker,
     HiddenHostSidecar,
     HiddenStagingRing,
-    HiddenVerifyD2HLauncher,
     HiddenWallSpanRecorder,
     SidecarCapacityError,
 )
@@ -44,7 +43,9 @@ NUM_SIDECAR_SLOTS = 64
 DTYPE = torch.float32
 
 
-def _make_ring(num_slots=2, slot_tokens=4, stats=None, stats_prefix="prefill"):
+def _make_ring(
+    num_slots=2, slot_tokens=4, stats=None, stats_prefix="prefill", max_verify_reqs=0
+):
     return HiddenStagingRing(
         num_slots=num_slots,
         slot_tokens=slot_tokens,
@@ -55,6 +56,23 @@ def _make_ring(num_slots=2, slot_tokens=4, stats=None, stats_prefix="prefill"):
         use_cuda_events=False,
         stats=stats,
         stats_prefix=stats_prefix,
+        max_verify_reqs=max_verify_reqs,
+    )
+
+
+def _make_twin_pool(num_twins=1, twin_tokens=16, max_reqs=4, stats=None):
+    from sglang.srt.state_capturer.hidden_host import DeviceTwinPool
+
+    return DeviceTwinPool(
+        num_twins=num_twins,
+        twin_tokens=twin_tokens,
+        max_reqs=max_reqs,
+        aux_width=AUX_WIDTH,
+        last_width=LAST_WIDTH,
+        dtype=DTYPE,
+        device="cpu",
+        use_cuda_events=False,
+        stats=stats,
     )
 
 
@@ -163,6 +181,7 @@ class TestSplitRingFinalizeOrder(CustomTestCase):
             pin_memory=False,
             use_cuda_events=False,
             seq_counter=seq,
+            max_verify_reqs=4,
         )
         return prefill_ring, verify_ring
 
@@ -178,32 +197,38 @@ class TestSplitRingFinalizeOrder(CustomTestCase):
             req_ranges=[(rid, 0, num_rows)],
         )
 
-    def _enqueue_verify(self, ring, rid, seed=0):
-        from sglang.srt.state_capturer.hidden_host import _DeviceTwin, _NullEvent
-
+    def _enqueue_verify(self, ring, pool, rid, seed=0):
         aux, last = _rows(2, seed=seed)
-        twin = _DeviceTwin(
-            index=0,
-            aux=aux,
-            last=last,
-            cache_loc=torch.arange(2, dtype=torch.int64),
-            tokens=torch.arange(2, dtype=torch.int64),
-            commit_lens=torch.tensor([2], dtype=torch.int32),
-            fence_event=_NullEvent(),
-        )
+        twin = pool.try_acquire()
+        views = pool.views(twin, bs=1, stride=2)
+        views.aux.copy_(aux)
+        views.last.copy_(last)
+        views.cache_loc.copy_(torch.arange(2, dtype=torch.int64))
+        views.tokens.copy_(torch.arange(2, dtype=torch.int64))
+        views.commit_lens.copy_(torch.tensor([2], dtype=torch.int32))
         (slot,) = ring.try_acquire(1)
-        ring.reserve_verify_compact(
+        ring.enqueue_verify_compact(
             slot,
             twin=twin,
             rids=[rid],
             stride=2,
             num_reqs=1,
-            header_submitted_ns=time.monotonic_ns(),
         )
-        ring.mark_verify_payload_enqueued(slot, num_rows=2)
 
     def test_finalize_merges_rings_in_global_seq_order(self):
+        from sglang.srt.state_capturer.hidden_host import DeviceTwinPool
+
         prefill_ring, verify_ring = self._make_pair()
+        pool = DeviceTwinPool(
+            num_twins=2,
+            twin_tokens=8,
+            max_reqs=4,
+            aux_width=AUX_WIDTH,
+            last_width=LAST_WIDTH,
+            dtype=DTYPE,
+            device="cpu",
+            use_cuda_events=False,
+        )
         finalize = HiddenFinalizeWorker(
             ring=prefill_ring,
             verify_ring=verify_ring,
@@ -213,9 +238,9 @@ class TestSplitRingFinalizeOrder(CustomTestCase):
         )
         # Interleave: prefill(0), verify(1), prefill(2), verify(3).
         self._enqueue_prefill(prefill_ring, "p0", seed=0)
-        self._enqueue_verify(verify_ring, "v1", seed=1)
+        self._enqueue_verify(verify_ring, pool, "v1", seed=1)
         self._enqueue_prefill(prefill_ring, "p2", seed=2)
-        self._enqueue_verify(verify_ring, "v3", seed=3)
+        self._enqueue_verify(verify_ring, pool, "v3", seed=3)
 
         order = []
         while (popped := finalize._pop_next_ready()) is not None:
@@ -928,6 +953,115 @@ class TestObservability(CustomTestCase):
         self.assertEqual(set(bookkeeper.pop("sampled-a")), {10})
         self.assertEqual(set(bookkeeper.pop("sampled-b")), {13})
         self.assertEqual(stats.prefill_rows_finalized_ct, 2)
+        # The holes forced the keep_idx gather (issue #10 change 4).
+        self.assertEqual(stats.prefill_finalize_slow_gather_ct, 1)
+
+    def test_prefill_finalize_contiguous_range_skips_slow_gather(self):
+        stats = HiddenCaptureStats()
+        ring = _make_ring(num_slots=1, slot_tokens=4, stats=stats)
+        finalize = HiddenFinalizeWorker(
+            ring=ring,
+            sidecar=_make_sidecar(stats=stats),
+            bookkeeper=HiddenCaptureBookkeeper(),
+            stats=stats,
+        )
+        aux, last = _rows(3, seed=98)
+        (slot,) = ring.try_acquire(1)
+        ring.enqueue_segment(
+            slot,
+            aux_rows=aux,
+            last_rows=last,
+            cache_locs=torch.tensor([10, 11, 12]),
+            tokens=torch.tensor([20, 21, 22]),
+            req_ranges=[("whole", 0, 3)],
+        )
+        finalize.finalize_slot(ring.pop_ready())
+        self.assertEqual(stats.prefill_finalize_slow_gather_ct, 0)
+
+    def test_finalize_lag_and_hol_blocking_high_water(self):
+        """Issue #10 change 4 / #9 observability: while the globally oldest
+        slot's copy is pending, the backlog probe records how far enqueue ran
+        ahead of finalize and how many completed slots strict global-order
+        settlement is holding."""
+        from sglang.srt.state_capturer.hidden_host import StagingSeqCounter
+
+        seq = StagingSeqCounter()
+        stats = HiddenCaptureStats()
+        prefill_ring = HiddenStagingRing(
+            num_slots=2,
+            slot_tokens=8,
+            aux_width=AUX_WIDTH,
+            last_width=LAST_WIDTH,
+            dtype=DTYPE,
+            pin_memory=False,
+            use_cuda_events=False,
+            seq_counter=seq,
+            stats=stats,
+        )
+        verify_ring = HiddenStagingRing(
+            num_slots=1,
+            slot_tokens=8,
+            aux_width=AUX_WIDTH,
+            last_width=LAST_WIDTH,
+            dtype=DTYPE,
+            pin_memory=False,
+            use_cuda_events=False,
+            seq_counter=seq,
+            stats=stats,
+            stats_prefix="verify",
+            max_verify_reqs=4,
+        )
+        pool = _make_twin_pool(twin_tokens=8, max_reqs=4)
+        finalize = HiddenFinalizeWorker(
+            ring=prefill_ring,
+            verify_ring=verify_ring,
+            sidecar=_make_sidecar(),
+            bookkeeper=HiddenCaptureBookkeeper(),
+            stats=stats,
+            twin_pool=pool,
+        )
+        # seq 0: verify slot whose copy never completes (gated event) ...
+        twin = pool.try_acquire()
+        views = pool.views(twin, bs=1, stride=2)
+        views.commit_lens.copy_(torch.tensor([2], dtype=torch.int32))
+        views.cache_loc.copy_(torch.arange(2, dtype=torch.int64))
+        views.tokens.copy_(torch.arange(2, dtype=torch.int64))
+        (vslot,) = verify_ring.try_acquire(1)
+        gate = _GateEvent()
+        vslot.event = gate
+        verify_ring.enqueue_verify_compact(
+            vslot, twin=twin, rids=["v0"], stride=2, num_reqs=1
+        )
+        # ... seqs 1-2: prefill slots that are already complete behind it.
+        for i, rid in enumerate(("p1", "p2")):
+            (slot,) = prefill_ring.try_acquire(1)
+            aux, last = _rows(2, seed=i)
+            prefill_ring.enqueue_segment(
+                slot,
+                aux_rows=aux,
+                last_rows=last,
+                cache_locs=torch.arange(2, dtype=torch.int64) + 4 * (i + 1),
+                tokens=torch.zeros(2, dtype=torch.int64),
+                req_ranges=[(rid, 0, 2)],
+            )
+
+        self.assertIsNone(finalize._pop_next_ready())
+        finalize._observe_backlog()
+        self.assertEqual(stats.finalize_lag_high_water_ct, 3)  # seq 2 - (-1)
+        self.assertEqual(stats.finalize_hol_blocked_slots_high_water_ct, 2)
+
+        # Head completes: everything settles and the marks stay high-water.
+        gate.ready.set()
+        settled = 0
+        while (popped := finalize._pop_next_ready()) is not None:
+            slot, source = popped
+            finalize.last_finalized_seq = slot.ring_seq
+            source.release(slot)
+            settled += 1
+        self.assertEqual(settled, 3)
+        finalize._observe_backlog()
+        self.assertEqual(stats.finalize_lag_high_water_ct, 3)
+        self.assertEqual(stats.finalize_hol_blocked_slots_high_water_ct, 2)
 
 
 class TestWorkerShutdown(CustomTestCase):
@@ -1233,31 +1367,6 @@ class TestWorkerShutdown(CustomTestCase):
         self.assertTrue(export.join(timeout_s=2.0))
         self.assertEqual(stats.export_queue_full_miss_ct, 1)
 
-    def test_verify_launcher_stop_drains_header_wait(self):
-        gate = _GateEvent()
-        launched = []
-        launcher = HiddenVerifyD2HLauncher(
-            ring=SimpleNamespace(),
-            twin_pool=SimpleNamespace(),
-            bookkeeper=HiddenCaptureBookkeeper(),
-            stats=HiddenCaptureStats(),
-            capture_stream=None,
-            capture_launch_lock=threading.Lock(),
-            row_bytes=1,
-            poll_interval_s=0.0001,
-        )
-        launcher._launch_payload = lambda slot: launched.append(slot)
-        slot = SimpleNamespace(header_event=gate)
-        launcher.start()
-        launcher.submit(slot)
-        launcher.stop()
-        self.addCleanup(gate.ready.set)
-        self.assertFalse(launcher.join(timeout_s=0.02))
-        self.assertEqual(launcher.pending_count, 1)
-        gate.ready.set()
-        self.assertTrue(launcher.join(timeout_s=2.0))
-        self.assertEqual(launched, [slot])
-
     def test_capturer_close_never_releases_sink_before_export_join(self):
         events = []
         export_join_entered = threading.Event()
@@ -1297,7 +1406,6 @@ class TestWorkerShutdown(CustomTestCase):
         capturer._closed = False
         capturer._accepting = threading.Event()
         capturer._accepting.set()
-        capturer.verify_launcher = Worker("launcher")
         capturer.finalize_worker = Worker("finalize")
         capturer.export_worker = ExportWorker("export", block_join=True)
         capturer.sink = Sink()
@@ -1347,7 +1455,6 @@ class TestWorkerShutdown(CustomTestCase):
         capturer._closed = False
         capturer._accepting = threading.Event()
         capturer._accepting.set()
-        capturer.verify_launcher = Worker()
         capturer.finalize_worker = Worker()
         capturer.export_worker = ExportWorker()
         capturer.sink = Sink()
@@ -1365,49 +1472,51 @@ class TestVerifyCommittedRows(CustomTestCase):
     the sidecar would poison warm-prefix reuse (their kv slots are freed and
     reused while the stale row still carries a plausible token id)."""
 
-    def _make_verify_slot(self, ring, commit_lens, stride, seed=0):
-        from sglang.srt.state_capturer.hidden_host import _DeviceTwin, _NullEvent
+    def _make_verify_slot(self, ring, pool, commit_lens, stride, seed=0):
+        """Pack committed rows into a twin blob (CPU reference pack), enqueue
+        the single blob copy, and pop the ready slot."""
+        from sglang.srt.state_capturer.hidden_pack import (
+            pack_committed_verify_rows_into,
+        )
 
         num_reqs = len(commit_lens)
         num_rows = num_reqs * stride
         aux, last = _rows(num_rows, seed=seed)
-        twin = _DeviceTwin(
-            index=0,
-            aux=aux,
-            last=last,
-            cache_loc=torch.arange(num_rows, dtype=torch.int64),
-            tokens=torch.arange(100, 100 + num_rows, dtype=torch.int64),
+        cache = torch.arange(num_rows, dtype=torch.int64)
+        tokens = torch.arange(100, 100 + num_rows, dtype=torch.int64)
+        twin = pool.try_acquire()
+        views = pool.views(twin, bs=num_reqs, stride=stride)
+        pack_committed_verify_rows_into(
+            aux_strided=aux,
+            last_strided=last,
+            last_compact=None,
+            verify_lens=None,
+            verify_cache_loc=cache,
+            verify_tokens=tokens,
             commit_lens=torch.tensor(commit_lens, dtype=torch.int32),
-            fence_event=_NullEvent(),
+            bs=num_reqs,
+            stride=stride,
+            out_aux=views.aux,
+            out_last=views.last,
+            out_cache_loc=views.cache_loc,
+            out_tokens=views.tokens,
+            out_commit_lens=views.commit_lens,
+            out_commit_offsets=twin.commit_offsets,
+            out_verify_offsets=twin.verify_offsets,
         )
         (slot,) = ring.try_acquire(1)
-        ring.reserve_verify_compact(
+        ring.enqueue_verify_compact(
             slot,
             twin=twin,
             rids=[f"r{i}" for i in range(num_reqs)],
             stride=stride,
             num_reqs=num_reqs,
-            header_submitted_ns=time.monotonic_ns(),
         )
-        # Emulate the payload launcher: contiguous committed rows only.
-        keep = []
-        for i, commit_len in enumerate(commit_lens):
-            keep.extend(range(i * stride, i * stride + commit_len))
-        keep_idx = torch.tensor(keep, dtype=torch.long)
-        packed = len(keep)
-        slot.aux[:packed].copy_(aux[keep_idx])
-        slot.last[:packed].copy_(last[keep_idx])
-        slot.cache_loc[:packed].copy_(twin.cache_loc[keep_idx])
-        slot.tokens[:packed].copy_(twin.tokens[keep_idx])
-        if slot.commit_lens is None:
-            slot.commit_lens = torch.tensor(commit_lens, dtype=torch.int32)
-        else:
-            slot.commit_lens[:num_reqs].copy_(twin.commit_lens[:num_reqs])
-        ring.mark_verify_payload_enqueued(slot, num_rows=packed)
         return ring.pop_ready(), aux, last
 
     def test_only_committed_prefix_enters_sidecar(self):
-        ring = _make_ring(num_slots=1, slot_tokens=16)
+        ring = _make_ring(num_slots=1, slot_tokens=16, max_verify_reqs=4)
+        pool = _make_twin_pool(twin_tokens=16, max_reqs=4)
         sidecar = _make_sidecar()
         bookkeeper = HiddenCaptureBookkeeper()
         stats = HiddenCaptureStats()
@@ -1416,7 +1525,7 @@ class TestVerifyCommittedRows(CustomTestCase):
         )
         stride = 4
         # r0 commits 2 of 4 rows, r1 commits all 4.
-        slot, aux, last = self._make_verify_slot(ring, [2, 4], stride)
+        slot, aux, last = self._make_verify_slot(ring, pool, [2, 4], stride)
         finalize.finalize_slot(slot)
 
         # Committed rows present with correct payloads.
@@ -1444,33 +1553,21 @@ class TestVerifyCommittedRows(CustomTestCase):
         moment its slot's D2H event fires; reap_ready_twins must release it
         while the slot still sits in the finalize queue — waiting for the
         finalize memcpy starves fast decode steps of twins."""
-        from sglang.srt.state_capturer.hidden_host import DeviceTwinPool
-
-        pool = DeviceTwinPool(
-            num_twins=1,
-            twin_tokens=16,
-            max_reqs=4,
-            aux_width=AUX_WIDTH,
-            last_width=LAST_WIDTH,
-            dtype=DTYPE,
-            device="cpu",
-            use_cuda_events=False,
-        )
-        ring = _make_ring(num_slots=1, slot_tokens=16)
+        pool = _make_twin_pool(twin_tokens=16, max_reqs=4)
+        ring = _make_ring(num_slots=1, slot_tokens=16, max_verify_reqs=4)
         twin = pool.try_acquire()
-        twin.cache_loc[:2] = torch.tensor([10, 11], dtype=torch.int64)
-        twin.tokens[:2] = torch.tensor([5, 6], dtype=torch.int64)
-        twin.commit_lens[:1] = torch.tensor([1], dtype=torch.int32)
+        views = pool.views(twin, bs=1, stride=2)
+        views.cache_loc.copy_(torch.tensor([10, 11], dtype=torch.int64))
+        views.tokens.copy_(torch.tensor([5, 6], dtype=torch.int64))
+        views.commit_lens.copy_(torch.tensor([1], dtype=torch.int32))
         (slot,) = ring.try_acquire(1)
-        ring.reserve_verify_compact(
+        ring.enqueue_verify_compact(
             slot,
             twin=twin,
             rids=["r0"],
             stride=2,
             num_reqs=1,
-            header_submitted_ns=time.monotonic_ns(),
         )
-        ring.mark_verify_payload_enqueued(slot, num_rows=1)
         self.assertIsNone(pool.try_acquire())
 
         # D2H done (_NullEvent queries True); slot NOT yet finalized.
@@ -1481,6 +1578,157 @@ class TestVerifyCommittedRows(CustomTestCase):
         ready = ring.pop_ready()
         self.assertIsNotNone(ready)
         self.assertIsNone(ready.twin)
+
+    def test_ready_event_is_queried_at_most_once(self):
+        """Issue #10 change 3a: a fired copy event is memoized; polling an
+        already-confirmed in-flight slot must not re-issue event.query()."""
+
+        class CountingEvent:
+            def __init__(self):
+                self.queries = 0
+                self.ready = False
+
+            def record(self):
+                pass
+
+            def query(self):
+                self.queries += 1
+                return self.ready
+
+        pool = _make_twin_pool(num_twins=2, twin_tokens=16, max_reqs=4)
+        ring = _make_ring(num_slots=2, slot_tokens=16, max_verify_reqs=4)
+        slots = ring.try_acquire(2)
+        events = []
+        for i, slot in enumerate(slots):
+            event = CountingEvent()
+            slot.event = event
+            events.append(event)
+            twin = pool.try_acquire()
+            views = pool.views(twin, bs=1, stride=2)
+            views.commit_lens.copy_(torch.tensor([2], dtype=torch.int32))
+            views.cache_loc.copy_(torch.arange(2, dtype=torch.int64) + 2 * i)
+            views.tokens.copy_(torch.arange(2, dtype=torch.int64))
+            ring.enqueue_verify_compact(
+                slot, twin=twin, rids=[f"r{i}"], stride=2, num_reqs=1
+            )
+        # Head pending: each reap queries the head once and stops (ordered
+        # completion), never touching the second slot's event.
+        for _ in range(3):
+            self.assertEqual(ring.reap_ready_twins(pool), 0)
+        self.assertEqual(events[0].queries, 3)
+        self.assertEqual(events[1].queries, 0)
+        # Both complete: one reap confirms each event exactly once...
+        events[0].ready = True
+        events[1].ready = True
+        self.assertEqual(ring.reap_ready_twins(pool), 2)
+        self.assertEqual(events[0].queries, 4)
+        self.assertEqual(events[1].queries, 1)
+        # ...and every later poll is answered from the memoized flag.
+        self.assertEqual(ring.reap_ready_twins(pool), 0)
+        self.assertIsNotNone(ring.pop_ready())
+        self.assertIsNotNone(ring.pop_ready())
+        self.assertEqual(events[0].queries, 4)
+        self.assertEqual(events[1].queries, 1)
+
+    def test_capture_stream_completion_order_matches_enqueue_order(self):
+        """Issue #10 acceptance: with the scheduler as sole submitter on the
+        capture stream, event completion order == enqueue order, so a ready
+        younger slot implies every older slot is ready (change 3b and #9
+        both build on this). Locked here with gate events emulating in-order
+        stream completion; the CUDA-level equivalent is the single-stream
+        FIFO property exercised by the GPU suite."""
+        pool = _make_twin_pool(num_twins=3, twin_tokens=16, max_reqs=4)
+        ring = _make_ring(num_slots=3, slot_tokens=16, max_verify_reqs=4)
+        gates = []
+        for i in range(3):
+            (slot,) = ring.try_acquire(1)
+            gate = _GateEvent()
+            slot.event = gate
+            gates.append(gate)
+            twin = pool.try_acquire()
+            views = pool.views(twin, bs=1, stride=2)
+            views.commit_lens.copy_(torch.tensor([2], dtype=torch.int32))
+            views.cache_loc.copy_(torch.arange(2, dtype=torch.int64) + 2 * i)
+            views.tokens.copy_(torch.arange(2, dtype=torch.int64))
+            ring.enqueue_verify_compact(
+                slot, twin=twin, rids=[f"r{i}"], stride=2, num_reqs=1
+            )
+        # In-order completion: firing events oldest-first releases twins and
+        # pops slots strictly in enqueue order.
+        self.assertEqual(ring.reap_ready_twins(pool), 0)
+        self.assertIsNone(ring.pop_ready())
+        order = []
+        for i, gate in enumerate(gates):
+            gate.ready.set()
+            self.assertEqual(ring.reap_ready_twins(pool), 1)
+            popped = ring.pop_ready()
+            self.assertIsNotNone(popped)
+            order.append(popped.ring_seq)
+            self.assertIsNone(ring.pop_ready())
+        self.assertEqual(order, [0, 1, 2])
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_cuda_capture_stream_event_order_matches_enqueue_order(self):
+        """Issue #10 acceptance: on the real capture stream (single
+        submitter), a younger verify blob's completed event implies every
+        older one has completed — the FIFO stream property changes 3b and
+        issue #9 build on. A long spin kernel delays the stream so the
+        assertion window is real, then completion is observed strictly
+        oldest-first."""
+        from sglang.srt.state_capturer.hidden_host import DeviceTwinPool
+
+        pool = DeviceTwinPool(
+            num_twins=3,
+            twin_tokens=8,
+            max_reqs=2,
+            aux_width=AUX_WIDTH,
+            last_width=LAST_WIDTH,
+            dtype=DTYPE,
+        )
+        ring = HiddenStagingRing(
+            num_slots=3,
+            slot_tokens=8,
+            aux_width=AUX_WIDTH,
+            last_width=LAST_WIDTH,
+            dtype=DTYPE,
+            stats_prefix="verify",
+            max_verify_reqs=2,
+        )
+        capture_stream = torch.cuda.Stream()
+        with torch.cuda.stream(capture_stream):
+            # ~10ms spin delays all three copies behind it on the stream.
+            torch.cuda._sleep(10_000_000)
+            for i in range(3):
+                twin = pool.try_acquire()
+                views = pool.views(twin, bs=1, stride=2)
+                views.commit_lens.fill_(2)
+                views.cache_loc.copy_(
+                    torch.arange(2, dtype=torch.int64, device="cuda") + 2 * i
+                )
+                views.tokens.copy_(
+                    torch.arange(2, dtype=torch.int64, device="cuda")
+                )
+                twin.pack_start_event.record()
+                twin.fence_event.record()
+                (slot,) = ring.try_acquire(1)
+                ring.enqueue_verify_compact(
+                    slot, twin=twin, rids=[f"r{i}"], stride=2, num_reqs=1
+                )
+        order = []
+        deadline = time.monotonic() + 10
+        while len(order) < 3 and time.monotonic() < deadline:
+            with ring._lock:
+                # Whenever any in-flight event reports done, every older
+                # in-flight event must also report done (FIFO completion).
+                done_flags = [slot.event.query() for slot in ring._inflight]
+            for older, younger in zip(done_flags, done_flags[1:]):
+                self.assertFalse(younger and not older, done_flags)
+            popped = ring.pop_ready()
+            if popped is not None:
+                order.append(popped.ring_seq)
+                pool.release(popped.twin)
+                ring.release(popped)
+        self.assertEqual(order, [0, 1, 2])
 
 
 class TestVerifyCommittedPack(CustomTestCase):
@@ -1520,7 +1768,6 @@ class TestVerifyCommittedPack(CustomTestCase):
         out_tokens = torch.empty_like(tokens)
         out_lens = torch.empty(bs, dtype=torch.int32, device=device)
         out_offsets = torch.empty(bs, dtype=torch.int32, device=device)
-        out_total = torch.empty(1, dtype=torch.int32, device=device)
         out_verify_offsets = torch.empty(bs, dtype=torch.int32, device=device)
         pack_committed_verify_rows_into(
             aux_strided=aux,
@@ -1538,7 +1785,6 @@ class TestVerifyCommittedPack(CustomTestCase):
             out_tokens=out_tokens,
             out_commit_lens=out_lens,
             out_commit_offsets=out_offsets,
-            out_total_rows=out_total,
             out_verify_offsets=out_verify_offsets,
         )
         keep = torch.tensor([0, 4, 5, 6, 8, 9], dtype=torch.long, device=device)
@@ -1554,11 +1800,11 @@ class TestVerifyCommittedPack(CustomTestCase):
             "out_tokens": out_tokens,
             "out_lens": out_lens,
             "out_offsets": out_offsets,
-            "out_total": out_total,
         }
 
     def _assert_case(self, case):
-        total = int(case["out_total"].cpu()[0])
+        # The host derives the committed total from the arrived commit_lens.
+        total = int(case["out_lens"].cpu().sum())
         self.assertEqual(total, 6)
         self.assertEqual(case["out_lens"].cpu().tolist(), [1, 3, 2])
         self.assertEqual(case["out_offsets"].cpu().tolist(), [0, 1, 4])
@@ -1627,7 +1873,6 @@ class TestVerifyCommittedPack(CustomTestCase):
         out_tokens = torch.empty(n, dtype=torch.int64, device="cuda")
         out_lens = torch.empty(bs, dtype=torch.int32, device="cuda")
         out_offsets = torch.empty(bs, dtype=torch.int32, device="cuda")
-        out_total = torch.empty(1, dtype=torch.int32, device="cuda")
         out_verify_offsets = torch.empty(bs, dtype=torch.int32, device="cuda")
         cache = torch.arange(n, dtype=torch.int64, device="cuda")
         tokens = cache + 1000
@@ -1652,7 +1897,6 @@ class TestVerifyCommittedPack(CustomTestCase):
                 out_tokens=out_tokens,
                 out_commit_lens=out_lens,
                 out_commit_offsets=out_offsets,
-                out_total_rows=out_total,
                 out_verify_offsets=out_verify_offsets,
             )
             # This replay overwrites aux_static/last_static in place, but is
@@ -1663,36 +1907,20 @@ class TestVerifyCommittedPack(CustomTestCase):
         self.assertTrue(torch.equal(out_aux[:5].cpu(), torch.full((5, 8), 3.0)))
         self.assertTrue(torch.equal(out_last[:5].cpu(), torch.full((5, 4), 103.0)))
 
-    def test_two_phase_launcher_writes_contiguous_payload(self):
-        from sglang.srt.state_capturer.hidden_host import (
-            DeviceTwinPool,
-            HiddenVerifyD2HLauncher,
-        )
+    def test_single_copy_verify_enqueue_finalizes_committed_prefix(self):
+        """Issue #10 changes 1+2: one blob copy replaces header+payload; the
+        finalizer derives the committed row count from the arrived
+        commit_lens and settles exactly the committed prefix."""
         from sglang.srt.state_capturer.hidden_pack import (
             pack_committed_verify_rows_into,
         )
 
         stats = HiddenCaptureStats()
         bookkeeper = HiddenCaptureBookkeeper()
-        pool = DeviceTwinPool(
-            num_twins=1,
-            twin_tokens=8,
-            max_reqs=2,
-            aux_width=AUX_WIDTH,
-            last_width=LAST_WIDTH,
-            dtype=DTYPE,
-            device="cpu",
-            use_cuda_events=False,
-            stats=stats,
-        )
-        ring = HiddenStagingRing(
+        pool = _make_twin_pool(twin_tokens=8, max_reqs=2, stats=stats)
+        ring = _make_ring(
             num_slots=1,
             slot_tokens=8,
-            aux_width=AUX_WIDTH,
-            last_width=LAST_WIDTH,
-            dtype=DTYPE,
-            pin_memory=False,
-            use_cuda_events=False,
             stats=stats,
             stats_prefix="verify",
             max_verify_reqs=2,
@@ -1702,6 +1930,7 @@ class TestVerifyCommittedPack(CustomTestCase):
         cache = torch.arange(10, 18, dtype=torch.int64)
         tokens = torch.arange(110, 118, dtype=torch.int64)
         lens = torch.tensor([1, 3], dtype=torch.int32)
+        views = pool.views(twin, bs=2, stride=4)
         pack_committed_verify_rows_into(
             aux_strided=aux,
             last_strided=last,
@@ -1712,48 +1941,26 @@ class TestVerifyCommittedPack(CustomTestCase):
             commit_lens=lens,
             bs=2,
             stride=4,
-            out_aux=twin.aux,
-            out_last=twin.last,
-            out_cache_loc=twin.cache_loc,
-            out_tokens=twin.tokens,
-            out_commit_lens=twin.commit_lens,
+            out_aux=views.aux,
+            out_last=views.last,
+            out_cache_loc=views.cache_loc,
+            out_tokens=views.tokens,
+            out_commit_lens=views.commit_lens,
             out_commit_offsets=twin.commit_offsets,
-            out_total_rows=twin.total_rows,
             out_verify_offsets=twin.verify_offsets,
         )
         twin.pack_start_event.record()
         twin.fence_event.record()
         (slot,) = ring.try_acquire(1)
-        slot.commit_lens[:2].copy_(twin.commit_lens[:2])
-        slot.total_rows.copy_(twin.total_rows)
-        slot.header_event.record()
-        seq = ring.reserve_verify_compact(
+        seq = ring.enqueue_verify_compact(
             slot,
             twin=twin,
             rids=["r0", "r1"],
             stride=4,
             num_reqs=2,
-            header_submitted_ns=time.monotonic_ns(),
         )
         bookkeeper.record_enqueued(["r0", "r1"], seq)
-        launcher = HiddenVerifyD2HLauncher(
-            ring=ring,
-            twin_pool=pool,
-            bookkeeper=bookkeeper,
-            stats=stats,
-            capture_stream=None,
-            capture_launch_lock=threading.Lock(),
-            row_bytes=(AUX_WIDTH + LAST_WIDTH) * DTYPE.itemsize + 16,
-        )
-        launcher.start()
-        launcher.submit(slot)
-        deadline = time.monotonic() + 2
-        ready = None
-        while ready is None and time.monotonic() < deadline:
-            ready = ring.pop_ready()
-            time.sleep(0.001)
-        launcher.stop()
-        self.assertTrue(launcher.join(timeout_s=2))
+        ready = ring.pop_ready()
         self.assertIsNotNone(ready)
 
         sidecar = _make_sidecar()
@@ -1769,19 +1976,40 @@ class TestVerifyCommittedPack(CustomTestCase):
         ring.release(ready)
         self.assertEqual(set(bookkeeper.pop("r0")), {10})
         self.assertEqual(set(bookkeeper.pop("r1")), {14, 15, 16})
-        self.assertEqual(stats.verify_candidate_rows_staged_ct, 0)
-        self.assertEqual(stats.verify_payload_rows_staged_ct, 4)
         self.assertEqual(stats.verify_rows_committed_ct, 4)
 
-    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
-    def test_cuda_two_phase_launcher_events_and_timing(self):
-        from sglang.srt.state_capturer.hidden_host import (
-            DeviceTwinPool,
-            HiddenVerifyD2HLauncher,
+    def test_verify_finalize_rejects_corrupt_commit_lens(self):
+        """The launcher's header validation moved to finalize: commit_lens
+        outside [0, stride] fails the slot closed instead of writing junk
+        row counts into the sidecar."""
+        pool = _make_twin_pool(twin_tokens=8, max_reqs=2)
+        ring = _make_ring(num_slots=1, slot_tokens=8, max_verify_reqs=2)
+        twin = pool.try_acquire()
+        views = pool.views(twin, bs=2, stride=4)
+        views.commit_lens.copy_(torch.tensor([5, -1], dtype=torch.int32))
+        (slot,) = ring.try_acquire(1)
+        ring.enqueue_verify_compact(
+            slot, twin=twin, rids=["r0", "r1"], stride=4, num_reqs=2
         )
+        finalize = HiddenFinalizeWorker(
+            ring=ring,
+            sidecar=_make_sidecar(),
+            bookkeeper=HiddenCaptureBookkeeper(),
+            stats=HiddenCaptureStats(),
+            twin_pool=pool,
+        )
+        ready = ring.pop_ready()
+        with self.assertRaisesRegex(RuntimeError, "invalid compact verify"):
+            finalize.finalize_slot(ready)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_cuda_single_copy_verify_d2h_round_trip(self):
+        """CUDA path: the packed twin blob crosses to the pinned slot in one
+        copy; the pinned views then show the packed values and commit_lens
+        without any header round trip."""
+        from sglang.srt.state_capturer.hidden_host import DeviceTwinPool
 
         stats = HiddenCaptureStats()
-        bookkeeper = HiddenCaptureBookkeeper()
         pool = DeviceTwinPool(
             num_twins=1,
             twin_tokens=8,
@@ -1803,58 +2031,39 @@ class TestVerifyCommittedPack(CustomTestCase):
         )
         twin = pool.try_acquire()
         twin.pack_start_event.record()
-        twin.aux[:4].fill_(7)
-        twin.last[:4].fill_(8)
-        twin.cache_loc[:4].copy_(
+        views = pool.views(twin, bs=2, stride=4)
+        views.aux[:4].fill_(7)
+        views.last[:4].fill_(8)
+        views.cache_loc[:4].copy_(
             torch.tensor([10, 14, 15, 16], dtype=torch.int64, device="cuda")
         )
-        twin.tokens[:4].copy_(
+        views.tokens[:4].copy_(
             torch.tensor([110, 114, 115, 116], dtype=torch.int64, device="cuda")
         )
-        twin.commit_lens[:2].copy_(
+        views.commit_lens.copy_(
             torch.tensor([1, 3], dtype=torch.int32, device="cuda")
         )
-        twin.total_rows.fill_(4)
         twin.fence_event.record()
 
         capture_stream = torch.cuda.Stream()
         capture_stream.wait_event(twin.fence_event)
         (slot,) = ring.try_acquire(1)
         with torch.cuda.stream(capture_stream):
-            slot.commit_lens[:2].copy_(twin.commit_lens[:2], non_blocking=True)
-            slot.total_rows.copy_(twin.total_rows, non_blocking=True)
-            slot.header_event.record()
-        seq = ring.reserve_verify_compact(
-            slot,
-            twin=twin,
-            rids=["r0", "r1"],
-            stride=4,
-            num_reqs=2,
-            header_submitted_ns=time.monotonic_ns(),
-        )
-        bookkeeper.record_enqueued(["r0", "r1"], seq)
-        launcher = HiddenVerifyD2HLauncher(
-            ring=ring,
-            twin_pool=pool,
-            bookkeeper=bookkeeper,
-            stats=stats,
-            capture_stream=capture_stream,
-            capture_launch_lock=threading.Lock(),
-            row_bytes=(AUX_WIDTH + LAST_WIDTH) * DTYPE.itemsize + 16,
-        )
-        launcher.start()
-        launcher.submit(slot)
+            ring.enqueue_verify_compact(
+                slot, twin=twin, rids=["r0", "r1"], stride=4, num_reqs=2
+            )
         deadline = time.monotonic() + 5
         ready = None
         while ready is None and time.monotonic() < deadline:
             ready = ring.pop_ready()
             time.sleep(0.001)
-        launcher.stop()
-        self.assertTrue(launcher.join(timeout_s=2))
         self.assertIsNotNone(ready)
+        self.assertEqual(ready.commit_lens.tolist(), [1, 3])
         self.assertTrue(torch.equal(ready.aux[:4], torch.full_like(ready.aux[:4], 7)))
+        self.assertTrue(
+            torch.equal(ready.cache_loc[:4].cpu(), torch.tensor([10, 14, 15, 16]))
+        )
         self.assertGreater(stats.verify_pack_ns_ct, 0)
-        self.assertGreater(stats.verify_payload_d2h_ns_ct, 0)
         pool.release(ready.twin)
         ring.release(ready)
 
