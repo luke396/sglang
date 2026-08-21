@@ -35,6 +35,23 @@ logger = logging.getLogger(__name__)
 
 _GB = 1024**3
 
+
+def _set_os_thread_name(name: str) -> None:
+    """Give the calling thread a kernel-visible name (prctl PR_SET_NAME).
+
+    Python ``Thread(name=...)`` never reaches the OS, so profilers (nsys,
+    perf) attribute capture-worker CUDA API calls to the process comm.
+    nsys attribution of capture host overhead (issue #10/#11) requires the
+    workers to be separable by name; comm is capped at 15 chars.
+    """
+    try:
+        import ctypes
+
+        PR_SET_NAME = 15
+        ctypes.CDLL("libc.so.6").prctl(PR_SET_NAME, name.encode()[:15], 0, 0, 0)
+    except Exception:  # non-Linux or restricted environment: name is cosmetic
+        pass
+
 # Finalize-side stats log cadence, in seconds (time-based so short runs
 # still get attribution before shutdown).
 _STATS_LOG_INTERVAL_S = 30.0
@@ -1076,6 +1093,7 @@ class HiddenVerifyD2HLauncher:
             return len(self._pending)
 
     def _run(self) -> None:
+        _set_os_thread_name("hcap-d2h-launch")
         while True:
             with self._cv:
                 while not self._pending and not self._stop_requested:
@@ -2028,6 +2046,7 @@ class HiddenFinalizeWorker:
         return (slot, source) if slot is not None else None
 
     def _run(self) -> None:
+        _set_os_thread_name("hcap-finalize")
         while True:
             if self._stop_requested.is_set() and self.pending_count == 0:
                 break
