@@ -59,7 +59,9 @@ TERM_PLOTLIB_AVAILABLE = (importlib.util.find_spec("termplotlib") is not None) a
     shutil.which("gnuplot") is not None
 )
 
-global args
+# Unset until run_benchmark()/set_global_args(); import-mode callers of
+# async_request_sglang_generate(sampling_params=...) never read it.
+args: Optional[argparse.Namespace] = None
 
 
 # don't want to import sglang package here
@@ -93,6 +95,7 @@ class RequestFuncInput:
     extra_request_body: Dict[str, Any]
     timestamp: Optional[float] = None
     routing_key: Optional[str] = None
+    rid: Optional[str] = None  # forwarded to the /generate payload when set
 
 
 @dataclass
@@ -113,6 +116,10 @@ class RequestFuncOutput:
     spec_cap_length: float = 0.0
     spec_block_accept_length: float = 0.0
     spec_cap_lens_histogram: List[int] = field(default_factory=list)
+    # Last non-empty meta_info chunk from a streaming /generate response, so
+    # importers get every server-side metric (e2e_latency, spec_verify_ct,
+    # ...) without this dataclass chasing individual fields.
+    meta_info: Optional[Dict[str, Any]] = None
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -657,32 +664,57 @@ async def async_request_truss(
 async def async_request_sglang_generate(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
+    *,
+    sampling_params: Optional[Dict[str, Any]] = None,
+    stream: bool = True,
 ) -> RequestFuncOutput:
+    """Measure one /generate request.
+
+    CLI mode (``sampling_params=None``): sampling params, the stream flag,
+    and the logprob payload fields are built from the module-level ``args``,
+    exactly as before this function grew keyword parameters.
+
+    Import mode (``sampling_params`` given): the caller controls the payload
+    per request and the module-level ``args`` is never read, so the function
+    is importable without running the CLI. ``request_func_input.rid``, when
+    set, is forwarded to the payload in both modes.
+    """
     api_url = request_func_input.api_url
     prompt = request_func_input.prompt
 
     async with _create_bench_client_session() as session:
-        sampling_params = {
-            "temperature": args.temperature,
-            "max_new_tokens": request_func_input.output_len,
-            "ignore_eos": not args.disable_ignore_eos,
-        }
-        if args.top_p < 1.0:
-            sampling_params["top_p"] = args.top_p
+        use_global_args = sampling_params is None
+        if use_global_args:
+            sampling_params = {
+                "temperature": args.temperature,
+                "max_new_tokens": request_func_input.output_len,
+                "ignore_eos": not args.disable_ignore_eos,
+            }
+            if args.top_p < 1.0:
+                sampling_params["top_p"] = args.top_p
+            stream = not args.disable_stream
+            global_args_fields = {
+                "return_logprob": args.return_logprob,
+                "return_routed_experts": args.return_routed_experts,
+                "logprob_start_len": args.logprob_start_len,
+            }
+        else:
+            global_args_fields = {}
         payload = {
             ("text" if isinstance(prompt, str) else "input_ids"): prompt,
             "sampling_params": sampling_params,
-            "stream": not args.disable_stream,
+            "stream": stream,
             "lora_path": request_func_input.lora_name,
-            "return_logprob": args.return_logprob,
-            "return_routed_experts": args.return_routed_experts,
-            "logprob_start_len": args.logprob_start_len,
+            **global_args_fields,
             **request_func_input.extra_request_body,
         }
-        if args.top_logprobs_num > 0:
-            payload["top_logprobs_num"] = args.top_logprobs_num
-        if args.token_ids_logprob is not None:
-            payload["token_ids_logprob"] = args.token_ids_logprob
+        if use_global_args:
+            if args.top_logprobs_num > 0:
+                payload["top_logprobs_num"] = args.top_logprobs_num
+            if args.token_ids_logprob is not None:
+                payload["token_ids_logprob"] = args.token_ids_logprob
+        if request_func_input.rid is not None:
+            payload["rid"] = request_func_input.rid
 
         # Add image data if available (list of image urls/base64)
         if request_func_input.image_data:
@@ -725,6 +757,8 @@ async def async_request_sglang_generate(
                             data = orjson.loads(sse_data)
 
                             _meta_info = data.get("meta_info") or {}
+                            if _meta_info:
+                                output.meta_info = _meta_info
                             if _meta_info.get("spec_accept_length") is not None:
                                 output.spec_accept_length = _meta_info[
                                     "spec_accept_length"
