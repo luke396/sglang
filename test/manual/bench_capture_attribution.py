@@ -32,6 +32,17 @@ item matches):
   flushed so both arms enter measurement with an equally cold radix tree.
 - Capture arm: mooncake sink, WINDOW_S == PERIOD_S (every request captured).
 
+Instrument-validity guards (a leg that fails these is method-invalid, not a
+result): the mooncake master binary defaults to the SERVER interpreter's own
+mooncake package (a version-mismatched master rejects mount_segment, store
+setup fails with -900 and capture runs silently degraded while the bench
+completes normally); the capture arm fails fast right after warmup if the
+pipeline staged nothing or any degraded-mode counter is nonzero, and fails
+after the burst unless every measured request exported.  Source identity is
+resolved once at startup, so a staging-dir launch without
+SGLANG_CHARACTERIZATION_SOURCE_ROOT dies in seconds, not at the manifest
+write after a completed leg.
+
 Convert the 2026-08-20 burst format with ``--convert-burst old.jsonl
 new.jsonl`` (synthesizes a completion with the row's max_new_tokens tokens).
 
@@ -291,7 +302,86 @@ def _terminate(process, timeout_s=60):
         process.wait(timeout=30)
 
 
-def run_leg(args, matrix, arm, leg_dir):
+def _default_master_bin(server_python):
+    """mooncake_master shipped with the SERVER interpreter's mooncake package.
+
+    The master must version-match the server-side client: a mismatched master
+    rejects mount_segment ("invalid rpc arg"), store setup fails with -900,
+    and capture runs silently degraded while the bench completes normally.
+    Resolving from the server venv makes the default version-matched by
+    construction; --master-bin still overrides.
+    """
+    resolved = subprocess.run(
+        [
+            server_python,
+            "-c",
+            "import mooncake, os; print(os.path.join("
+            "os.path.dirname(mooncake.__file__), 'mooncake_master'))",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    if not os.path.isfile(resolved):
+        raise FileNotFoundError(
+            f"mooncake_master not found in the server interpreter's mooncake "
+            f"package: {resolved}"
+        )
+    return resolved
+
+
+def _assert_capture_live(warmed_stats):
+    """Fail fast when the warmed-up capture pipeline is degraded or empty.
+
+    Store-setup failures leave the bench runnable while capture stages
+    nothing; catching that here costs seconds instead of a lost leg.
+    """
+    degraded = {
+        name: value
+        for name, value in warmed_stats.items()
+        if name.startswith("capture_degraded") and value
+    }
+    if degraded:
+        raise AssertionError(f"capture degraded after warmup: {degraded}")
+    if not warmed_stats.get("rows_staged_ct"):
+        raise AssertionError(
+            "capture staged no rows for the warmup requests; store setup "
+            "likely failed (check mooncake.log and server.log in the leg dir)"
+        )
+
+
+def _capture_validity_error(stats_delta, drained, completed):
+    """None when the measured window's capture coverage is method-valid.
+
+    The counter delta must show a drained pipeline, no degraded-mode
+    entries, and one export per measured request — anything else means the
+    instrument was not measuring what the report claims (the 2026-08-20
+    session's 13/14 sample_too_large misses shipped unnoticed this way).
+    """
+    if not drained:
+        return "capture pipeline did not drain after the burst"
+    degraded = {
+        name: value
+        for name, value in stats_delta.items()
+        if name.startswith("capture_degraded") and value
+    }
+    if degraded:
+        return f"degraded-mode counters nonzero in the measured window: {degraded}"
+    exported = stats_delta.get("export_ok_ct", 0)
+    if exported != completed:
+        misses = {
+            name: value
+            for name, value in stats_delta.items()
+            if name.endswith("_miss_ct") and value
+        }
+        return (
+            f"export coverage {exported}/{completed} in the measured window "
+            f"(misses: {misses or 'none recorded'})"
+        )
+    return None
+
+
+def run_leg(args, matrix, arm, leg_dir, source_identity):
     from sglang.benchmark.serving import run_benchmark
 
     os.makedirs(leg_dir, exist_ok=True)
@@ -306,7 +396,7 @@ def run_leg(args, matrix, arm, leg_dir):
     nsys = None
     server_log = open(os.path.join(leg_dir, "server.log"), "w")
     if arm == "on":
-        master_bin = args.master_bin or matrix.MASTER_BIN
+        master_bin = args.master_bin or _default_master_bin(args.server_python)
         master = subprocess.Popen(
             [
                 master_bin,
@@ -340,6 +430,7 @@ def run_leg(args, matrix, arm, leg_dir):
             if not drained:
                 raise AssertionError("capture pipeline did not drain after warmup")
             before_stats = matrix._sum_capture_stats(before_snapshots)
+            _assert_capture_live(before_stats)
         else:
             before_stats = {}
 
@@ -359,6 +450,10 @@ def run_leg(args, matrix, arm, leg_dir):
             result["capture_drain_s"] = drain_s
             result["capture_stats_delta"] = stats_delta
             result["captured_rows"] = stats_delta.get("rows_staged_ct", 0)
+            validity_error = _capture_validity_error(
+                stats_delta, drained, int(bench.get("completed", 0))
+            )
+            result["capture_validity_error"] = validity_error
         result.update(
             {
                 "burst_start": burst_start,
@@ -399,10 +494,15 @@ def run_leg(args, matrix, arm, leg_dir):
             if key.startswith(("SGLANG_HIDDEN_CAPTURE", "MOONCAKE"))
         ),
     }
-    result["source_identity"] = matrix._source_identity()
+    result["source_identity"] = source_identity
     run_json = os.path.join(leg_dir, f"run-{arm}.json")
     with open(run_json, "w") as handle:
         json.dump(result, handle, indent=1)
+    validity_error = result.get("capture_validity_error")
+    if validity_error:
+        raise AssertionError(
+            f"leg is method-invalid ({validity_error}); evidence kept at {run_json}"
+        )
     print(f"[leg done] mode={args.mode} arm={arm} -> {run_json}")
     return run_json
 
@@ -537,7 +637,8 @@ def main():
     )
     parser.add_argument("--master-bin",
                         help="mooncake_master binary (default: alongside the "
-                        "benchmark-side mooncake package)")
+                        "SERVER interpreter's mooncake package, so master and "
+                        "server client are version-matched)")
     parser.add_argument("--out", help="leg artifact directory")
     parser.add_argument("--report", nargs=2, metavar=("ON_JSON", "OFF_JSON"),
                         help="paired bare-mode TTFT/ITL delta report")
@@ -556,12 +657,23 @@ def main():
 
     sys.path.insert(0, _REPO_PYTHON)
     matrix = _load_matrix_module()
+    # Resolve once, before any leg: from a staging dir this needs
+    # SGLANG_CHARACTERIZATION_SOURCE_ROOT, and failing here costs seconds
+    # instead of a completed leg dying at the manifest write.
+    try:
+        source_identity = matrix._source_identity()
+    except subprocess.CalledProcessError as error:
+        raise SystemExit(
+            f"cannot resolve source identity ({error}); when running from a "
+            "staging copy, set SGLANG_CHARACTERIZATION_SOURCE_ROOT to the "
+            "real worktree"
+        ) from error
     run_jsons = {}
     for arm in args.arms.split(","):
         arm = arm.strip()
         if arm not in ("on", "off"):
             parser.error(f"unknown arm {arm!r}")
-        run_jsons[arm] = run_leg(args, matrix, arm, args.out)
+        run_jsons[arm] = run_leg(args, matrix, arm, args.out, source_identity)
     if args.mode == "bare" and set(run_jsons) == {"on", "off"}:
         paired_report(run_jsons["on"], run_jsons["off"])
 
