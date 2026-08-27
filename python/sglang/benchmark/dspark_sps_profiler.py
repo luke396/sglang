@@ -111,8 +111,17 @@ INFO_RECORD_ENABLE_HINT = (
 )
 
 
+class ProfileEndpoints(msgspec.Struct, frozen=True):
+    load_base_url: str
+    control_base_url: str
+
+    @property
+    def is_separate(self) -> bool:
+        return self.load_base_url != self.control_base_url
+
+
 class ServerContext(msgspec.Struct, frozen=True):
-    base_url: str
+    control_base_url: str
     tokenizer_path: str
     tp_size: int
     dp_size: int
@@ -121,6 +130,8 @@ class ServerContext(msgspec.Struct, frozen=True):
     cuda_graph_max_bs: Optional[int]
     skip_max_running_requests_threshold: float
     skip_token_capacity_threshold: float
+    disaggregation_mode: str | None = None
+    disaggregation_transfer_backend: str | None = None
 
 
 class RoundSettings(msgspec.Struct, frozen=True):
@@ -165,7 +176,7 @@ def out_paths(*, out: str) -> dict[str, Path]:
 
 def run_profile(
     *,
-    base_url: str,
+    endpoints: ProfileEndpoints,
     batch_sizes: list[int],
     settings: RoundSettings,
     out: str,
@@ -179,13 +190,6 @@ def run_profile(
             "process loaded the torch-free fallback. Run 'run' where sglang is "
             "installed; 'fit' works in either environment."
         )
-    if not base_url:
-        raise ValueError(
-            "dspark_sps_profiler connects to an already-running DSpark server "
-            "(SGLANG_RAGGED_VERIFY_MODE=static, SGLANG_DSPARK_ENABLE_SPS_RECORD=1); "
-            "pass --base-url <url> (it never launches a server)."
-        )
-
     offdiag = fracs is not None
     if offdiag:
         for frac in fracs:
@@ -203,9 +207,10 @@ def run_profile(
             path.unlink()
 
     context = fetch_server_context(
-        base_url=base_url,
+        control_base_url=endpoints.control_base_url,
         local_tokenizer_path=local_tokenizer_path,
         allowed_modes=("compact", "cap-accept") if offdiag else ("static",),
+        require_pd_decode=endpoints.is_separate,
     )
     vocab_size = len(get_tokenizer(context.tokenizer_path))
     batch_sizes = sorted(set(batch_sizes))
@@ -216,6 +221,7 @@ def run_profile(
 
     run_warmup_round(
         context=context,
+        endpoints=endpoints,
         vocab_size=vocab_size,
         batch_sizes=batch_sizes,
         settings=settings,
@@ -229,6 +235,7 @@ def run_profile(
             for frac in frac_sweep:
                 outcome = run_one_round(
                     context=context,
+                    endpoints=endpoints,
                     vocab_size=vocab_size,
                     batch_size_per_rank=batch_size_per_rank,
                     settings=settings,
@@ -274,6 +281,7 @@ def run_profile(
         records_path=paths["records"],
         rounds_path=paths["rounds"],
         context=context,
+        endpoints=endpoints,
         batch_sizes=batch_sizes,
         settings=settings,
         repeats=repeats,
@@ -339,7 +347,7 @@ def fit_profile(
 
 def profile_all(
     *,
-    base_url: str,
+    endpoints: ProfileEndpoints,
     batch_sizes: list[int],
     settings: RoundSettings,
     out: str,
@@ -351,7 +359,7 @@ def profile_all(
     plot: bool,
 ) -> None:
     run_profile(
-        base_url=base_url,
+        endpoints=endpoints,
         batch_sizes=batch_sizes,
         settings=settings,
         out=out,
@@ -409,18 +417,27 @@ def build_table_from_summaries(
 
 def fetch_server_context(
     *,
-    base_url: str,
+    control_base_url: str,
     local_tokenizer_path: Optional[str],
     allowed_modes: tuple[str, ...] = ("static",),
+    require_pd_decode: bool = False,
 ) -> ServerContext:
-    response = requests.get(base_url + "/server_info", timeout=DEFAULT_TIMEOUT)
+    response = requests.get(control_base_url + "/server_info", timeout=DEFAULT_TIMEOUT)
     response.raise_for_status()
     info = response.json()
+
+    disaggregation_mode = info.get("disaggregation_mode")
+    if require_pd_decode and disaggregation_mode != "decode":
+        raise ValueError(
+            "A separate DSpark SPS control endpoint must be a PD decode server: "
+            f"{control_base_url} reports disaggregation_mode="
+            f"{disaggregation_mode!r}."
+        )
 
     speculative_algorithm = info.get("speculative_algorithm")
     if speculative_algorithm != "DSPARK":
         raise ValueError(
-            f"Profile against a DSpark server: {base_url} reports "
+            f"Profile against a DSpark server: {control_base_url} reports "
             f"speculative_algorithm={speculative_algorithm!r}. The SPS table is "
             "measured from real static-mode DSpark verify steps; relaunch with "
             "--speculative-algorithm DSPARK and SGLANG_RAGGED_VERIFY_MODE=static."
@@ -434,7 +451,9 @@ def fetch_server_context(
 
     internal_states = info.get("internal_states") or []
     if not internal_states:
-        raise RuntimeError(f"{base_url}/server_info returned no internal_states.")
+        raise RuntimeError(
+            f"{control_base_url}/server_info returned no internal_states."
+        )
     sps_payloads = [state.get(INFO_RECORD_PAYLOAD_KEY) for state in internal_states]
     for rank_index, payload in enumerate(sps_payloads):
         if payload is None:
@@ -502,7 +521,7 @@ def fetch_server_context(
         )
 
     return ServerContext(
-        base_url=base_url,
+        control_base_url=control_base_url,
         tokenizer_path=tokenizer_path,
         tp_size=int(info.get("tp_size", 1) or 1),
         dp_size=dp_size,
@@ -511,6 +530,8 @@ def fetch_server_context(
         cuda_graph_max_bs=cuda_graph_max_bs,
         skip_max_running_requests_threshold=skip_max_running,
         skip_token_capacity_threshold=skip_token_capacity,
+        disaggregation_mode=disaggregation_mode,
+        disaggregation_transfer_backend=info.get("disaggregation_transfer_backend"),
     )
 
 
@@ -589,6 +610,7 @@ def round_max_new_tokens(*, settings: RoundSettings) -> int:
 def run_warmup_round(
     *,
     context: ServerContext,
+    endpoints: ProfileEndpoints,
     vocab_size: int,
     batch_sizes: list[int],
     settings: RoundSettings,
@@ -606,6 +628,7 @@ def run_warmup_round(
     try:
         run_one_round(
             context=context,
+            endpoints=endpoints,
             vocab_size=vocab_size,
             batch_size_per_rank=min(8, max(batch_sizes)),
             settings=warmup_settings,
@@ -613,12 +636,15 @@ def run_warmup_round(
             frac=frac,
         )
     except Exception:
+        if endpoints.is_separate:
+            raise
         logger.warning("Warmup round failed; continuing.", exc_info=True)
 
 
 def run_one_round(
     *,
     context: ServerContext,
+    endpoints: ProfileEndpoints,
     vocab_size: int,
     batch_size_per_rank: int,
     settings: RoundSettings,
@@ -638,17 +664,20 @@ def run_one_round(
         return None
 
     if frac is not None:
-        set_forced_budget_frac(base_url=context.base_url, frac=frac)
+        set_forced_budget_frac(base_url=endpoints.control_base_url, frac=frac)
 
-    flush_cache(base_url=context.base_url)
+    if endpoints.is_separate:
+        _ensure_decode_idle(control_base_url=endpoints.control_base_url)
+    else:
+        flush_cache(base_url=endpoints.control_base_url)
     watermarks = [
         max((row.forward_ct for row in rows), default=-1)
-        for rows in fetch_rank_rows(base_url=context.base_url)
+        for rows in fetch_rank_rows(base_url=endpoints.control_base_url)
     ]
 
     start_time = time.monotonic()
     load_thread = start_load(
-        base_url=context.base_url,
+        base_url=endpoints.load_base_url,
         num_requests=batch_size,
         input_len=settings.input_len,
         max_new_tokens=max_new_tokens,
@@ -656,22 +685,21 @@ def run_one_round(
         vocab_size=vocab_size,
         rng=rng,
     )
-    reached_target = wait_for_aligned_steps(
-        context=context,
-        watermarks=watermarks,
-        batch_size_per_rank=batch_size_per_rank,
-        min_steady_steps=settings.min_steady_steps,
-        min_steady_seconds=settings.min_steady_seconds,
-        timeout_seconds=settings.round_timeout_seconds,
-    )
-    abort_all_requests(base_url=context.base_url)
-    load_thread.join(timeout=LOAD_JOIN_TIMEOUT_SECONDS)
-    if load_thread.is_alive():
-        logger.warning(
-            "Load batch for bs=%s did not return within %.0fs after abort; "
-            "continuing with the collected records.",
-            batch_size,
-            LOAD_JOIN_TIMEOUT_SECONDS,
+    try:
+        reached_target = wait_for_aligned_steps(
+            context=context,
+            watermarks=watermarks,
+            batch_size_per_rank=batch_size_per_rank,
+            min_steady_steps=settings.min_steady_steps,
+            min_steady_seconds=settings.min_steady_seconds,
+            timeout_seconds=settings.round_timeout_seconds,
+        )
+    finally:
+        _stop_load(
+            load_thread=load_thread,
+            control_base_url=endpoints.control_base_url,
+            batch_size=batch_size,
+            require_join=endpoints.is_separate,
         )
     wall_seconds = time.monotonic() - start_time
     if not reached_target:
@@ -684,11 +712,10 @@ def run_one_round(
             settings.min_steady_seconds,
         )
 
-    rank_rows = fetch_rank_rows(base_url=context.base_url)
+    rank_rows = fetch_rank_rows(base_url=endpoints.control_base_url)
     if len(rank_rows) != len(watermarks):
         raise RuntimeError(
-            f"DP rank count changed mid-profile: {len(watermarks)} -> "
-            f"{len(rank_rows)}."
+            f"DP rank count changed mid-profile: {len(watermarks)} -> {len(rank_rows)}."
         )
     new_rank_rows = [
         [row for row in rows if row.forward_ct > watermark]
@@ -752,6 +779,50 @@ def start_load(
     return thread
 
 
+def _stop_load(
+    *,
+    load_thread: threading.Thread,
+    control_base_url: str,
+    batch_size: int,
+    require_join: bool,
+) -> None:
+    abort_error: requests.exceptions.RequestException | None = None
+    try:
+        abort_all_requests(base_url=control_base_url)
+    except requests.exceptions.RequestException as exc:
+        abort_error = exc
+
+    load_thread.join(timeout=LOAD_JOIN_TIMEOUT_SECONDS)
+    if load_thread.is_alive():
+        message = (
+            f"Load batch for bs={batch_size} did not return within "
+            f"{LOAD_JOIN_TIMEOUT_SECONDS:.0f}s after abort."
+        )
+        if require_join:
+            raise RuntimeError(message) from abort_error
+        logger.warning("%s Continuing with the collected records.", message)
+
+    if abort_error is not None:
+        raise abort_error
+
+    if require_join:
+        _ensure_decode_idle(control_base_url=control_base_url)
+
+
+def _ensure_decode_idle(*, control_base_url: str) -> None:
+    try:
+        response = requests.post(
+            control_base_url + "/flush_cache",
+            params={"timeout": LOAD_JOIN_TIMEOUT_SECONDS},
+            timeout=DEFAULT_TIMEOUT + LOAD_JOIN_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(
+            f"PD decode did not become idle: {control_base_url}."
+        ) from exc
+
+
 def wait_for_aligned_steps(
     *,
     context: ServerContext,
@@ -766,7 +837,7 @@ def wait_for_aligned_steps(
     while time.monotonic() < deadline:
         time.sleep(POLL_INTERVAL_SECONDS)
         try:
-            rank_rows = fetch_rank_rows(base_url=context.base_url)
+            rank_rows = fetch_rank_rows(base_url=context.control_base_url)
         except Exception:
             logger.warning("Polling /server_info failed; retrying.", exc_info=True)
             continue
@@ -1264,6 +1335,7 @@ def write_manifest(
     records_path: Path,
     rounds_path: Path,
     context: ServerContext,
+    endpoints: ProfileEndpoints,
     batch_sizes: list[int],
     settings: RoundSettings,
     repeats: int,
@@ -1271,7 +1343,10 @@ def write_manifest(
     fracs: Optional[list[float]],
 ) -> None:
     manifest = {
-        "base_url": context.base_url,
+        "base_url": endpoints.control_base_url,
+        "load_base_url": endpoints.load_base_url,
+        "control_base_url": endpoints.control_base_url,
+        "endpoint_layout": "separate" if endpoints.is_separate else "shared",
         "tp_size": context.tp_size,
         "dp_size": context.dp_size,
         "verify_num_draft_tokens": context.verify_num_draft_tokens,
@@ -1291,6 +1366,12 @@ def write_manifest(
             round_summary_dict(outcome=outcome, repeat=0) for outcome in rounds
         ],
     }
+    if context.disaggregation_mode is not None:
+        manifest["disaggregation_mode"] = context.disaggregation_mode
+    if context.disaggregation_transfer_backend is not None:
+        manifest["disaggregation_transfer_backend"] = (
+            context.disaggregation_transfer_backend
+        )
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
 
@@ -1366,6 +1447,40 @@ def add_out_arg(parser: argparse.ArgumentParser) -> None:
         type=str,
         default="info",
         help="Python logging level for the profiler.",
+    )
+
+
+def resolve_profile_endpoints(
+    *,
+    base_url: str,
+    load_base_url: str | None = None,
+    control_base_url: str | None = None,
+) -> ProfileEndpoints:
+    base_url = base_url.rstrip("/")
+    load_base_url = (load_base_url or "").rstrip("/")
+    control_base_url = (control_base_url or "").rstrip("/")
+
+    has_endpoint_pair = bool(load_base_url or control_base_url)
+    if base_url and has_endpoint_pair:
+        raise ValueError(
+            "--base-url cannot be combined with --load-base-url or --control-base-url."
+        )
+    if has_endpoint_pair:
+        if not load_base_url or not control_base_url:
+            raise ValueError(
+                "--load-base-url and --control-base-url must be provided together."
+            )
+        return ProfileEndpoints(
+            load_base_url=load_base_url,
+            control_base_url=control_base_url,
+        )
+    if not base_url:
+        raise ValueError(
+            "Pass --base-url, or pass both --load-base-url and --control-base-url."
+        )
+    return ProfileEndpoints(
+        load_base_url=base_url,
+        control_base_url=base_url,
     )
 
 
@@ -1469,6 +1584,24 @@ def add_run_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_all_endpoint_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--load-base-url",
+        type=str,
+        default=None,
+        help="PD Router base URL used only for POST /generate. Must be paired "
+        "with --control-base-url and cannot be combined with --base-url.",
+    )
+    parser.add_argument(
+        "--control-base-url",
+        type=str,
+        default=None,
+        help="PD decode server base URL used for SPS records and control "
+        "requests. Must be paired with --load-base-url and cannot be combined "
+        "with --base-url.",
+    )
+
+
 def add_fit_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--max-batch-tokens",
@@ -1533,6 +1666,7 @@ def cli_main() -> None:
     all_parser = subparsers.add_parser("all", help="Run then fit in one shot.")
     add_out_arg(all_parser)
     add_run_args(all_parser)
+    add_all_endpoint_args(all_parser)
     add_fit_args(all_parser)
 
     args = parser.parse_args()
@@ -1542,8 +1676,12 @@ def cli_main() -> None:
     )
 
     if args.command == "run":
+        try:
+            endpoints = resolve_profile_endpoints(base_url=args.base_url)
+        except ValueError as exc:
+            parser.error(str(exc))
         run_profile(
-            base_url=args.base_url,
+            endpoints=endpoints,
             batch_sizes=run_batch_sizes(args=args),
             settings=run_settings(args=args),
             out=args.out,
@@ -1559,8 +1697,16 @@ def cli_main() -> None:
             plot=args.plot,
         )
     else:
+        try:
+            endpoints = resolve_profile_endpoints(
+                base_url=args.base_url,
+                load_base_url=args.load_base_url,
+                control_base_url=args.control_base_url,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
         profile_all(
-            base_url=args.base_url,
+            endpoints=endpoints,
             batch_sizes=run_batch_sizes(args=args),
             settings=run_settings(args=args),
             out=args.out,
