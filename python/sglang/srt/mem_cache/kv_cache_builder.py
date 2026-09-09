@@ -39,7 +39,7 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -161,10 +161,6 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
             isinstance(kv_cache, MHATokenToKVPool)
             or (isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0)
         )
-        # temporarily only support Kimi-K3, not validated on other model
-        supports_host_pool = supports_host_pool or (
-            isinstance(kv_cache, HybridLinearKVPool) and not tp_worker.is_hybrid_swa
-        )
         # TODO(zhangmj): maintain host_pool for priority scheduling, but need
         # to disable when disable hicache.
         backend = (
@@ -173,8 +169,8 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
             # Large ROCm retraction restores can fault the GPU process. Keep
             # host_pool opt-in on HIP until the retraction path is safe at scale.
             and not is_hip()
-            # Unified{MHA,HybridLinear}KVPool pass the isinstance checks below
-            # but hand out virtual slots the host transfer never translates.
+            # Unified MHA pools pass the isinstance checks below but hand out
+            # virtual slots the host transfer never translates.
             and not memory.enable_unified_memory
             and not get_parallel().dcp_enabled
             and not disagg.disaggregation_decode_enable_radix_cache
