@@ -954,6 +954,43 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
         src_token_indices = plan.src_token_indices
         dst_token_indices = plan.dst_token_indices
+        tokens_per_batch = src_token_indices.size
+        if pack_buffer is not None:
+            bytes_per_token = sum(dcp_token_item_lens[: len(src_kv_ptrs)])
+            if bytes_per_token > 0:
+                capacity = pack_buffer.get_size() // bytes_per_token
+                if capacity > 0:
+                    tokens_per_batch = min(tokens_per_batch, capacity)
+
+        # Cached prefixes or KV accumulated before bootstrap can exceed the
+        # existing pack buffer. Complete each slice before reusing its bytes.
+        for start in range(0, src_token_indices.size, tokens_per_batch):
+            end = start + tokens_per_batch
+            ret = self._send_kvcache_dcp_slice(
+                mooncake_session_id,
+                src_kv_ptrs,
+                dst_kv_ptrs,
+                src_token_indices[start:end],
+                dst_token_indices[start:end],
+                dcp_token_item_lens,
+                executor,
+                pack_buffer,
+            )
+            if ret != 0:
+                return ret
+        return 0
+
+    def _send_kvcache_dcp_slice(
+        self,
+        mooncake_session_id: str,
+        src_kv_ptrs: list[int],
+        dst_kv_ptrs: list[int],
+        src_token_indices: npt.NDArray[np.int64],
+        dst_token_indices: npt.NDArray[np.int64],
+        dcp_token_item_lens: List[int],
+        executor: concurrent.futures.ThreadPoolExecutor,
+        pack_buffer,
+    ) -> int:
         if pack_buffer is not None:
             from sglang.srt.disaggregation.common.dcp_pack import try_pack_dcp_src
 
@@ -963,8 +1000,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 src_token_indices=src_token_indices,
                 token_item_lens=dcp_token_item_lens[: len(src_kv_ptrs)],
             )
-            if packed is not None:
-                src_kv_ptrs, src_token_indices = packed
+            assert packed is not None, (
+                "Mooncake DCP slice must fit in the pack buffer after capacity batching "
+                f"(tokens={src_token_indices.size}, buffer_bytes={pack_buffer.get_size()})"
+            )
+            src_kv_ptrs, src_token_indices = packed
 
         layers_current_pp_stage = len(src_kv_ptrs)
         src_groups, dst_groups = group_concurrent_contiguous(
