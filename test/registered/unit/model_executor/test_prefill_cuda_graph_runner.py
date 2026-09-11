@@ -8,6 +8,7 @@ import torch
 
 import sglang.srt.model_executor.model_runner_components.cuda_graph_setup as graph_setup
 import sglang.srt.model_executor.runner.prefill_cuda_graph_runner as runner_module
+from sglang.srt.model_executor.cuda_graph_buffer_registry import build_prefill_registry
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -65,32 +66,6 @@ class _FakeKVIndexKernel:
                 cursor += seq_len
 
         return run
-
-
-class _FakeGraphSlot:
-    def __init__(self, buffer):
-        self.buffer = buffer
-
-    def slice_for(self, _batch_size, num_tokens):
-        return self.buffer[:num_tokens]
-
-
-class _FakeBatchRegistry:
-    def __init__(self):
-        self.slots = {
-            "input_ids": _FakeGraphSlot(torch.arange(4, dtype=torch.int64)),
-            "positions": _FakeGraphSlot(torch.arange(4, dtype=torch.int64)),
-            "out_cache_loc": _FakeGraphSlot(torch.arange(4, dtype=torch.int64)),
-        }
-
-    def fill_from(self, *_args, **_kwargs):
-        return None
-
-    def has_slot(self, name):
-        return name in self.slots
-
-    def get_slot(self, name):
-        return self.slots[name]
 
 
 class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
@@ -241,10 +216,18 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         self.assertEqual(tuple(trimmed["hidden_states"].shape), (3, 4))
         self.assertEqual(tuple(trimmed["residual"].shape), (3, 4))
 
-    def test_static_batch_preserves_consumed_multimodal_embeddings(self):
+    def test_static_batch_preserves_model_side_inputs(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner.capture_num_tokens = [4]
-        runner.buffer_registry = _FakeBatchRegistry()
+        runner.buffer_registry = build_prefill_registry(
+            device=torch.device("cpu"),
+            max_bs=1,
+            max_num_token=4,
+            cache_loc_dtype=torch.int64,
+            enable_num_token_non_padded=True,
+            enable_global_num_token_non_padded=True,
+            share_pool=False,
+        )
         runner.model_runner = SimpleNamespace(attn_tp_sequence_sharded=lambda _: False)
         runner.enable_cp_bcg_capture = False
         runner._is_full_backend = False
@@ -256,6 +239,13 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner._next_token_logits_buffer = lambda _rows: None
         runner._prefill_logits_buffer_rows = lambda _batch: 1
         runner._prepare_forward_metadata_for_replay = lambda *_args: None
+
+        local_count = runner._capture_num_token_non_padded(4)
+        global_count = runner.buffer_registry.get_slot(
+            "global_num_token_non_padded"
+        ).buffer
+        self.assertEqual(local_count.item(), 4)
+        self.assertEqual(global_count.item(), 4)
 
         mm_input_embeds = torch.randn(3, 8)
         forward_batch = ForwardBatch(
@@ -277,11 +267,20 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             mm_input_embeds=mm_input_embeds,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             global_forward_mode=ForwardMode.EXTEND,
+            global_num_token_non_padded=torch.tensor(3, dtype=torch.int32),
+            global_num_token_non_padded_cpu=3,
         )
 
         static_batch = runner.load_batch(forward_batch)
 
         self.assertIs(static_batch.mm_input_embeds, mm_input_embeds)
+        self.assertIs(static_batch.global_num_token_non_padded, global_count)
+        self.assertEqual(
+            global_count.shape, forward_batch.global_num_token_non_padded.shape
+        )
+        self.assertEqual(global_count.item(), 3)
+        self.assertIs(static_batch.num_token_non_padded, local_count)
+        self.assertEqual(local_count.item(), 3)
 
     def test_eagle_target_full_reaches_graph_construction(self):
         override = get_context().override_server_args(

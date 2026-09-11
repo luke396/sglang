@@ -30,6 +30,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers import (
     k3_ar_fusion,
     k3_gemm_ar,
@@ -437,6 +438,9 @@ class KimiK3MoE(nn.Module):
         self.alt_stream = alt_stream
         self._dp_attention = is_dp_attention_enabled()
 
+        self._record_expert_distribution = (
+            get_exec().moe.expert_distribution_recorder_mode is not None
+        )
         self.use_latent_moe = config.routed_expert_hidden_size is not None
         # Merged front weight ([H, gate_up + E + latent]), built after weight
         # loading by _merge_front_weights().
@@ -889,10 +893,8 @@ class KimiK3MoE(nn.Module):
             return False
         if self.gate.e_score_correction_bias is None:
             return False
-        # K3 calls self.topk() without a padding mask or EPLB dispatch info, so
-        # select_experts' post-processing collapses to the capture hook and the
-        # recorder -- both of which build_precomputed_topk_output runs. Bail out
-        # if that ever stops holding rather than silently dropping the remap.
+        # The precomputed builder handles padding, capture and recording.
+        # Remapping/shared-slot appending still require the regular TopK path.
         if not precomputed_topk_postprocess_is_noop(cfg):
             return False
         if get_exec().deterministic.enable_deterministic_inference:
@@ -917,7 +919,11 @@ class KimiK3MoE(nn.Module):
             and self._routing_contract_ok
         )
 
-    def _ep_front(self, hidden_states: torch.Tensor):
+    def _ep_front(
+        self,
+        hidden_states: torch.Tensor,
+        num_token_non_padded: Optional[torch.Tensor] = None,
+    ):
         """Merged front: returns ``(topk_output, routed_input)``, or None when the
         shape is not covered and the caller should run the unmerged path."""
         if not self._ep_front_eligible:
@@ -956,9 +962,18 @@ class KimiK3MoE(nn.Module):
                 self.layer_idx,
                 hidden_states.shape[0],
             )
-        return build_precomputed_topk_output(w, i, cfg, self.layer_idx), routed
+        return (
+            build_precomputed_topk_output(
+                w, i, cfg, self.layer_idx, num_token_non_padded=num_token_non_padded
+            ),
+            routed,
+        )
 
-    def _ep_front_overlap(self, hidden_states: torch.Tensor):
+    def _ep_front_overlap(
+        self,
+        hidden_states: torch.Tensor,
+        num_token_non_padded: Optional[torch.Tensor] = None,
+    ):
         """Overlap the exact fp32 gate+top-k with the latent down projection.
 
         The side stream is joined before returning. It is then free for the
@@ -982,7 +997,11 @@ class KimiK3MoE(nn.Module):
         self.alt_stream.wait_stream(current_stream)
         with torch.cuda.stream(self.alt_stream):
             router_logits = self.gate(hidden_states)
-            topk_output = self.topk(hidden_states, router_logits)
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                num_token_non_padded=num_token_non_padded,
+            )
 
         routed_input, _ = self.routed_expert_down_proj(hidden_states)
         current_stream.wait_stream(self.alt_stream)
@@ -1021,6 +1040,7 @@ class KimiK3MoE(nn.Module):
         hidden_states: torch.Tensor,
         *,
         prefix_sum: Optional[torch.Tensor],
+        num_token_non_padded: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Front section with three separate GEMMs, each reading
         hidden_states: shared-expert MLP, router gate, latent down-proj."""
@@ -1052,9 +1072,9 @@ class KimiK3MoE(nn.Module):
         # The gate and the latent down-proj read the same hidden_states, so the
         # merged-weight strategies compute both in one GEMM; see
         # kernels/ops/moe/moe_front.py for the strategy table.
-        routed_input = self._ep_front(hidden_states)
+        routed_input = self._ep_front(hidden_states, num_token_non_padded)
         if routed_input is None:
-            routed_input = self._ep_front_overlap(hidden_states)
+            routed_input = self._ep_front_overlap(hidden_states, num_token_non_padded)
         topk_output = None
         if routed_input is not None:
             topk_output, routed_input = routed_input
@@ -1063,7 +1083,11 @@ class KimiK3MoE(nn.Module):
             # or tiny_gemm_bf16); non-CUDA falls back to F.linear (bf16). The
             # fp32 logits reach the radix router from moe_fused_gate.
             router_logits = self.gate(hidden_states)
-            topk_output = self.topk(hidden_states, router_logits)
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                num_token_non_padded=num_token_non_padded,
+            )
         issue_shared()
 
         if not self.use_latent_moe:
@@ -1350,6 +1374,7 @@ class KimiK3MoE(nn.Module):
         *,
         prefix_sum: Optional[torch.Tensor] = None,
         forward_batch: Optional[ForwardBatch] = None,
+        token_offset: int = -1,
     ) -> torch.Tensor:
         """A pending prefix_sum is always consumed here: folded into the
         3-way JIT tail add when covered, plain adds otherwise (bit-identical
@@ -1373,10 +1398,35 @@ class KimiK3MoE(nn.Module):
             hidden_states = get_global_dp_buffer(get_tp_group())
             dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
             dp_prefix_sum, prefix_sum = prefix_sum, None
+        num_token_non_padded = None
+        if self._record_expert_distribution:
+            assert forward_batch is not None
+            num_token_non_padded = forward_batch.global_num_token_non_padded
+            if token_offset >= 0:
+                if (
+                    forward_batch.attn_tp_sequence_sharded
+                    and get_parallel().attn_cp_size == 1
+                ):
+                    # The runner already localized this same contiguous SP
+                    # shard, including updates in the graph replay buffer.
+                    num_token_non_padded = forward_batch.num_token_non_padded
+                else:
+                    # Model-managed SP can run with the runner's gather off.
+                    # Only that layout needs a separate localization here.
+                    assert num_token_non_padded is not None
+                    num_token_non_padded = torch.clamp(
+                        num_token_non_padded - token_offset, 0, num_tokens
+                    )
+            # A negative offset denotes a full-batch MLP, including RS fallback.
+            assert num_token_non_padded is not None
         if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
             out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
         else:
-            out = self._forward_unfused(hidden_states, prefix_sum=prefix_sum)
+            out = self._forward_unfused(
+                hidden_states,
+                prefix_sum=prefix_sum,
+                num_token_non_padded=num_token_non_padded,
+            )
         if use_dp:
             global_out = out
             out = get_local_dp_buffer(_dp_local_buffer_group())
@@ -2761,9 +2811,17 @@ class KimiK3DecoderLayer(nn.Module):
 
         # ---- MLP (consumes +prefix_sum: MoE folds it into the 3-way tail
         # add, dense adds it after down_proj) ----
-        out = self.mlp(
-            hidden_states, prefix_sum=prefix_sum, forward_batch=forward_batch
-        )
+        if self._is_moe_layer:
+            out = self.mlp(
+                hidden_states,
+                prefix_sum=prefix_sum,
+                forward_batch=forward_batch,
+                token_offset=shard_lo,
+            )
+        else:
+            out = self.mlp(
+                hidden_states, prefix_sum=prefix_sum, forward_batch=forward_batch
+            )
         if shard_lo >= 0:
             if keep_sharded:
                 return out, None, True
@@ -3022,6 +3080,39 @@ class KimiK3LinearModel(nn.Module):
 
 class KimiK3LinearForCausalLM(nn.Module):
     """Text-only K3 causal LM."""
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        moe = get_exec().moe
+        if (
+            moe.enable_eplb
+            or moe.ep_num_redundant_experts != 0
+            or moe.init_expert_location != "trivial"
+        ):
+            raise ValueError(
+                "Kimi-K3 supports expert distribution metrics with a fixed trivial "
+                "expert layout only; EPLB and redundant experts are not supported."
+            )
+        if moe.expert_distribution_recorder_mode is None:
+            return None
+        if (
+            moe.expert_distribution_recorder_mode != "stat"
+            or moe.moe_a2a_backend != "megamoe"
+            or moe.elastic_ep_backend is not None
+            or get_parallel().pp_size != 1
+        ):
+            raise ValueError(
+                "Kimi-K3 expert distribution metrics currently require "
+                "--moe-a2a-backend megamoe, recorder mode stat, PP=1 "
+                "and no elastic EP. Attention DP and DCP are supported."
+            )
+        if config.num_experts is None:
+            raise ValueError("Kimi-K3 expert distribution metrics require MoE layers.")
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.num_experts,
+            num_groups=config.num_expert_group,
+        )
 
     def __init__(
         self,
@@ -3400,6 +3491,12 @@ class KimiK3ForConditionalGeneration(nn.Module):
     """K3 multimodal wrapper: MoonViT3d tower + KimiK3LinearForCausalLM."""
 
     supports_cuda_vmm_feature_transport = True
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return KimiK3LinearForCausalLM.get_model_config_for_expert_location(
+            config.text_config
+        )
 
     # Fused runtime module -> checkpoint shard names, so quant configs can
     # match fused prefixes against per-shard exclude_modules

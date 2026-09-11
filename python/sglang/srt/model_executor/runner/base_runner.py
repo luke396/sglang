@@ -624,6 +624,8 @@ class BaseRunner(ABC):
             spec_info=spec_info,
             capture_hidden_mode=capture_hidden_mode,
             num_token_non_padded=buffers.num_token_non_padded,
+            # Dummy batches have no padding and this buffer is still GLOBAL.
+            global_num_token_non_padded=buffers.num_token_non_padded,
             global_forward_mode=capture_forward_mode,
             lora_ids=lora_ids,
         )

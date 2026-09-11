@@ -706,6 +706,7 @@ class TestBuildDecodeRegistry(unittest.TestCase):
         ):
             self.assertTrue(reg.has_slot(name), name)
         self.assertFalse(reg.has_slot("mamba_track_indices"))
+        self.assertFalse(reg.has_slot("global_num_token_non_padded"))
 
         raw_bs, padded_bs, raw_nt, padded_nt = 2, 4, 2, 4
         fb = _MiniForwardBatch(
@@ -829,19 +830,38 @@ class TestBuildDecodeRegistry(unittest.TestCase):
                 seq_len_fill_value=5,
                 cache_loc_dtype=torch.int64,
                 enable_num_token_non_padded=True,
+                enable_global_num_token_non_padded=True,
                 require_gathered_buffer=True,
                 attn_tp_sharded_fn=lambda num_tokens: True,
                 source=src,
             )
             fb = _MiniForwardBatch(
-                global_num_token_non_padded=torch.tensor([100], dtype=torch.int32),
+                global_num_token_non_padded=torch.tensor(100, dtype=torch.int32),
             )
             reg.fill_from(
                 fb, raw_bs=4, padded_bs=4, raw_num_tokens=4, padded_num_tokens=8
             )
-        # tokens_per_rank = padded_num_tokens(8) // attn_tp_size(2) = 4;
-        # local = clamp(global(100) - rank*4, 0, 4) = 4.
-        self.assertEqual(int(src.num_token_non_padded.item()), 4)
+            view = reg.extract_buffer(
+                padded_bs=4, padded_num_tokens=8, forward_batch_template=fb
+            )
+            self.assertEqual(view.global_num_token_non_padded.item(), 100)
+            # Match init_new's scalar shape so grouped CUDA copy needs no broadcast.
+            self.assertEqual(view.global_num_token_non_padded.shape, torch.Size([]))
+            # tokens_per_rank = 8 // 2 = 4; LOCAL clamps GLOBAL to this shard.
+            self.assertEqual(view.num_token_non_padded.item(), 4)
+            global_ptr = view.global_num_token_non_padded.data_ptr()
+            # Replay updates the same graph-visible GLOBAL and LOCAL storage.
+            for total, local in ((3, 3), (0, 0), (7, 4)):
+                fb.global_num_token_non_padded.fill_(total)
+                reg.fill_from(
+                    fb, raw_bs=4, padded_bs=4, raw_num_tokens=4, padded_num_tokens=8
+                )
+                self.assertEqual(view.global_num_token_non_padded.item(), total)
+                self.assertEqual(view.num_token_non_padded.item(), local)
+                self.assertEqual(
+                    view.global_num_token_non_padded.data_ptr(), global_ptr
+                )
+            self.assertIs(view.num_token_non_padded, src.num_token_non_padded)
 
     def test_num_token_non_padded_bypass_carries_local_count(self):
         # Regression: the dense SBD draft and TBO sub-batches bypass
@@ -1134,6 +1154,7 @@ class TestBuildPrefillRegistry(unittest.TestCase):
             cache_loc_dtype=torch.int64,
             source=src,
         )
+        self.assertFalse(reg.has_slot("global_num_token_non_padded"))
         for name in ("input_ids", "positions", "out_cache_loc"):
             self.assertEqual(
                 reg.get_slot(name).buffer.data_ptr(),
