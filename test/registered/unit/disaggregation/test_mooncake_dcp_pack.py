@@ -3,7 +3,7 @@ import threading
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
@@ -108,6 +108,7 @@ class TestMooncakeDcpPack(CustomTestCase):
             page_size=self.page_size,
             kv_data_ptrs=[buffer.data_ptr() for buffer in src],
             kv_layer_ids=[100, 101],
+            num_draft_entries=0,
         )
         manager.enable_custom_mem_pool = False
         manager.enable_deferred_decode_kv_release = False
@@ -293,6 +294,43 @@ class TestMooncakeDcpPack(CustomTestCase):
                     decode_prefix_len=prefix,
                 )
                 self.assertEqual(len(transport.calls), calls)
+
+    def test_draft_preserves_upstream_oversized_fallback(self):
+        manager, src_pages, dst_pages, pack = self._make_case()
+        manager.kv_args.num_draft_entries = 1
+        # The second buffer is now replicated draft KV with DCP-wide pages.
+        self._dst[-1] = torch.full(
+            (self._dst[-1].shape[0] * 3, self.widths[-1]), 0xEE, dtype=torch.uint8
+        )
+        transport = Mock(return_value=0)
+        ret = self._send(
+            manager,
+            src_pages,
+            dst_pages,
+            pack,
+            num_kv_tokens=19,
+            transport=transport,
+        )
+        self.assertEqual(ret, 0)
+        # Seven target rows exceed the 16-byte pack buffer; the draft path
+        # must retain upstream's direct-source fallback and one full-plan send.
+        transport.assert_called_once()
+        _, blocks = transport.call_args.args
+        bytes_by_layer = [0, 0]
+        for src_addr, dst_addr, length in blocks:
+            for layer, src in enumerate(self._src):
+                start = src.data_ptr()
+                if start <= src_addr and src_addr + length <= start + src.numel():
+                    bytes_by_layer[layer] += length
+                    dst = self._dst[layer]
+                    self.assertGreaterEqual(dst_addr, dst.data_ptr())
+                    self.assertLessEqual(
+                        dst_addr + length, dst.data_ptr() + dst.numel()
+                    )
+                    break
+            else:
+                self.fail("draft path unexpectedly read from the pack buffer")
+        self.assertEqual(bytes_by_layer, [7 * self.widths[0], 19 * self.widths[1]])
 
     def test_pack_too_small_for_one_token_rejects_before_transfer(self):
         manager, src_pages, dst_pages, pack = self._make_case(pack_tokens=0)
