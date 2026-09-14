@@ -90,6 +90,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
+    DCPPageRetractionError,
     HybridReqToTokenPool,
     KVCache,
     ReqToTokenPool,
@@ -857,24 +858,35 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if uses_swa_tail_prealloc and swa_required > swa_allocatable_tokens:
                 break
 
-            resumed_reqs.append(req)
-            indices_to_remove.add(i)
             req.is_retracted = False
             self._pre_alloc(req)
+            try:
+                retraction_restore(
+                    req,
+                    self.tree_cache,
+                    self.req_to_token_pool,
+                    self.token_to_kv_pool_allocator,
+                    get_disagg().disaggregation_decode_retraction_backup,
+                )
+            except DCPPageRetractionError:
+                retraction_discard(
+                    req,
+                    self.tree_cache,
+                    get_disagg().disaggregation_decode_retraction_backup,
+                )
+                release_kv_cache(req, self.tree_cache, is_insert=False)
+                # Restore has no cross-rank result consensus. Let the scheduler
+                # fail-stop instead of allowing this rank's batch to diverge.
+                raise
+
+            resumed_reqs.append(req)
+            indices_to_remove.add(i)
             full_allocatable_tokens -= full_required
             if uses_swa_tail_prealloc:
                 swa_allocatable_tokens = self._swa_tail_allocatable_token_budget(
                     count_retracted=False,
                     extra_reserved_reqs=len(resumed_reqs),
                 )
-
-            retraction_restore(
-                req,
-                self.tree_cache,
-                self.req_to_token_pool,
-                self.token_to_kv_pool_allocator,
-                get_disagg().disaggregation_decode_retraction_backup,
-            )
 
         self.retracted_queue = [
             entry

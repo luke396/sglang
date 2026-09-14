@@ -33,6 +33,7 @@ from dataclasses import dataclass, fields
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
+import msgspec
 import numpy as np
 import torch
 import triton
@@ -52,6 +53,10 @@ from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
+from sglang.srt.layers.dcp.layout import (
+    dcp_slot_owner_mask,
+    dcp_slots_to_local_rows,
+)
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     UnquantizedKVCacheMethod,
 )
@@ -95,6 +100,24 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+class DCPPageRetractionSnapshot(msgspec.Struct, frozen=True):
+    """CPU MLA backup for a page-layout DCP request."""
+
+    cpu_tensors: list[list[torch.Tensor]]
+    layout: str
+    dcp_size: int
+    dcp_rank: int
+    physical_page_size: int
+    row_count: int
+    layer_num: int
+    chunk_size: int
+
+
+class DCPPageRetractionError(ValueError):
+    """A page-layout CPU backup cannot be restored into this KV pool."""
+
 
 # Debug-only invariant in the Mamba slot-donation path calls tensor.item(), which
 # forces a per-request cudaStreamSynchronize on the scheduler thread and can stall
@@ -1075,6 +1098,49 @@ class MambaPool:
         if self._slot_siblings:
             return conv_cpu, temporal_cpu, siblings_cpu
         return conv_cpu, temporal_cpu
+
+    def _validate_dcp_page_cpu_copy(
+        self, mamba_cache_cpu, indices: torch.Tensor
+    ) -> None:
+        """Validate K3's saved recurrent state before a paired MLA restore."""
+        if not isinstance(mamba_cache_cpu, tuple) or len(mamba_cache_cpu) != 2:
+            raise DCPPageRetractionError("page DCP retraction Mamba snapshot changed")
+        conv_cpu, temporal_cpu = mamba_cache_cpu
+        if not isinstance(conv_cpu, list) or not isinstance(temporal_cpu, torch.Tensor):
+            raise DCPPageRetractionError("page DCP retraction Mamba snapshot changed")
+        if len(conv_cpu) != len(self.mamba_cache.conv):
+            raise DCPPageRetractionError(
+                "page DCP retraction Mamba layer count changed"
+            )
+        for conv_snapshot, conv_buffer in zip(
+            conv_cpu, self.mamba_cache.conv, strict=True
+        ):
+            expected_shape = (
+                conv_buffer.shape[0],
+                *indices.shape,
+                *conv_buffer.shape[2:],
+            )
+            if (
+                not isinstance(conv_snapshot, torch.Tensor)
+                or conv_snapshot.shape != expected_shape
+                or conv_snapshot.dtype != conv_buffer.dtype
+            ):
+                raise DCPPageRetractionError(
+                    "page DCP retraction Mamba convolution state changed"
+                )
+        temporal_buffer = self.mamba_cache.temporal
+        expected_temporal_shape = (
+            temporal_buffer.shape[0],
+            *indices.shape,
+            *temporal_buffer.shape[2:],
+        )
+        if (
+            temporal_cpu.shape != expected_temporal_shape
+            or temporal_cpu.dtype != temporal_buffer.dtype
+        ):
+            raise DCPPageRetractionError(
+                "page DCP retraction Mamba temporal state changed"
+            )
 
     def load_cpu_copy(self, mamba_cache_cpu, indices):
         # The trailing element exists exactly when this instance registered siblings:
@@ -4143,6 +4209,15 @@ class HybridLinearKVPool(KVCache):
         self, cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
         kv_cpu, mamba_cpu = cache_cpu
+        if isinstance(kv_cpu, DCPPageRetractionSnapshot):
+            if (mamba_cpu is None) != (mamba_indices is None):
+                raise DCPPageRetractionError(
+                    "page DCP retraction Mamba state is missing"
+                )
+            if mamba_cpu is not None:
+                self.mamba_pool._validate_dcp_page_cpu_copy(
+                    mamba_cpu, self._mamba_translate(mamba_indices)
+                )
         self.full_kv_pool.load_cpu_copy(kv_cpu, indices, req_pool_index=req_pool_index)
         if mamba_cpu is not None and mamba_indices is not None:
             self.mamba_pool.load_cpu_copy(
@@ -4613,7 +4688,36 @@ class MLATokenToKVPool(KVCache):
         for kv_cache in self.kv_buffer:
             kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
 
+    def _dcp_page_retraction_rows(
+        self, indices: torch.Tensor
+    ) -> tuple[torch.Tensor, tuple[int, int, int]] | None:
+        parallel = get_parallel()
+        if not (parallel.dcp_enabled and parallel.dcp_kv_layout == "page"):
+            return None
+        dcp_size = parallel.dcp_size
+        dcp_rank = parallel.dcp_rank
+        owned = dcp_slot_owner_mask(
+            indices,
+            dcp_size,
+            dcp_rank,
+            layout="page",
+            physical_page_size=self.page_size,
+        )
+        return (
+            dcp_slots_to_local_rows(
+                indices[owned],
+                dcp_size,
+                layout="page",
+                physical_page_size=self.page_size,
+            ),
+            (dcp_size, dcp_rank, self.page_size),
+        )
+
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        page_rows = self._dcp_page_retraction_rows(indices)
+        if page_rows is not None:
+            indices, (dcp_size, dcp_rank, page_size) = page_rows
+
         current_platform.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
@@ -4628,11 +4732,96 @@ class MLATokenToKVPool(KVCache):
                 )
                 kv_cache_cpu[-1].append(kv_cpu)
         current_platform.synchronize()
-        return kv_cache_cpu
+        if page_rows is None:
+            return kv_cache_cpu
+        return DCPPageRetractionSnapshot(
+            cpu_tensors=kv_cache_cpu,
+            layout="page",
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
+            physical_page_size=page_size,
+            row_count=indices.numel(),
+            layer_num=self.layer_num,
+            chunk_size=chunk_size,
+        )
+
+    def _validate_dcp_page_retraction_snapshot(
+        self, snapshot: DCPPageRetractionSnapshot, rows: torch.Tensor
+    ) -> None:
+        parallel = get_parallel()
+        expected_geometry = (
+            snapshot.layout == "page"
+            and snapshot.dcp_size == parallel.dcp_size
+            and snapshot.dcp_rank == parallel.dcp_rank
+            and snapshot.physical_page_size == self.page_size
+            and snapshot.row_count == rows.numel()
+            and snapshot.layer_num == self.layer_num
+            and snapshot.chunk_size == self.cpu_offloading_chunk_size
+        )
+        if not expected_geometry:
+            raise DCPPageRetractionError(
+                "page DCP retraction snapshot geometry changed"
+            )
+
+        expected_chunks = (
+            snapshot.row_count + snapshot.chunk_size - 1
+        ) // snapshot.chunk_size
+        if (
+            not isinstance(snapshot.cpu_tensors, list)
+            or len(snapshot.cpu_tensors) != self.layer_num
+        ):
+            raise DCPPageRetractionError(
+                "page DCP retraction snapshot layer count changed"
+            )
+        for layer_id, (layer_cpu, kv_buffer) in enumerate(
+            zip(snapshot.cpu_tensors, self.kv_buffer, strict=True)
+        ):
+            if not isinstance(layer_cpu, list):
+                raise DCPPageRetractionError(
+                    f"page DCP retraction snapshot layer {layer_id} changed"
+                )
+            if kv_buffer.shape[0] == 0:
+                if layer_cpu:
+                    raise DCPPageRetractionError(
+                        f"page DCP retraction snapshot has data for empty layer {layer_id}"
+                    )
+                continue
+            if len(layer_cpu) != expected_chunks:
+                raise DCPPageRetractionError(
+                    f"page DCP retraction snapshot chunk count changed for layer {layer_id}"
+                )
+            for chunk_id, kv_cpu in enumerate(layer_cpu):
+                expected_rows = min(
+                    snapshot.chunk_size,
+                    snapshot.row_count - chunk_id * snapshot.chunk_size,
+                )
+                if (
+                    not isinstance(kv_cpu, torch.Tensor)
+                    or kv_cpu.shape != (expected_rows, *kv_buffer.shape[1:])
+                    or kv_cpu.dtype != kv_buffer.dtype
+                ):
+                    raise DCPPageRetractionError(
+                        f"page DCP retraction snapshot tensor changed for layer {layer_id}"
+                    )
 
     def load_cpu_copy(
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
+        page_rows = self._dcp_page_retraction_rows(indices)
+        if isinstance(kv_cache_cpu, DCPPageRetractionSnapshot):
+            if page_rows is None:
+                raise DCPPageRetractionError(
+                    "page DCP retraction snapshot requires page DCP layout"
+                )
+            rows, _ = page_rows
+            self._validate_dcp_page_retraction_snapshot(kv_cache_cpu, rows)
+            kv_cache_cpu = kv_cache_cpu.cpu_tensors
+            indices = rows
+        elif page_rows is not None:
+            raise DCPPageRetractionError(
+                "page DCP layout requires a page retraction snapshot"
+            )
+
         current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
