@@ -63,6 +63,15 @@ class Parallel(msgspec.Struct):
             aliases=["--decode-context-parallel-size"],
         ),
     ] = 1
+    dcp_kv_layout: A[
+        str,
+        Arg(
+            help="KV layout for decode-context parallelism. 'token' keeps the "
+            "existing token-stripe layout; 'page' enables the DCP page "
+            "interleave layout on supported PD decode servers.",
+            choices=["token", "page"],
+        ),
+    ] = "token"
     pp_size: A[
         int,
         Arg(

@@ -354,17 +354,32 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         parallel = get_parallel()
         if not parallel.dcp_enabled:
             return seq_lens
-        return get_dcp_lens(seq_lens, parallel.dcp_size, parallel.dcp_rank).to(
-            torch.int32
-        )
+        return get_dcp_lens(
+            seq_lens,
+            parallel.dcp_size,
+            parallel.dcp_rank,
+            layout=getattr(parallel, "dcp_kv_layout", "token"),
+            physical_page_size=self.page_size,
+        ).to(torch.int32)
 
     def _get_dcp_local_max_seq_len(self, max_seq_len: int) -> int:
         parallel = get_parallel()
         if not parallel.dcp_enabled:
             return max_seq_len
-        local_max = max_seq_len // parallel.dcp_size + int(
-            parallel.dcp_rank < max_seq_len % parallel.dcp_size
-        )
+        if getattr(parallel, "dcp_kv_layout", "token") == "page":
+            local_max = int(
+                get_dcp_lens(
+                    torch.tensor(max_seq_len),
+                    parallel.dcp_size,
+                    parallel.dcp_rank,
+                    layout="page",
+                    physical_page_size=self.page_size,
+                )
+            )
+        else:
+            local_max = max_seq_len // parallel.dcp_size + int(
+                parallel.dcp_rank < max_seq_len % parallel.dcp_size
+            )
         # A positive scheduling bound is required even when every sequence in a
         # padded graph row is empty on this rank.
         return max(local_max, 1)
@@ -398,6 +413,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             PHYSICAL_PAGE_SIZE=self.page_size,
             DCP_SIZE=parallel.dcp_size,
             DCP_RANK=parallel.dcp_rank,
+            PAGE_LAYOUT=getattr(parallel, "dcp_kv_layout", "token") == "page",
             PAGES_PER_BLOCK=pages_per_block,
             HAS_V2P=v2p is not None,
         )
@@ -1222,6 +1238,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             q_rope=q_rope_3d,
             dcp_world_size=parallel.attn_dcp_size,
             dcp_rank=parallel.attn_dcp_rank,
+            dcp_page_size=(
+                self.page_size
+                if getattr(parallel, "dcp_kv_layout", "token") == "page"
+                else 0
+            ),
         )
 
     def _dummy_dcp_decode_for_autotune(

@@ -32,6 +32,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLAMultiStepDraftBackend,
 )
+from sglang.srt.layers.dcp.layout import guard_dcp_page_layout_forward_mode
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_flashinfer_available
@@ -81,15 +82,16 @@ class CuteDslMLABackend(TRTLLMMLABackend):
         cp_world: int = 1,
         cp_rank: int = 0,
         return_lse: bool = False,
+        page_layout: bool = False,
     ):
         """Call the flashinfer cute-dsl MLA decode kernel.
 
-        Without DCP (``cp_world <= 1``) this defers to the base cute-dsl path.
-        With DCP, ``seq_lens`` are this rank's cyclic-local KV lengths and
-        ``causal_seqs`` the global per-request KV lengths; the kernel returns a
-        rank-local ``(out, lse)``, the LSE in natural log.
+        Without DCP this defers to the base cute-dsl path. Page DCP instead
+        deliberately invokes the local-coordinate DCP API with ``cp_world=1``:
+        SGLang retains its real DCP group for Q exchange and outer LSE merge,
+        while the kernel sees only this rank's page-local KV rows.
         """
-        if cp_world <= 1:
+        if cp_world <= 1 and not page_layout:
             return super()._run_decode_kernel(
                 query,
                 kv_cache,
@@ -167,6 +169,10 @@ class CuteDslMLABackend(TRTLLMMLABackend):
                 llama_4_scaling,
             )
 
+        page_layout = getattr(parallel, "dcp_kv_layout", "token") == "page"
+        if page_layout:
+            guard_dcp_page_layout_forward_mode(forward_batch.forward_mode)
+
         # Query / KV preparation mirrors the base cute-dsl decode (both FP16 and
         # FP8 KV), then swaps to the DCP kernel call + rank-local return.
         merge_query = q_rope is not None
@@ -224,6 +230,11 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             query = (query.to(self.q_data_type) * llama_4_scaling).to(self.data_type)
         if query.dim() == 3:
             query = query.unsqueeze(1)
+        if page_layout and query.shape[1] != 1:
+            raise NotImplementedError(
+                "DCP page layout supports q_len == 1 only; multi-query decode "
+                "must not read page-layout KV."
+            )
 
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
@@ -255,10 +266,11 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             seq_lens=local_seq_lens,
             max_seq_len=metadata.max_seq_len_k,
             layer=layer,
-            causal_seqs=global_seq_lens,
-            cp_world=parallel.dcp_size,
-            cp_rank=parallel.dcp_rank,
+            causal_seqs=local_seq_lens if page_layout else global_seq_lens,
+            cp_world=1 if page_layout else parallel.dcp_size,
+            cp_rank=0 if page_layout else parallel.dcp_rank,
             return_lse=True,
+            page_layout=page_layout,
         )
 
         output = raw_out.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -273,6 +285,20 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             1,
         )
         return output.flatten(1), lse
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        """Keep page KV out of inherited extend and verify metadata paths."""
+        guard_dcp_page_layout_forward_mode(forward_batch.forward_mode)
+        return super().init_forward_metadata(forward_batch)
+
+    def init_forward_metadata_out_graph(
+        self, forward_batch: ForwardBatch, in_capture: bool = False
+    ):
+        """Reject unsupported page-layout modes before inherited graph metadata."""
+        guard_dcp_page_layout_forward_mode(forward_batch.forward_mode)
+        return super().init_forward_metadata_out_graph(
+            forward_batch, in_capture=in_capture
+        )
 
 
 class CuteDslMLAMultiStepDraftBackend(TRTLLMMLAMultiStepDraftBackend):

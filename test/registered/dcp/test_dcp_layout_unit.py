@@ -23,6 +23,8 @@ from sglang.srt import runtime_context as rc
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.dcp.layout import (
+    dcp_slot_owner_mask,
+    dcp_slots_to_local_rows,
     filter_dcp_local_chunk_kv_indices,
     get_dcp_lens,
 )
@@ -48,6 +50,92 @@ def _owner_count(length: int, n: int, rank: int, start: int) -> int:
 def _legacy_inplace_formula(length: int, n: int, rank: int) -> int:
     """The pre-refactor update_local_kv_lens_for_dcp body (start == 0 case)."""
     return (length - rank - 1) // n + 1
+
+
+def _page_owner(position: int, page_size: int, dcp_size: int) -> int:
+    return (position // page_size) % dcp_size
+
+
+class TestPageDcpLayout(CustomTestCase):
+    """Independent enumeration for the public page-layout index helpers."""
+
+    def test_lengths_and_ranges_match_enumeration(self):
+        for dcp_size in DCP_SIZES:
+            for page_size in (1, 2, 3, 64):
+                for rank in range(dcp_size):
+                    for start in (0, 1, page_size - 1, page_size + 1, 3 * page_size):
+                        lens = torch.arange(0, 4 * dcp_size * page_size + 3)
+                        got = get_dcp_lens(
+                            lens,
+                            dcp_size,
+                            rank,
+                            start=torch.full_like(lens, start),
+                            layout="page",
+                            physical_page_size=page_size,
+                        )
+                        want = torch.tensor(
+                            [
+                                sum(
+                                    _page_owner(position, page_size, dcp_size) == rank
+                                    for position in range(start, start + int(length))
+                                )
+                                for length in lens
+                            ]
+                        )
+                        torch.testing.assert_close(got, want)
+
+    def test_fragmented_slots_filter_and_collapse_once(self):
+        dcp_size, page_size, rank = 3, 2, 1
+        virtual_page = dcp_size * page_size
+        # Distinct request allocation pages make the physical page ids non-contiguous.
+        slots = torch.tensor(
+            [17 * virtual_page + offset for offset in range(virtual_page)]
+            + [4 * virtual_page + offset for offset in range(virtual_page)]
+            + [-1]
+        )
+        expected_mask = torch.tensor(
+            [
+                False,
+                False,
+                True,
+                True,
+                False,
+                False,
+                False,
+                False,
+                True,
+                True,
+                False,
+                False,
+                False,
+            ]
+        )
+        got_mask = dcp_slot_owner_mask(
+            slots, dcp_size, rank, layout="page", physical_page_size=page_size
+        )
+        torch.testing.assert_close(got_mask, expected_mask)
+        owned = slots[got_mask]
+        got_rows = dcp_slots_to_local_rows(
+            owned, dcp_size, layout="page", physical_page_size=page_size
+        )
+        # N=3, S=2, rank=1 owns physical pages 17 and 4.  Their rows are
+        # [34, 35] and [8, 9], independent of the allocation gaps above.
+        want_rows = torch.tensor([34, 35, 8, 9])
+        torch.testing.assert_close(got_rows, want_rows)
+
+
+class TestDcpCombineEmptyRows(CustomTestCase):
+    def test_all_empty_rows_are_neutral(self):
+        from sglang.kernels.ops.attention.dcp_kernels import _lse_weighted_combine_cpu
+
+        output, lse = _lse_weighted_combine_cpu(
+            torch.randn(3, 2, 1, 4),
+            torch.full((3, 2, 1), float("-inf")),
+            is_lse_base_on_e=True,
+            return_lse=True,
+        )
+        torch.testing.assert_close(output, torch.zeros_like(output))
+        self.assertTrue(torch.isneginf(lse).all())
 
 
 class TestFilterDcpLocalChunkKvIndices(CustomTestCase):

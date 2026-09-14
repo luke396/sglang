@@ -23,6 +23,7 @@ from sglang.srt.layers.dcp import (
     cp_lse_ag_out_rs_mla,
     dcp_a2a_lse_reduce,
 )
+from sglang.srt.layers.dcp.layout import guard_dcp_page_layout_forward_mode
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.layers.radix_attention import unified_attention_with_output
 from sglang.srt.lora.deepseek_mla_correction import (
@@ -294,6 +295,7 @@ class DeepseekMLAForwardMixin:
     ):
         from sglang.srt.model_executor.runner import get_is_capture_mode
 
+        guard_dcp_page_layout_forward_mode(forward_batch.forward_mode)
         # Q8KV8 q-prep/indexer overlap handshake (see the fork site below):
         # True between the alt-stream fork and its consumption in the born
         # block; also suppresses the duplicate split/rope on that path.

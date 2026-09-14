@@ -64,6 +64,7 @@ from sglang.kernels.ops.kvcache.kv_read_table import (
     build_kv_read_table,
     build_kv_read_table_packed,
 )
+from sglang.srt.layers.dcp.layout import dcp_slots_to_local_rows
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedSWATokenToKVPoolAllocator,
 )
@@ -516,9 +517,15 @@ class KVIndexTranslator:
         The one hook every DCP read-index production site calls; on a static
         pool `widened // dcp_size` IS the whole virtual->physical translation.
         """
-        dcp_size = get_parallel().attn_dcp_size
+        parallel = get_parallel()
+        dcp_size = parallel.attn_dcp_size
         if dcp_size > 1:
-            widened_ids = widened_ids // dcp_size
+            widened_ids = dcp_slots_to_local_rows(
+                widened_ids,
+                dcp_size,
+                layout=getattr(parallel, "dcp_kv_layout", "token"),
+                physical_page_size=self.page_size,
+            )
         return self.translate_full_attn_ids(widened_ids)
 
     def translate_full_attn_ids(

@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 from sglang.srt.arg_groups.arg_utils import record_fields
 from sglang.srt.arg_groups.overrides import (
+    attention_backends_of,
     declare_resolution,
     model_config_of,
     resolved_view,
@@ -17,6 +18,53 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+def validate_dcp_kv_layout(server_args: ServerArgs) -> None:
+    """Validate the resolved static contract of the optional page DCP layout.
+
+    This deliberately runs after model overrides, attention-backend resolution,
+    and speculative-decoding resolution.  The default token layout must retain
+    every existing DCP/PD combination, so it has no additional checks here.
+    """
+
+    cfg = resolved_view(server_args)
+    if cfg.dcp_kv_layout not in ("token", "page"):
+        raise ValueError(
+            "--dcp-kv-layout must be one of 'token' or 'page', got "
+            f"{cfg.dcp_kv_layout!r}."
+        )
+    if cfg.dcp_kv_layout == "token":
+        return
+
+    if cfg.disaggregation_mode != "decode":
+        raise ValueError("--dcp-kv-layout page requires --disaggregation-mode decode.")
+    if cfg.dcp_size <= 1:
+        raise ValueError("--dcp-kv-layout page requires --dcp-size > 1.")
+    if cfg.disaggregation_transfer_backend != "mooncake":
+        raise ValueError(
+            "--dcp-kv-layout page requires --disaggregation-transfer-backend mooncake."
+        )
+    if cfg.speculative_algorithm is not None:
+        raise ValueError(
+            "--dcp-kv-layout page does not support speculative decoding "
+            f"(got --speculative-algorithm {cfg.speculative_algorithm!r})."
+        )
+
+    model_architectures = model_config_of(server_args).hf_config.architectures
+    if "KimiK3ForConditionalGeneration" not in model_architectures:
+        raise ValueError(
+            "--dcp-kv-layout page is currently supported only for "
+            "KimiK3ForConditionalGeneration."
+        )
+
+    _, decode_backend = attention_backends_of(cfg)
+    if decode_backend != "cutedsl_mla":
+        raise ValueError(
+            "--dcp-kv-layout page requires the resolved decode attention "
+            "backend to be 'cutedsl_mla', got "
+            f"{decode_backend!r}."
+        )
 
 
 def handle_pd_disaggregation(server_args: ServerArgs) -> None:

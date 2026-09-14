@@ -89,6 +89,7 @@ def create_mla_kv_page_table_for_dcp(
     PHYSICAL_PAGE_SIZE: tl.constexpr,
     DCP_SIZE: tl.constexpr,
     DCP_RANK: tl.constexpr,
+    PAGE_LAYOUT: tl.constexpr,
     PAGES_PER_BLOCK: tl.constexpr,
     HAS_V2P: tl.constexpr,
 ):
@@ -105,7 +106,12 @@ def create_mla_kv_page_table_for_dcp(
     local_len = tl.load(local_seq_lens_ptr + req)
     local_pages = tl.cdiv(local_len, PHYSICAL_PAGE_SIZE)
     mask = page_offsets < local_pages
-    global_positions = DCP_RANK + page_offsets * PHYSICAL_PAGE_SIZE * DCP_SIZE
+    if PAGE_LAYOUT:
+        global_positions = (
+            DCP_RANK * PHYSICAL_PAGE_SIZE + page_offsets * PHYSICAL_PAGE_SIZE * DCP_SIZE
+        )
+    else:
+        global_positions = DCP_RANK + page_offsets * PHYSICAL_PAGE_SIZE * DCP_SIZE
     req_pool_index = tl.load(req_pool_indices_ptr + req)
     virtual_locs = tl.load(
         req_to_token_ptr + req_pool_index * req_to_token_stride + global_positions,
@@ -567,7 +573,8 @@ def _dcp_lse_combine_kernel(
         partial_out = tl.load(recv_output_ptr + o_offsets).to(tl.float32)
         acc += partial_out * w
 
-    acc = acc / weight_sum
+    has_contribution = weight_sum > 0
+    acc = acc / tl.where(has_contribution, weight_sum, 1.0)
 
     out_offsets = (
         batch_idx * out_stride_B + head_idx * out_stride_H + d_offsets * out_stride_D
@@ -576,9 +583,13 @@ def _dcp_lse_combine_kernel(
 
     if RETURN_LSE:
         if IS_BASE_E:
-            global_lse = tl.log(weight_sum) + lse_max
+            global_lse = tl.where(
+                has_contribution, tl.log(weight_sum) + lse_max, -float("inf")
+            )
         else:
-            global_lse = tl.log2(weight_sum) + lse_max
+            global_lse = tl.where(
+                has_contribution, tl.log2(weight_sum) + lse_max, -float("inf")
+            )
         out_lse_offset = batch_idx * recv_lse_stride_B + head_idx * recv_lse_stride_H
         tl.store(out_lse_ptr + out_lse_offset, global_lse)
 
@@ -639,7 +650,8 @@ def _lse_weighted_combine_cpu(
     partial_outputs: torch.Tensor,
     partial_lses: torch.Tensor,
     is_lse_base_on_e: bool = True,
-) -> torch.Tensor:
+    return_lse: bool = False,
+) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
     """CPU reference: combine N partial attention outputs using LSE weights.
 
     Args:
@@ -648,7 +660,7 @@ def _lse_weighted_combine_cpu(
         is_lse_base_on_e: base-e (True) or base-2 (False)
 
     Returns:
-        [B, H_local, D] combined output
+        Combined output, or ``(output, lse)`` when ``return_lse`` is true.
     """
     N, B, H_local, D = partial_outputs.shape
     partial_outputs = partial_outputs.float()
@@ -672,7 +684,21 @@ def _lse_weighted_combine_cpu(
         weights = torch.pow(2.0, centered)
 
     weight_sum = weights.sum(dim=0, keepdim=True)
-    weights = weights / weight_sum
+    weights = weights / torch.where(
+        weight_sum > 0, weight_sum, torch.ones_like(weight_sum)
+    )
 
     combined = (partial_outputs * weights.unsqueeze(-1)).sum(dim=0)
-    return combined
+    if not return_lse:
+        return combined
+    log_weight_sum = (
+        torch.log(weight_sum.squeeze(0))
+        if is_lse_base_on_e
+        else torch.log2(weight_sum.squeeze(0))
+    )
+    combined_lse = torch.where(
+        weight_sum.squeeze(0) > 0,
+        log_weight_sum + lse_max,
+        torch.full_like(lse_max, float("-inf")),
+    )
+    return combined, combined_lse

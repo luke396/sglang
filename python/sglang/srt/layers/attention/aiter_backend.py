@@ -2075,6 +2075,7 @@ class AiterAttnBackend(AttentionBackend):
             PHYSICAL_PAGE_SIZE=1,
             DCP_SIZE=self.dcp_world_size,
             DCP_RANK=get_parallel().attn_dcp_rank,
+            PAGE_LAYOUT=False,
             PAGES_PER_BLOCK=_DCP_VERIFY_TABLE_COLS_PER_BLOCK,
             HAS_V2P=v2p is not None,
         )

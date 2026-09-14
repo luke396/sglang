@@ -4457,7 +4457,11 @@ class MLATokenToKVPool(KVCache):
             set_mla_kv_buffer_triton(dst_buffer, loc, cache_k_nope, cache_k_rope)
         else:
             set_mla_kv_buffer_dcp_sharded_triton(
-                dst_buffer, loc, cache_k_nope, cache_k_rope
+                dst_buffer,
+                loc,
+                cache_k_nope,
+                cache_k_rope,
+                physical_page_size=self.page_size,
             )
 
     def set_kv_buffer(
