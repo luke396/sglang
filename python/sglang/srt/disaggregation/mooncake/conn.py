@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import concurrent.futures
 import dataclasses
+import json
 import logging
 import os
 import struct
 import threading
 import time
+import uuid
 from collections import defaultdict
 from typing import List, Optional, Set, Tuple, Union
 
+import msgspec
 import numpy as np
 import numpy.typing as npt
 import zmq
@@ -17,6 +20,8 @@ from prometheus_client import Counter
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
+    DCP_KV_LAYOUT_PAGE_INTERLEAVE_V1,
+    DCP_KV_LAYOUT_TOKEN_STRIPE_V1,
     CommonKVBootstrapServer,
     CommonKVManager,
     CommonKVReceiver,
@@ -38,6 +43,7 @@ from sglang.srt.disaggregation.common.utils import (
     DCPTokenTransferPlan,
     FastQueue,
     TransferKVChunk,
+    build_dcp_page_transfer_plan,
     build_dcp_token_transfer_plan,
     group_concurrent_contiguous,
     pack_int_lists,
@@ -70,6 +76,7 @@ from sglang.srt.observability.trace import (
 from sglang.srt.runtime_context import (
     get_memory,
     get_observability,
+    get_parallel,
     get_schedule,
 )
 from sglang.srt.server_args import ServerArgs
@@ -81,6 +88,13 @@ FAILED_SESSION_RECOVERIES = Counter(
     "sglang:failed_session_recoveries_total",
     "Number of mooncake_session_ids un-blacklisted via probe.",
 )
+
+
+class PageRegistrationState(msgspec.Struct):
+    registration_id: str
+    started_at: float
+    accepted: bool = False
+    failed_reason: Optional[str] = None
 
 
 # decode
@@ -97,6 +111,9 @@ class TransferInfo:
     is_dummy: bool
     decode_prefix_len: Optional[int] = None
     dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None
+    dcp_kv_layout: str = DCP_KV_LAYOUT_TOKEN_STRIPE_V1
+    page_layout_version: Optional[int] = None
+    registration_id: Optional[str] = None
     # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
     staging: Optional[StagingTransferInfo] = None
 
@@ -112,6 +129,9 @@ class TransferInfo:
             dst_aux_index = int(msg[5].decode("ascii"))
             dst_state_indices = unpack_int_lists(msg[6], "i")
             is_dummy = False
+        page_metadata = {}
+        if len(msg) > 10 and msg[10]:
+            page_metadata = json.loads(msg[10].decode("utf-8"))
         return cls(
             room=int(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
@@ -130,6 +150,9 @@ class TransferInfo:
                 if len(msg) > 9 and msg[9] != b""
                 else None
             ),
+            dcp_kv_layout=page_metadata.get("layout", DCP_KV_LAYOUT_TOKEN_STRIPE_V1),
+            page_layout_version=page_metadata.get("version"),
+            registration_id=page_metadata.get("registration_id"),
         )
 
 
@@ -157,10 +180,17 @@ class KVArgsRegisterInfo:
     dcp_token_item_lens: Optional[List[int]] = None
     staging_base_ptr: int = 0
     staging_total_size: int = 0
+    dcp_kv_layout: str = DCP_KV_LAYOUT_TOKEN_STRIPE_V1
+    page_layout_version: Optional[int] = None
+    physical_page_size: Optional[int] = None
+    registration_id: Optional[str] = None
     staging: Optional[StagingRegisterInfo] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
+        page_registration = {}
+        if len(msg) > 19 and msg[19]:
+            page_registration = json.loads(msg[19].decode("utf-8"))
         return cls(
             room=str(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
@@ -202,6 +232,12 @@ class KVArgsRegisterInfo:
             dst_dcp_rank=(
                 int(msg[17].decode("ascii")) if len(msg) > 17 and msg[17] != b"" else 0
             ),
+            dcp_kv_layout=page_registration.get(
+                "layout", DCP_KV_LAYOUT_TOKEN_STRIPE_V1
+            ),
+            page_layout_version=page_registration.get("version"),
+            physical_page_size=page_registration.get("physical_page_size"),
+            registration_id=page_registration.get("registration_id"),
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14, slot_ids_index=18),
         )
@@ -228,6 +264,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
+            self._page_transfer_rooms = set()
             self.session_lock = threading.Lock()
             self.start_prefill_thread()
             # Per-room count of chunks not yet transferred; teardown waits for
@@ -292,12 +329,35 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 ).start()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self._staging_ctx = DecodeStagingContext() if self.enable_staging else None
+            self._page_registration_generation = 0
+            self._page_registration_states = {}
             if self.enable_staging:
                 self._init_staging_allocator()
             self.start_decode_thread()
 
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
+
+    def _local_dcp_kv_layouts(self) -> List[str]:
+        """Advertise page only from a P that can actually send it."""
+        layouts = [DCP_KV_LAYOUT_TOKEN_STRIPE_V1]
+        if self._supports_page_dcp_send():
+            layouts.append(DCP_KV_LAYOUT_PAGE_INTERLEAVE_V1)
+        return layouts
+
+    def _supports_page_dcp_send(self) -> bool:
+        """Whether this K3 prefill can honor the page wire contract."""
+        if self.disaggregation_mode != DisaggregationMode.PREFILL:
+            return False
+        from sglang.srt.arg_groups.overrides import model_config_of
+
+        architectures = model_config_of(self.server_args).hf_config.architectures or []
+        return (
+            "KimiK3ForConditionalGeneration" in architectures
+            and self.dcp_size == 1
+            and (self.is_mla_backend or self.is_hybrid_mla_backend)
+            and self.kv_args.num_draft_entries == 0
+        )
 
     def _registerable_regions(self) -> List[Tuple[int, int]]:
         """(ptr, len) regions to (de)register, exact duplicates removed.
@@ -338,6 +398,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if hasattr(self, "connection_pool"):
             with self.connection_lock:
                 self.connection_pool.clear()
+                self._page_registration_generation += 1
+                self._page_registration_states.clear()
+                if self.disaggregation_mode == DisaggregationMode.DECODE:
+                    for bootstrap_addr, info in list(self.prefill_info_table.items()):
+                        if DCP_KV_LAYOUT_PAGE_INTERLEAVE_V1 in (
+                            info.dcp_kv_layouts or ()
+                        ):
+                            del self.prefill_info_table[bootstrap_addr]
 
     # ------------------------------------------------------------------
     # Staging buffer methods (all delegate to staging_handler.py)
@@ -905,7 +973,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 "must enable it and use the same page size and model spec."
             )
 
-    def _await_transfer_futures(self, futures) -> int:
+    def _await_transfer_futures(self, futures, *, drain_on_error: bool = False) -> int:
         """Await a chunk's per-layer RDMA writes; return the first non-zero status.
         cancel() is a no-op for a running future, so with deferred release on we
         still drain the running ones before returning (no write may outlive this
@@ -916,13 +984,172 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 status = future.result()
             except concurrent.futures.CancelledError:
                 continue
+            except Exception:
+                if not drain_on_error:
+                    raise
+                status = -1
             if status != 0 and ret == 0:
                 ret = status
                 for f in futures:
                     f.cancel()
-                if not self.enable_deferred_decode_kv_release:
+                if not self.enable_deferred_decode_kv_release and not drain_on_error:
                     return ret
         return ret
+
+    def send_kvcache_dcp_page(
+        self,
+        mooncake_session_id: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_ptrs: list[int],
+        dst_kv_indices: npt.NDArray[np.int32],
+        *,
+        dcp_token_item_lens: List[int],
+        dst_dcp_size: int,
+        dst_dcp_rank: int,
+        src_page_offset: int,
+        decode_prefix_len: int,
+        num_kv_tokens: int,
+        executor: concurrent.futures.ThreadPoolExecutor,
+        dst_layer_ids: List[int],
+    ) -> int:
+        """Send MLA pages directly for a page-interleaved decode target.
+
+        The page plan carries contiguous physical rows, so this path deliberately
+        bypasses the token gather/pack buffer used by token-stripe DCP.
+        """
+        if num_kv_tokens is None:
+            raise ValueError("PD DCP page transfer requires num_kv_tokens")
+        src_layer_ids = self.kv_args.kv_layer_ids
+        if src_layer_ids or dst_layer_ids:
+            dst_entries = resolve_dcp_dst_entry_indices(
+                src_layer_ids,
+                dst_layer_ids,
+                len(self.kv_args.kv_data_ptrs),
+                len(dst_kv_ptrs),
+            )
+            src_kv_ptrs = self.kv_args.kv_data_ptrs
+            dst_kv_ptrs = [dst_kv_ptrs[index] for index in dst_entries]
+        else:
+            src_kv_ptrs, dst_kv_ptrs, _ = self.get_mla_kv_ptrs_with_pp(
+                self.kv_args.kv_data_ptrs, dst_kv_ptrs
+            )
+
+        plan = build_dcp_page_transfer_plan(
+            prefill_kv_indices,
+            dst_kv_indices,
+            physical_page_size=self.kv_args.page_size,
+            dcp_size=dst_dcp_size,
+            dcp_rank=dst_dcp_rank,
+            src_page_offset=src_page_offset,
+            decode_prefix_len=decode_prefix_len,
+            num_kv_tokens=num_kv_tokens,
+        )
+        if plan.empty():
+            return 0
+
+        def blocks_for_layer(src_ptr: int, dst_ptr: int, item_len: int):
+            return [
+                (
+                    src_ptr + int(src_start) * item_len,
+                    dst_ptr + int(dst_start) * item_len,
+                    int(token_count) * item_len,
+                )
+                for src_start, dst_start, token_count in zip(
+                    plan.src_token_starts,
+                    plan.dst_token_starts,
+                    plan.token_counts,
+                )
+            ]
+
+        if self.enable_custom_mem_pool:
+            futures = []
+            try:
+                for src_ptr, dst_ptr, item_len in zip(
+                    src_kv_ptrs, dst_kv_ptrs, dcp_token_item_lens
+                ):
+                    futures.append(
+                        executor.submit(
+                            self._transfer_data,
+                            mooncake_session_id,
+                            blocks_for_layer(src_ptr, dst_ptr, item_len),
+                        )
+                    )
+            except Exception:
+                # A submit failure does not cancel a running predecessor.
+                self._await_transfer_futures(futures, drain_on_error=True)
+                raise
+            # A failed running RDMA future cannot be cancelled. Page targets
+            # must wait for all submitted writes before their terminal drain.
+            return self._await_transfer_futures(futures, drain_on_error=True)
+
+        transfer_blocks = []
+        for src_ptr, dst_ptr, item_len in zip(
+            src_kv_ptrs, dst_kv_ptrs, dcp_token_item_lens
+        ):
+            transfer_blocks.extend(blocks_for_layer(src_ptr, dst_ptr, item_len))
+        return self._transfer_data(mooncake_session_id, transfer_blocks)
+
+    def _validate_page_registration(self, info: KVArgsRegisterInfo) -> Optional[str]:
+        """Return a boundary-visible reason for a page registration rejection."""
+        if info.dcp_kv_layout == DCP_KV_LAYOUT_TOKEN_STRIPE_V1:
+            return None
+        if info.dcp_kv_layout != DCP_KV_LAYOUT_PAGE_INTERLEAVE_V1:
+            return "unsupported_dcp_kv_layout"
+        if not info.registration_id:
+            return "missing_registration_id"
+        if info.page_layout_version != 1:
+            return "unsupported_layout_version"
+        if info.physical_page_size != self.kv_args.page_size:
+            return "physical_page_size_mismatch"
+        if self.dcp_size != 1 or info.dst_dcp_size <= 1:
+            return "unsupported_dcp_topology"
+        if not 0 <= info.dst_dcp_rank < info.dst_dcp_size:
+            return "invalid_dcp_rank"
+        if not self._supports_page_dcp_send():
+            return "unsupported_mla_layout"
+        return None
+
+    def _send_page_registration_response(
+        self,
+        info: KVArgsRegisterInfo,
+        tag: bytes,
+        reason: Optional[str] = None,
+        description: Optional[str] = None,
+    ) -> None:
+        na = NetworkAddress(info.endpoint, info.dst_port)
+        payload = {
+            "version": 1,
+            "layout": DCP_KV_LAYOUT_PAGE_INTERLEAVE_V1,
+            "physical_page_size": self.kv_args.page_size,
+        }
+        if reason is not None:
+            payload["reason"] = reason
+            payload["description"] = description or reason.replace("_", " ")
+        self._send_multipart_locked(
+            na.to_tcp(),
+            [
+                tag,
+                (info.registration_id or "").encode("utf-8"),
+                NetworkAddress(self.local_ip, self.rank_port).to_tcp().encode("utf-8"),
+                info.mooncake_session_id.encode("utf-8"),
+                json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+            ],
+            is_ipv6=na.is_ipv6,
+        )
+
+    @staticmethod
+    def _page_registration_matches(
+        existing: KVArgsRegisterInfo, incoming: KVArgsRegisterInfo
+    ) -> bool:
+        """Accept a duplicate nonce only for the same registration wire record."""
+        return (
+            dataclasses.replace(
+                existing,
+                requires_dcp_relayout=False,
+                dcp_token_item_lens=None,
+            )
+            == incoming
+        )
 
     def send_kvcache(
         self,
@@ -1942,8 +2169,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
                             thread_finish_flag=True,
                         )
-                    self._staging_outstanding.pop(kv_chunk.room, None)
-                    if self.enable_deferred_decode_kv_release:
+                    if kv_chunk.room in self._page_transfer_rooms:
+                        self._staging_outstanding[kv_chunk.room] -= 1
+                    else:
+                        self._staging_outstanding.pop(kv_chunk.room, None)
+                    if (
+                        self.enable_deferred_decode_kv_release
+                        or kv_chunk.room in self._page_transfer_rooms
+                    ):
                         # Skipped => nothing written for this aborted room; ack.
                         self._maybe_ack_drained_abort(kv_chunk.room)
                     continue
@@ -1987,6 +2220,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         )
                         is_dcp_transfer = (
                             target_rank_registration_info.requires_dcp_relayout
+                        )
+                        is_page_dcp_transfer = (
+                            target_rank_registration_info.dcp_kv_layout
+                            == DCP_KV_LAYOUT_PAGE_INTERLEAVE_V1
                         )
                         chunked_dst_device_kv_indice = None
                         if is_dcp_transfer:
@@ -2039,16 +2276,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 target_rank_registration_info.dcp_token_item_lens
                             )
                             assert dcp_token_item_lens is not None
-                            pack_buffer = (
-                                self._dcp_pack_buffers[worker_index]
-                                if self._dcp_pack_buffers
-                                else None
-                            )
-                            ret = self.send_kvcache_dcp(
-                                req.mooncake_session_id,
-                                kv_chunk.prefill_kv_indices,
-                                target_rank_registration_info.dst_kv_ptrs,
-                                chunked_dst_kv_indice,
+                            transfer_args = dict(
                                 dcp_token_item_lens=dcp_token_item_lens,
                                 dst_dcp_size=target_rank_registration_info.dst_dcp_size,
                                 dst_dcp_rank=target_rank_registration_info.dst_dcp_rank,
@@ -2056,11 +2284,38 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 decode_prefix_len=req.decode_prefix_len or 0,
                                 num_kv_tokens=kv_chunk.num_kv_tokens,
                                 executor=executor,
-                                dst_layer_ids=(
-                                    target_rank_registration_info.dst_kv_layer_ids
-                                ),
-                                pack_buffer=pack_buffer,
+                                dst_layer_ids=target_rank_registration_info.dst_kv_layer_ids,
                             )
+                            if is_page_dcp_transfer:
+                                try:
+                                    ret = self.send_kvcache_dcp_page(
+                                        req.mooncake_session_id,
+                                        kv_chunk.prefill_kv_indices,
+                                        target_rank_registration_info.dst_kv_ptrs,
+                                        chunked_dst_kv_indice,
+                                        **transfer_args,
+                                    )
+                                except Exception:
+                                    logger.exception(
+                                        "Page DCP transfer failed after draining "
+                                        "submitted writes for room %s",
+                                        kv_chunk.room,
+                                    )
+                                    ret = -1
+                            else:
+                                pack_buffer = (
+                                    self._dcp_pack_buffers[worker_index]
+                                    if self._dcp_pack_buffers
+                                    else None
+                                )
+                                ret = self.send_kvcache_dcp(
+                                    req.mooncake_session_id,
+                                    kv_chunk.prefill_kv_indices,
+                                    target_rank_registration_info.dst_kv_ptrs,
+                                    chunked_dst_kv_indice,
+                                    pack_buffer=pack_buffer,
+                                    **transfer_args,
+                                )
                         elif (
                             self.is_mla_backend
                             or self.is_hybrid_mla_backend
@@ -2131,13 +2386,33 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             break
 
                         if kv_chunk.is_last_chunk:
+                            if (
+                                is_page_dcp_transfer
+                                and self.check_status(kv_chunk.room) == KVPoll.Failed
+                            ):
+                                break
                             if kv_chunk.state_indices and not skip_state:
-                                state_rc = self.maybe_send_extra(
-                                    req,
-                                    kv_chunk.state_indices,
-                                    executor,
-                                    target_rank_registration_info,
-                                )
+                                if is_page_dcp_transfer:
+                                    try:
+                                        state_rc = self.maybe_send_extra(
+                                            req,
+                                            kv_chunk.state_indices,
+                                            executor,
+                                            target_rank_registration_info,
+                                        )
+                                    except Exception:
+                                        logger.exception(
+                                            "Page DCP state transfer failed for room %s",
+                                            kv_chunk.room,
+                                        )
+                                        state_rc = -1
+                                else:
+                                    state_rc = self.maybe_send_extra(
+                                        req,
+                                        kv_chunk.state_indices,
+                                        executor,
+                                        target_rank_registration_info,
+                                    )
                                 if state_rc != 0:
                                     with self.session_lock:
                                         self.session_failures[
@@ -2157,11 +2432,30 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     break
 
                             # Only the last chunk we need to send the aux data
-                            ret = self.send_aux(
-                                req,
-                                kv_chunk.prefill_aux_index,
-                                target_rank_registration_info.dst_aux_ptrs,
-                            )
+                            if (
+                                is_page_dcp_transfer
+                                and self.check_status(kv_chunk.room) == KVPoll.Failed
+                            ):
+                                break
+                            if is_page_dcp_transfer:
+                                try:
+                                    ret = self.send_aux(
+                                        req,
+                                        kv_chunk.prefill_aux_index,
+                                        target_rank_registration_info.dst_aux_ptrs,
+                                    )
+                                except Exception:
+                                    logger.exception(
+                                        "Page DCP aux transfer failed for room %s",
+                                        kv_chunk.room,
+                                    )
+                                    ret = -1
+                            else:
+                                ret = self.send_aux(
+                                    req,
+                                    kv_chunk.prefill_aux_index,
+                                    target_rank_registration_info.dst_aux_ptrs,
+                                )
                             polls.append(True if ret == 0 else False)
                             dst_ranks_infos.append((req.endpoint, req.dst_port))
 
@@ -2202,7 +2496,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     continue
 
                 self._staging_outstanding[kv_chunk.room] -= 1
-                if self.enable_deferred_decode_kv_release:
+                if (
+                    self.enable_deferred_decode_kv_release
+                    or kv_chunk.room in self._page_transfer_rooms
+                ):
                     # In-flight write finished; if aborted and nothing outstanding,
                     # the pages are idle -> release the held ack.
                     self._maybe_ack_drained_abort(kv_chunk.room)
@@ -2223,6 +2520,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     if kv_chunk.room in self.transfer_infos:
                         self.transfer_infos.pop(kv_chunk.room)
                     self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
+                    self._page_transfer_rooms.discard(kv_chunk.room)
                     if self.enable_staging:
                         # Purge prefetch bookkeeping for the finished room.
                         # Snapshot first: the scheduler thread adds concurrently.
@@ -2261,7 +2559,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         room_to_be_aborted in self.request_status
                         and self.check_status(room_to_be_aborted) != KVPoll.Success
                     )
-                    if self.enable_deferred_decode_kv_release:
+                    if (
+                        self.enable_deferred_decode_kv_release
+                        or room_to_be_aborted in self._page_transfer_rooms
+                    ):
                         # Mark Failed FIRST (stops add_transfer_request enqueuing
                         # new chunks), THEN register the ack target: registering
                         # first would let the worker drain+ack while the room is
@@ -2324,6 +2625,66 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
                     decode_kv_args = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                    page_reject_reason = self._validate_page_registration(
+                        decode_kv_args
+                    )
+                    if page_reject_reason is not None:
+                        self._send_page_registration_response(
+                            decode_kv_args,
+                            b"DCP_LAYOUT_REGISTER_REJECT",
+                            page_reject_reason,
+                        )
+                        continue
+                    existing_page_registration = self.decode_kv_args_table.get(
+                        mooncake_session_id
+                    )
+                    page_registration_in_use = (
+                        existing_page_registration is not None
+                        and existing_page_registration.dcp_kv_layout
+                        == DCP_KV_LAYOUT_PAGE_INTERLEAVE_V1
+                        and any(
+                            mooncake_session_id in registrations
+                            for room, registrations in self.transfer_infos.items()
+                            if room in self._page_transfer_rooms
+                        )
+                    )
+                    if (
+                        decode_kv_args.dcp_kv_layout == DCP_KV_LAYOUT_PAGE_INTERLEAVE_V1
+                        and existing_page_registration is not None
+                        and existing_page_registration.dcp_kv_layout
+                        == DCP_KV_LAYOUT_PAGE_INTERLEAVE_V1
+                    ):
+                        if (
+                            existing_page_registration.registration_id
+                            == decode_kv_args.registration_id
+                        ):
+                            if not self._page_registration_matches(
+                                existing_page_registration, decode_kv_args
+                            ):
+                                self._send_page_registration_response(
+                                    decode_kv_args,
+                                    b"DCP_LAYOUT_REGISTER_REJECT",
+                                    "registration_mismatch",
+                                )
+                                continue
+                            self._send_page_registration_response(
+                                decode_kv_args, b"DCP_LAYOUT_REGISTER_ACK"
+                            )
+                            continue
+                        if page_registration_in_use:
+                            self._send_page_registration_response(
+                                decode_kv_args,
+                                b"DCP_LAYOUT_REGISTER_REJECT",
+                                "registration_in_use",
+                            )
+                            continue
+                    elif page_registration_in_use:
+                        logger.warning(
+                            "Ignoring token registration that would replace active "
+                            "page session %s",
+                            mooncake_session_id,
+                        )
+                        continue
                     decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
                         decode_kv_args.dst_dcp_size,
                         decode_kv_args.dst_dcp_rank,
@@ -2334,32 +2695,102 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         dst_item_lens: List[Optional[int]] = [
                             decode_kv_args.dst_kv_item_len
                         ] * (num_entries - num_draft) + [None] * num_draft
-                        decode_kv_args.dcp_token_item_lens = (
-                            self.prepare_dcp_token_item_lens(
-                                dst_item_lens,
-                                decode_kv_args.dst_dcp_size,
+                        try:
+                            decode_kv_args.dcp_token_item_lens = (
+                                self.prepare_dcp_token_item_lens(
+                                    dst_item_lens,
+                                    decode_kv_args.dst_dcp_size,
+                                )
                             )
-                        )
-                        self._init_dcp_pack_buffers_once(decode_kv_args.dst_dcp_size)
+                        except RuntimeError as error:
+                            if (
+                                decode_kv_args.dcp_kv_layout
+                                != DCP_KV_LAYOUT_PAGE_INTERLEAVE_V1
+                            ):
+                                raise
+                            self._send_page_registration_response(
+                                decode_kv_args,
+                                b"DCP_LAYOUT_REGISTER_REJECT",
+                                "kv_geometry_mismatch",
+                                str(error),
+                            )
+                            continue
+                        if (
+                            decode_kv_args.dcp_kv_layout
+                            != DCP_KV_LAYOUT_PAGE_INTERLEAVE_V1
+                        ):
+                            self._init_dcp_pack_buffers_once(
+                                decode_kv_args.dst_dcp_size
+                            )
                     self.decode_kv_args_table[mooncake_session_id] = decode_kv_args
-                    with self.session_lock:
-                        if mooncake_session_id in self.failed_sessions:
-                            self.failed_sessions.remove(mooncake_session_id)
-                        if mooncake_session_id in self.session_failures:
-                            del self.session_failures[mooncake_session_id]
+                    if decode_kv_args.dcp_kv_layout != DCP_KV_LAYOUT_PAGE_INTERLEAVE_V1:
+                        with self.session_lock:
+                            if mooncake_session_id in self.failed_sessions:
+                                self.failed_sessions.remove(mooncake_session_id)
+                            if mooncake_session_id in self.session_failures:
+                                del self.session_failures[mooncake_session_id]
                     logger.debug(
                         f"Register KVArgs from {mooncake_session_id} successfully"
                     )
+                    if decode_kv_args.dcp_kv_layout == DCP_KV_LAYOUT_PAGE_INTERLEAVE_V1:
+                        self._send_page_registration_response(
+                            decode_kv_args, b"DCP_LAYOUT_REGISTER_ACK"
+                        )
                     continue
                 else:
                     required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
                     room = int(room)
+                    transfer_info = TransferInfo.from_zmq(waiting_req_bytes)
+                    if transfer_info.dcp_kv_layout not in {
+                        DCP_KV_LAYOUT_TOKEN_STRIPE_V1,
+                        DCP_KV_LAYOUT_PAGE_INTERLEAVE_V1,
+                    }:
+                        self.conclude_failure(
+                            bootstrap_room=room,
+                            failure_reason="unsupported DCP KV layout in room metadata",
+                            targets=[(transfer_info.endpoint, transfer_info.dst_port)],
+                        )
+                        continue
+                    if transfer_info.dcp_kv_layout == DCP_KV_LAYOUT_PAGE_INTERLEAVE_V1:
+                        registration = self.decode_kv_args_table.get(
+                            mooncake_session_id
+                        )
+                        if (
+                            registration is None
+                            or registration.dcp_kv_layout
+                            != DCP_KV_LAYOUT_PAGE_INTERLEAVE_V1
+                            or transfer_info.page_layout_version != 1
+                            or transfer_info.registration_id
+                            != registration.registration_id
+                        ):
+                            self.conclude_failure(
+                                bootstrap_room=room,
+                                failure_reason="page room metadata does not match registration",
+                                targets=[
+                                    (transfer_info.endpoint, transfer_info.dst_port)
+                                ],
+                            )
+                            continue
+                    elif (
+                        self.decode_kv_args_table.get(mooncake_session_id) is not None
+                        and self.decode_kv_args_table[mooncake_session_id].dcp_kv_layout
+                        == DCP_KV_LAYOUT_PAGE_INTERLEAVE_V1
+                    ):
+                        self.conclude_failure(
+                            bootstrap_room=room,
+                            failure_reason="token room metadata conflicts with page registration",
+                            targets=[(transfer_info.endpoint, transfer_info.dst_port)],
+                        )
+                        continue
                     if room not in self.transfer_infos:
                         self.transfer_infos[room] = {}
 
-                    self.transfer_infos[room][mooncake_session_id] = (
-                        TransferInfo.from_zmq(waiting_req_bytes)
-                    )
+                    self.transfer_infos[room][mooncake_session_id] = transfer_info
+                    if (
+                        self.transfer_infos[room][mooncake_session_id].dcp_kv_layout
+                        == DCP_KV_LAYOUT_PAGE_INTERLEAVE_V1
+                    ):
+                        self._page_transfer_rooms.add(room)
                     # NOTE: after bootstrapping we can mark the req as waiting for input
                     if len(self.transfer_infos[room]) == required_dst_info_num:
                         self.resolve_kv_replica_factor(self.transfer_infos[room])
@@ -2408,13 +2839,53 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     self._handle_staging_req(msg)
                     continue
 
+                if msg[0] in {
+                    b"DCP_LAYOUT_REGISTER_ACK",
+                    b"DCP_LAYOUT_REGISTER_REJECT",
+                }:
+                    if len(msg) != 5:
+                        logger.warning("Dropping malformed page registration response")
+                        continue
+                    try:
+                        registration_id = msg[1].decode("utf-8")
+                        endpoint = msg[2].decode("utf-8")
+                        session_id = msg[3].decode("utf-8")
+                        payload = json.loads(msg[4].decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        logger.warning("Dropping unparsable page registration response")
+                        continue
+                    with self.connection_lock:
+                        matches = [
+                            (key, state)
+                            for key, state in self._page_registration_states.items()
+                            if key[0] == endpoint
+                            and key[1] == session_id
+                            and state.registration_id == registration_id
+                        ]
+                        for key, state in matches:
+                            if msg[0] == b"DCP_LAYOUT_REGISTER_REJECT":
+                                state.failed_reason = payload.get("reason", "unknown")
+                            elif (
+                                payload.get("version") == 1
+                                and payload.get("layout")
+                                == DCP_KV_LAYOUT_PAGE_INTERLEAVE_V1
+                                and payload.get("physical_page_size") == key[3]
+                            ):
+                                state.accepted = True
+                            else:
+                                state.failed_reason = "acknowledgement_mismatch"
+                    continue
+
                 # Prefill acknowledges abort notification
                 if msg[0] == b"ABORT_ACK":
                     ack_aborted_room = int(msg[1].decode("ascii"))
                     logger.debug(f"Received ABORT_ACK for room {ack_aborted_room}")
                     # Deferred release: the 3-frame ack carries the prefill rank
                     # and means its transfer drained; aggregate for is_abort_release_safe.
-                    if self.enable_deferred_decode_kv_release and len(msg) >= 3:
+                    if (
+                        self.enable_deferred_decode_kv_release
+                        or ack_aborted_room in self._deferred_abort_ack_tracker
+                    ) and len(msg) >= 3:
                         self.note_abort_ack(
                             ack_aborted_room, int(msg[2].decode("ascii"))
                         )
@@ -2473,6 +2944,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
 
+        page_transfer = bootstrap_room in self._page_transfer_rooms
+        if page_transfer:
+            # Count on enqueue: an abort ACK cannot race a queued write.
+            self._staging_outstanding[bootstrap_room] += 1
         self.transfer_queues[shard_idx].put(
             TransferKVChunk(
                 room=bootstrap_room,
@@ -2483,6 +2958,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=trace_ctx,
+                staging_counted=page_transfer,
             )
         )
 
@@ -2614,10 +3090,12 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
     def poll(self) -> KVPoll:
         if self.conclude_state is None:
             status = self.kv_mgr.check_status(self.bootstrap_room)
-            # Hold Success until all staging chunks transferred: a deferred
-            # chunk can still be pending, and concluding now would drop it.
+            # A page room also holds Failed until every already-enqueued write
+            # drains. The Failed status still blocks new chunks, while keeping
+            # P source pages live for a running RDMA read.
             if (
-                status == KVPoll.Success
+                status in (KVPoll.Success, KVPoll.Failed)
+                and self.bootstrap_room in self.kv_mgr._page_transfer_rooms
                 and self.kv_mgr._staging_outstanding.get(self.bootstrap_room, 0) > 0
             ):
                 return KVPoll.Transferring
@@ -2662,10 +3140,95 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
         bootstrap_room: Optional[int] = None,
     ):
         self.session_id = mgr.get_session_id()
+        self.dcp_kv_layout = getattr(get_parallel(), "dcp_kv_layout", "token")
+        self._is_page_layout = self.dcp_kv_layout == "page"
+        self._page_registration_records = {}
+        self._page_metadata_sent = False
         self.init_time = None
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
 
+    def _registration_ready(self) -> bool:
+        if not self._is_page_layout:
+            return True
+        if self.conclude_state == KVPoll.Failed:
+            return False
+        with self.kv_mgr.connection_lock:
+            records = list(self._page_registration_records.items())
+            return bool(records) and all(
+                self.kv_mgr._page_registration_states.get(key) is state
+                and state.accepted
+                and state.failed_reason is None
+                for key, state in records
+            )
+
+    def failure_exception(self):
+        if not self._is_page_layout or not self._page_metadata_sent:
+            return super().failure_exception()
+        # DecodeTransferQueue must retain this receiver long enough to arm the
+        # already-created page drain tracker and obtain every P ACK.
+        self.conclude_state = KVPoll.Failed
+        with self.kv_mgr.failure_lock:
+            reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
+        raise KVTransferError(
+            self.bootstrap_room,
+            reason or "Failed page DCP transfer",
+            is_from_another_rank=reason is None,
+        )
+
+    def invalidate_cached_bootstrap_infos(self) -> None:
+        super().invalidate_cached_bootstrap_infos()
+        if self._is_page_layout:
+            with self.kv_mgr.connection_lock:
+                for key, state in self._page_registration_records.items():
+                    if self.kv_mgr._page_registration_states.get(key) is state:
+                        del self.kv_mgr._page_registration_states[key]
+                if (
+                    self.kv_mgr.prefill_info_table.get(self.bootstrap_addr)
+                    is self.prefill_info
+                ):
+                    del self.kv_mgr.prefill_info_table[self.bootstrap_addr]
+
+    def clear(self) -> None:
+        super().clear()
+        if self._is_page_layout:
+            self.kv_mgr.clear_deferred_abort_state(self.bootstrap_room)
+
+    def _setup_bootstrap_infos(self):
+        super()._setup_bootstrap_infos()
+        if self._is_page_layout and self.bootstrap_infos is not None:
+            # Cached connections skip _register_kv_args; attach this receiver to
+            # the shared accepted/pending records instead of inventing a nonce.
+            with self.kv_mgr.connection_lock:
+                missing_registration = False
+                for bootstrap_info in self.bootstrap_infos:
+                    key = (
+                        NetworkAddress(
+                            bootstrap_info["rank_ip"], bootstrap_info["rank_port"]
+                        ).to_tcp(),
+                        self.session_id,
+                        DCP_KV_LAYOUT_PAGE_INTERLEAVE_V1,
+                        self.kv_mgr.kv_args.page_size,
+                        self.kv_mgr._page_registration_generation,
+                    )
+                    state = self.kv_mgr._page_registration_states.get(key)
+                    if state is not None:
+                        self._page_registration_records[key] = state
+                    else:
+                        missing_registration = True
+            if missing_registration and not self._register_kv_args():
+                self.invalidate_cached_bootstrap_infos()
+
     def _register_kv_args(self) -> bool:
+        if self._is_page_layout and DCP_KV_LAYOUT_PAGE_INTERLEAVE_V1 not in (
+            self.prefill_info.dcp_kv_layouts or ()
+        ):
+            self.kv_mgr.record_failure(
+                self.bootstrap_room,
+                "prefill topology does not advertise page-interleaved DCP KV",
+            )
+            self.conclude_state = KVPoll.Failed
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            return False
         for bootstrap_info in self.bootstrap_infos:
             packed_kv_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
@@ -2718,33 +3281,71 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                 struct.pack("Q", layer_id)
                 for layer_id in (staging_slots.get("slot_layer_ids") or [])
             )
-
+            page_key = None
+            page_state = None
+            send_page_registration = False
+            if self._is_page_layout:
+                endpoint = NetworkAddress(
+                    bootstrap_info["rank_ip"], bootstrap_info["rank_port"]
+                ).to_tcp()
+                page_key = (
+                    endpoint,
+                    self.session_id,
+                    DCP_KV_LAYOUT_PAGE_INTERLEAVE_V1,
+                    self.kv_mgr.kv_args.page_size,
+                    self.kv_mgr._page_registration_generation,
+                )
+                with self.kv_mgr.connection_lock:
+                    page_state = self.kv_mgr._page_registration_states.get(page_key)
+                    if page_state is None:
+                        page_state = PageRegistrationState(
+                            uuid.uuid4().hex, time.monotonic()
+                        )
+                        self.kv_mgr._page_registration_states[page_key] = page_state
+                        send_page_registration = True
+                self._page_registration_records[page_key] = page_state
+            page_registration = (
+                json.dumps(
+                    {
+                        "version": 1,
+                        "layout": DCP_KV_LAYOUT_PAGE_INTERLEAVE_V1,
+                        "physical_page_size": self.kv_mgr.kv_args.page_size,
+                        "registration_id": page_state.registration_id,
+                    },
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                if self._is_page_layout
+                else b""
+            )
+            if self._is_page_layout and not send_page_registration:
+                continue
             try:
                 sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
                 with lock:
-                    sock.send_multipart(
-                        [
-                            "None".encode("ascii"),
-                            self.kv_mgr.local_ip.encode("ascii"),
-                            str(self.kv_mgr.rank_port).encode("ascii"),
-                            self.session_id.encode("ascii"),
-                            packed_kv_data_ptrs,
-                            packed_aux_data_ptrs,
-                            packed_state_data_ptrs,
-                            dst_tp_rank,
-                            dst_attn_tp_size,
-                            dst_kv_item_len,
-                            packed_state_item_lens,
-                            packed_state_dim_per_tensor,
-                            packed_kv_layer_ids,
-                            packed_state_layer_ids,
-                            packed_staging_base_ptr,
-                            staging_total_size_str,
-                            dst_dcp_size,
-                            dst_dcp_rank,
-                            packed_staging_slot_layer_ids,
-                        ]
-                    )
+                    frames = [
+                        "None".encode("ascii"),
+                        self.kv_mgr.local_ip.encode("ascii"),
+                        str(self.kv_mgr.rank_port).encode("ascii"),
+                        self.session_id.encode("ascii"),
+                        packed_kv_data_ptrs,
+                        packed_aux_data_ptrs,
+                        packed_state_data_ptrs,
+                        dst_tp_rank,
+                        dst_attn_tp_size,
+                        dst_kv_item_len,
+                        packed_state_item_lens,
+                        packed_state_dim_per_tensor,
+                        packed_kv_layer_ids,
+                        packed_state_layer_ids,
+                        packed_staging_base_ptr,
+                        staging_total_size_str,
+                        dst_dcp_size,
+                        dst_dcp_rank,
+                        packed_staging_slot_layer_ids,
+                    ]
+                    if self._is_page_layout:
+                        frames.append(page_registration)
+                    sock.send_multipart(frames)
             except zmq.ZMQError:
                 self.kv_mgr.record_failure(
                     self.bootstrap_room,
@@ -2763,6 +3364,18 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
         decode_prefix_len: Optional[int] = None,
         device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
     ):
+        if self._is_page_layout and not self._registration_ready():
+            self.kv_mgr.record_failure(
+                self.bootstrap_room,
+                "page room metadata requires accepted registration acknowledgements",
+            )
+            self.conclude_state = KVPoll.Failed
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            return
+        if self._is_page_layout and not self._page_metadata_sent:
+            # The tracker must exist before P can receive room metadata or
+            # return a quiescent drain ACK.
+            self.kv_mgr.register_deferred_abort_room(self.bootstrap_room)
         if self.bootstrap_infos is None:
             self.kv_mgr.record_failure(
                 self.bootstrap_room,
@@ -2772,6 +3385,10 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
             return
 
         self.chunk_staging_infos = []
+        if self._is_page_layout:
+            # From this point a P may write, including if a later endpoint send
+            # fails; Decode must retain the destination until the drain ACK.
+            self._page_metadata_sent = True
         if (
             self.kv_mgr.enable_staging
             and self.kv_mgr._staging_ctx.allocator is not None
@@ -2782,31 +3399,63 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
 
         for bootstrap_info in self.bootstrap_infos:
             is_dummy = bootstrap_info["is_dummy"]
+            page_state = None
+            if self._is_page_layout:
+                page_key = (
+                    NetworkAddress(
+                        bootstrap_info["rank_ip"], bootstrap_info["rank_port"]
+                    ).to_tcp(),
+                    self.session_id,
+                    DCP_KV_LAYOUT_PAGE_INTERLEAVE_V1,
+                    self.kv_mgr.kv_args.page_size,
+                    self.kv_mgr._page_registration_generation,
+                )
+                with self.kv_mgr.connection_lock:
+                    page_state = self._page_registration_records.get(page_key)
+                    current_state = self.kv_mgr._page_registration_states.get(page_key)
+                if page_state is None or current_state is not page_state:
+                    self.kv_mgr.record_failure(
+                        self.bootstrap_room,
+                        "page registration was invalidated before room metadata",
+                    )
+                    self.conclude_state = KVPoll.Failed
+                    self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                    return
             try:
                 sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
                 with lock:
-                    sock.send_multipart(
-                        [
-                            str(self.bootstrap_room).encode("ascii"),
-                            self.kv_mgr.local_ip.encode("ascii"),
-                            str(self.kv_mgr.rank_port).encode("ascii"),
-                            self.session_id.encode("ascii"),
-                            kv_indices.tobytes() if not is_dummy else b"",
-                            str(aux_index).encode("ascii") if not is_dummy else b"",
-                            (
-                                pack_int_lists(state_indices, "i")
-                                if not is_dummy and state_indices
-                                else b""
-                            ),
-                            str(self.required_dst_info_num).encode("ascii"),
-                            str(decode_prefix_len or 0).encode("ascii"),
-                            (
-                                np.asarray(device_kv_indices, dtype=np.int32).tobytes()
-                                if not is_dummy and device_kv_indices is not None
-                                else b""
-                            ),
-                        ]
-                    )
+                    frames = [
+                        str(self.bootstrap_room).encode("ascii"),
+                        self.kv_mgr.local_ip.encode("ascii"),
+                        str(self.kv_mgr.rank_port).encode("ascii"),
+                        self.session_id.encode("ascii"),
+                        kv_indices.tobytes() if not is_dummy else b"",
+                        str(aux_index).encode("ascii") if not is_dummy else b"",
+                        (
+                            pack_int_lists(state_indices, "i")
+                            if not is_dummy and state_indices
+                            else b""
+                        ),
+                        str(self.required_dst_info_num).encode("ascii"),
+                        str(decode_prefix_len or 0).encode("ascii"),
+                        (
+                            np.asarray(device_kv_indices, dtype=np.int32).tobytes()
+                            if not is_dummy and device_kv_indices is not None
+                            else b""
+                        ),
+                    ]
+                    if self._is_page_layout:
+                        frames.append(
+                            json.dumps(
+                                {
+                                    "version": 1,
+                                    "layout": DCP_KV_LAYOUT_PAGE_INTERLEAVE_V1,
+                                    "registration_id": page_state.registration_id,
+                                },
+                                separators=(",", ":"),
+                            ).encode("utf-8")
+                        )
+                    sock.send_multipart(frames)
             except zmq.ZMQError:
                 self.invalidate_cached_bootstrap_infos()
                 self.kv_mgr.record_failure(
@@ -2823,6 +3472,44 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
             return self.conclude_state
 
         status = self.kv_mgr.check_status(self.bootstrap_room)
+        if self._is_page_layout and status == KVPoll.Bootstrapping:
+            if self._registration_ready():
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
+                return KVPoll.WaitingForInput
+            with self.kv_mgr.connection_lock:
+                pending = list(self._page_registration_records.items())
+                registration_replaced = any(
+                    self.kv_mgr._page_registration_states.get(key) is not state
+                    for key, state in pending
+                )
+                pending_states = [state for _, state in pending]
+            if registration_replaced:
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room,
+                    "page registration was invalidated before acknowledgement",
+                )
+                self.conclude_state = KVPoll.Failed
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                self.invalidate_cached_bootstrap_infos()
+                return self.conclude_state
+            if any(state.failed_reason for state in pending_states) or any(
+                time.monotonic() - state.started_at >= self.kv_mgr.waiting_timeout
+                for state in pending_states
+            ):
+                with self.kv_mgr.connection_lock:
+                    for key, state in self._page_registration_records.items():
+                        if (
+                            self.kv_mgr._page_registration_states.get(key) is state
+                            and state.failed_reason is None
+                        ):
+                            state.failed_reason = "acknowledgement_timeout"
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room, "page registration acknowledgement timed out"
+                )
+                self.conclude_state = KVPoll.Failed
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                self.invalidate_cached_bootstrap_infos()
+                return self.conclude_state
         if status in (KVPoll.Success, KVPoll.Failed):
             self.conclude_state = status
         elif status == KVPoll.WaitingForInput:

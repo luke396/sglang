@@ -50,6 +50,16 @@ from sglang.srt.utils.network import (
 
 logger = logging.getLogger(__name__)
 
+DCP_KV_LAYOUT_TOKEN_STRIPE_V1 = "token_stripe_v1"
+DCP_KV_LAYOUT_PAGE_INTERLEAVE_V1 = "page_interleave_v1"
+
+
+def _parse_dcp_kv_layouts(value: object) -> Optional[List[str]]:
+    """Accept only the explicit JSON list-of-string capability shape."""
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        return None
+    return list(value)
+
 
 # Reuse a keep-alive session per bootstrap_addr for decode-side bootstrap queries
 # so we don't open a fresh TCP connection per query (that churns short-lived
@@ -109,6 +119,10 @@ class PrefillServerInfo:
     # recompute -- no router-injected pd_rebootstrap_prefill_url needed.
     prefill_http_port: Optional[int] = None
 
+    # Optional intersection of the P ranks' DCP KV wire-layout capabilities.
+    # This is deliberately absent from legacy /route responses.
+    dcp_kv_layouts: Optional[List[str]] = None
+
     # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
     target_tp_ranks: Optional[List[int]] = None
@@ -131,16 +145,19 @@ class PrefillServerInfo:
         self.prefill_http_port = (
             int(self.prefill_http_port) if self.prefill_http_port is not None else None
         )
+        self.dcp_kv_layouts = _parse_dcp_kv_layouts(self.dcp_kv_layouts)
 
 
 @dataclasses.dataclass
 class PrefillRankInfo:
     rank_ip: str
     rank_port: int
+    dcp_kv_layouts: Optional[List[str]] = None
 
     def __post_init__(self):
         self.rank_ip = str(self.rank_ip)
         self.rank_port = int(self.rank_port)
+        self.dcp_kv_layouts = _parse_dcp_kv_layouts(self.dcp_kv_layouts)
 
 
 class CommonKVManager(BaseKVManager):
@@ -860,11 +877,14 @@ class CommonKVManager(BaseKVManager):
 
         info: PrefillServerInfo = None
         try:
+            wants_dcp_kv_caps = getattr(get_parallel(), "dcp_kv_layout", None) == "page"
             url = (
                 f"http://{bootstrap_addr}/route?"
                 f"prefill_dp_rank={-1}&prefill_cp_rank={-1}&"
                 f"target_tp_rank={-1}&target_pp_rank={-1}"
             )
+            if wants_dcp_kv_caps:
+                url += "&want_dcp_kv_caps=1"
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 data = response.json()
@@ -876,6 +896,17 @@ class CommonKVManager(BaseKVManager):
                 return False
         except Exception as e:
             logger.error(f"Error fetching prefill server info from bootstrap: {e}")
+            return False
+
+        if wants_dcp_kv_caps and (
+            info.dcp_kv_layouts is None
+            or DCP_KV_LAYOUT_PAGE_INTERLEAVE_V1 not in info.dcp_kv_layouts
+        ):
+            logger.error(
+                "Prefill server %s does not advertise %s for page DCP KV layout.",
+                bootstrap_addr,
+                DCP_KV_LAYOUT_PAGE_INTERLEAVE_V1,
+            )
             return False
 
         # Sanity checks
@@ -911,6 +942,9 @@ class CommonKVManager(BaseKVManager):
         self.prefill_info_table[bootstrap_addr] = info
         logger.debug(f"Prefill parallel info for [{bootstrap_addr}]: {info}")
         return True
+
+    def _local_dcp_kv_layouts(self) -> List[str]:
+        return [DCP_KV_LAYOUT_TOKEN_STRIPE_V1]
 
     def _resolve_rank_mapping(self, info: PrefillServerInfo) -> None:
         """Compute TP/CP/PP rank mapping and store on the PrefillServerInfo object.
@@ -1059,6 +1093,7 @@ class CommonKVManager(BaseKVManager):
             "kv_cache_dtype": self.kv_cache_dtype_str,
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
+            "dcp_kv_layouts": self._local_dcp_kv_layouts(),
             # Self-register the HTTP API port so the decode can derive the PD
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
@@ -1643,7 +1678,13 @@ class CommonKVReceiver(BaseKVReceiver):
         self._setup_bootstrap_infos()
         if self.conclude_state == KVPoll.Failed:
             return
+        if not self._registration_ready():
+            return
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
+
+    def _registration_ready(self) -> bool:
+        """Backends with an extended registration ACK can hold Bootstrapping."""
+        return True
 
     def _setup_bootstrap_infos(self):
         all_bootstrap_infos = []
@@ -1980,6 +2021,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
         prefill_http_port = data.get("prefill_http_port")
+        dcp_kv_layouts = data.get("dcp_kv_layouts")
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -2027,6 +2069,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             tp_group_table[pp_rank] = PrefillRankInfo(
                 rank_ip=rank_ip,
                 rank_port=rank_port,
+                dcp_kv_layouts=dcp_kv_layouts,
             )
 
             self._registered_count += 1
@@ -2079,7 +2122,18 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
                 prefill_http_port=self.prefill_http_port,
             )
-            return web.json_response(dataclasses.asdict(info), status=200)
+            info_data = dataclasses.asdict(info)
+            if request.query.get("want_dcp_kv_caps") == "1":
+                dcp_kv_layouts = self._intersect_dcp_kv_layouts()
+                if dcp_kv_layouts is not None:
+                    info_data["dcp_kv_layouts"] = dcp_kv_layouts
+                else:
+                    info_data.pop("dcp_kv_layouts", None)
+            else:
+                # Keep the legacy JSON byte-for-byte field-compatible unless
+                # the decode explicitly opts into the capability extension.
+                info_data.pop("dcp_kv_layouts", None)
+            return web.json_response(info_data, status=200)
 
         if not self._is_ready():
             return web.Response(
@@ -2101,7 +2155,42 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 status=404,
             )
 
-        return web.json_response(dataclasses.asdict(bootstrap_info), status=200)
+        bootstrap_info_data = dataclasses.asdict(bootstrap_info)
+        # Per-rank routing remains a legacy response. Decode obtains the
+        # complete-topology capability intersection from the static query.
+        bootstrap_info_data.pop("dcp_kv_layouts", None)
+        return web.json_response(bootstrap_info_data, status=200)
+
+    def _intersect_dcp_kv_layouts(self) -> Optional[List[str]]:
+        """Return capabilities common to every expected registered P rank.
+
+        A missing/malformed rank advertisement is conservatively unsupported;
+        readiness based only on a registration count is insufficient when a
+        rank has re-registered or a topology row is absent.
+        """
+        if not self._is_ready():
+            return None
+
+        common: Optional[Set[str]] = None
+        try:
+            for dp_rank in range(self.dp_size):
+                for cp_rank in range(self.attn_cp_size):
+                    for tp_rank in range(self.attn_tp_size):
+                        for pp_rank in range(self.pp_size):
+                            rank_info = self.prefill_port_table[dp_rank][cp_rank][
+                                tp_rank
+                            ][pp_rank]
+                            layouts = rank_info.dcp_kv_layouts
+                            if layouts is None:
+                                return None
+                            if common is None:
+                                common = set(layouts)
+                            else:
+                                common.intersection_update(layouts)
+        except KeyError:
+            return None
+
+        return sorted(common) if common else None
 
     async def _handle_register_dp_rank(self, request: web.Request):
         data = await request.json()

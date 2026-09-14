@@ -2368,7 +2368,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
                 if self.scheduler.enable_hisparse:
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
-                if (
+                is_page_transfer = getattr(
+                    decode_req.kv_receiver, "_is_page_layout", False
+                ) and getattr(decode_req.kv_receiver, "_page_metadata_sent", False)
+                if is_page_transfer or (
                     self.enable_deferred_kv_release
                     and decode_req.kv_receiver.kv_mgr.enable_deferred_decode_kv_release
                     and decode_req.kv_receiver.abort_notified
@@ -2450,6 +2453,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # Require an ack from every notified prefill rank (dummy-proof). Snapshot
         # now -- the receiver may be cleared by resolve time.
         required_acks = len(decode_req.kv_receiver.bootstrap_infos)
+        if getattr(decode_req.kv_receiver, "_is_page_layout", False):
+            # Page metadata armed drain accounting before P could acknowledge.
+            if not decode_req.kv_receiver.abort_notified:
+                decode_req.kv_receiver.abort()
         self._deferred_releases.append(
             (decode_req, deadline, decode_req.metadata_buffer_index, required_acks)
         )
@@ -2481,7 +2488,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             room = decode_req.req.bootstrap_room
             kv_mgr = decode_req.kv_receiver.kv_mgr
             drained = kv_mgr.is_abort_release_safe(room, required_acks)
-            if not drained and now < deadline:
+            is_page_transfer = getattr(decode_req.kv_receiver, "_is_page_layout", False)
+            if not drained and (is_page_transfer or now < deadline):
                 still_held.append((decode_req, deadline, idx, required_acks))
             else:
                 to_release.append((decode_req, idx, room, drained))
@@ -2503,6 +2511,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def release_memory_occupation(self):
         """Clean up in-flight transfers before releasing GPU memory."""
+        if any(
+            getattr(item[0].kv_receiver, "_is_page_layout", False)
+            for item in self._deferred_releases
+        ):
+            raise RuntimeError(
+                "cannot tear down decode memory while page DCP writes remain quarantined"
+            )
         self.queue.clear()
         # Pool is being torn down; drop held entries without per-request release.
         self._deferred_releases.clear()

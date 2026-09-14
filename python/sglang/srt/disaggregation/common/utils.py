@@ -5,6 +5,7 @@ import threading
 from collections import deque
 from typing import List, Optional, Tuple, Union
 
+import msgspec
 import numpy as np
 import numpy.typing as npt
 
@@ -195,3 +196,94 @@ def build_dcp_token_transfer_plan(
     target_src, target_dst = rows(target_offsets, physical_page_size, target_local)
     draft_src, draft_dst = rows(draft_offsets, virtual_page_size, draft_local)
     return DCPTokenTransferPlan(target_src, target_dst, draft_src, draft_dst)
+
+
+class DCPPageTransferPlan(msgspec.Struct, frozen=True):
+    """Physical token-row spans for one DCP page-layout transfer."""
+
+    src_token_starts: npt.NDArray[np.int64]
+    dst_token_starts: npt.NDArray[np.int64]
+    token_counts: npt.NDArray[np.int64]
+
+    def empty(self) -> bool:
+        return self.token_counts.size == 0
+
+
+def build_dcp_page_transfer_plan(
+    src_page_indices: npt.NDArray[np.int32],
+    dst_page_indices: npt.NDArray[np.int32],
+    *,
+    physical_page_size: int,
+    dcp_size: int,
+    dcp_rank: int,
+    num_kv_tokens: int,
+    src_page_offset: int = 0,
+    decode_prefix_len: int = 0,
+) -> DCPPageTransferPlan:
+    """Build contiguous physical-row spans without materializing token indices."""
+    src_pages = np.asarray(src_page_indices, dtype=np.int64)
+    dst_pages = np.asarray(dst_page_indices, dtype=np.int64)
+    virtual_page_size = physical_page_size * dcp_size
+    if decode_prefix_len < 0 or decode_prefix_len % virtual_page_size != 0:
+        raise ValueError(
+            "PD DCP page transfer requires decode_prefix_len to align to the "
+            f"virtual DCP page size ({virtual_page_size}), got {decode_prefix_len}"
+        )
+
+    source_page_count = (num_kv_tokens + physical_page_size - 1) // physical_page_size
+    if src_pages.size < source_page_count:
+        raise ValueError(
+            "DCP page transfer source page-index array is too short for "
+            f"{num_kv_tokens} KV tokens: need {source_page_count}, got {src_pages.size}"
+        )
+
+    src_starts: list[int] = []
+    dst_starts: list[int] = []
+    counts: list[int] = []
+    for page_index in range(source_page_count):
+        valid_tokens = min(
+            physical_page_size,
+            num_kv_tokens - page_index * physical_page_size,
+        )
+        source_page = int(src_pages[page_index])
+        if source_page < 0:
+            raise ValueError(
+                "DCP page transfer source page index must be nonnegative, "
+                f"got {source_page} at chunk page {page_index}"
+            )
+
+        relative_page = src_page_offset + page_index
+        logical_page_start = decode_prefix_len + relative_page * physical_page_size
+        if (logical_page_start // physical_page_size) % dcp_size != dcp_rank:
+            continue
+
+        dst_page_offset = relative_page // dcp_size
+        if dst_page_offset >= dst_pages.size:
+            raise ValueError(
+                "DCP page transfer destination page-index array is too short for "
+                f"local page {dst_page_offset}: got {dst_pages.size} pages"
+            )
+        destination_page = int(dst_pages[dst_page_offset])
+        if destination_page < 0:
+            raise ValueError(
+                "DCP page transfer destination page index must be nonnegative, "
+                f"got {destination_page} at local page {dst_page_offset}"
+            )
+
+        src_start = source_page * physical_page_size
+        dst_start = destination_page * physical_page_size
+        if (
+            counts
+            and src_start == src_starts[-1] + counts[-1]
+            and dst_start == dst_starts[-1] + counts[-1]
+        ):
+            counts[-1] += valid_tokens
+        else:
+            src_starts.append(src_start)
+            dst_starts.append(dst_start)
+            counts.append(valid_tokens)
+
+    src_starts_array = np.asarray(src_starts, dtype=np.int64)
+    dst_starts_array = np.asarray(dst_starts, dtype=np.int64)
+    counts_array = np.asarray(counts, dtype=np.int64)
+    return DCPPageTransferPlan(src_starts_array, dst_starts_array, counts_array)
