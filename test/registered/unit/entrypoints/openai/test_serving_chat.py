@@ -4347,19 +4347,27 @@ class TestAllowedToolsServing(CustomTestCase):
             **kwargs,
         )
 
-    def _complete(self, request, text="No tool needed."):
+    def _complete(self, request, text="No tool needed.", *, chunk_size=1):
         self.internal_request = None
 
         async def generate(internal_request, raw_request):
             self.internal_request = internal_request
-            chunks = range(1, len(text) + 1) if request.stream else [len(text)]
+            chunks = (
+                [*range(chunk_size, len(text), chunk_size), len(text)]
+                if request.stream
+                else [len(text)]
+            )
             for end in chunks:
-                result = _spec_result(0)
-                result["text"] = text[:end]
-                result["meta_info"]["finish_reason"] = (
-                    {"type": "stop"} if end == len(text) else None
-                )
-                yield result
+                results = [_spec_result(index) for index in range(request.n)]
+                for result in results:
+                    result["text"] = text[:end]
+                    result["meta_info"]["finish_reason"] = (
+                        {"type": "stop"} if end == len(text) else None
+                    )
+                    if request.stream:
+                        yield result
+                if not request.stream:
+                    yield results
 
         async def complete():
             self.tm.generate_request = generate
@@ -4612,6 +4620,100 @@ class TestAllowedToolsServing(CustomTestCase):
                 else:
                     self.assertEqual(response.status_code, 400)
                     self.assertIn("allowed_tools", json.loads(response.body)["message"])
+
+    def test_parallel_disabled_rejects_embedded_allowed_call_before_emission(self):
+        """Embedded allowed calls cannot bypass the single-call limit across chunks."""
+        for second_name in ("B", "A"):
+            text = (
+                TOOLS_OPEN + '<|open|>call tool="A" index="1"<|sep|>'
+                '<|open|>argument key="body" type="string"<|sep|>'
+                "<|close|>call<|sep|>"
+                f'<|open|>call tool="{second_name}" index="1"<|sep|>'
+                "<|close|>call<|sep|><|close|>argument<|sep|>"
+                "<|close|>call<|sep|>" + TOOLS_CLOSE
+            )
+            for mode in ("auto", "required"):
+                for stream, chunk_size in ((False, 1), (True, 1), (True, len(text))):
+                    with self.subTest(
+                        second_name=second_name,
+                        mode=mode,
+                        stream=stream,
+                        chunk_size=chunk_size,
+                    ):
+                        response = self._complete(
+                            self._request(
+                                mode=mode, stream=stream, parallel_tool_calls=False
+                            ),
+                            text,
+                            chunk_size=chunk_size,
+                        )
+                        grammar = xgr.Grammar.from_structural_tag(
+                            self.internal_request.sampling_params["structural_tag"]
+                        )
+                        self.assertTrue(_is_grammar_accept_string(grammar, text))
+                        if stream:
+                            calls = [
+                                call
+                                for event in response
+                                for choice in event.get("choices", [])
+                                for call in choice.get("delta", {}).get(
+                                    "tool_calls", []
+                                )
+                            ]
+                            self.assertLessEqual(len(calls), 1)
+                            if chunk_size == 1:
+                                self.assertEqual(
+                                    [call["function"]["name"] for call in calls], ["A"]
+                                )
+                            errors = [
+                                event["error"] for event in response if "error" in event
+                            ]
+                            self.assertEqual(len(errors), 1)
+                            self.assertIn("parallel_tool_calls", errors[0]["message"])
+                        else:
+                            self.assertEqual(response.status_code, 400)
+                            self.assertIn(
+                                "parallel_tool_calls",
+                                json.loads(response.body)["message"],
+                            )
+
+    def test_parallel_limit_is_per_choice_and_preserves_legal_calls(self):
+        for stream in (False, True):
+            for parallel in (False, True):
+                with self.subTest(stream=stream, parallel=parallel):
+                    names = ["A", "B"] if parallel else ["B"]
+                    text = (
+                        TOOLS_OPEN
+                        + "".join(
+                            f'<|open|>call tool="{name}" index="1"<|sep|>'
+                            "<|close|>call<|sep|>"
+                            for name in names
+                        )
+                        + TOOLS_CLOSE
+                    )
+                    response = self._complete(
+                        self._request(stream=stream, n=2, parallel_tool_calls=parallel),
+                        text,
+                    )
+                    if stream:
+                        self.assertFalse(any("error" in event for event in response))
+                        calls_by_choice = {0: [], 1: []}
+                        for event in response:
+                            for choice in event.get("choices", []):
+                                calls_by_choice[choice["index"]].extend(
+                                    call["function"]["name"]
+                                    for call in choice.get("delta", {}).get(
+                                        "tool_calls", []
+                                    )
+                                )
+                    else:
+                        calls_by_choice = {
+                            choice.index: [
+                                call.function.name for call in choice.message.tool_calls
+                            ]
+                            for choice in response.choices
+                        }
+                    self.assertEqual(calls_by_choice, {0: names, 1: names})
 
     def test_required_does_not_succeed_without_a_call(self):
         for stream in (False, True):

@@ -2237,6 +2237,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     call.function.name not in allowed_names for call in tool_calls or []
                 ):
                     raise ValueError("Generated tool call is outside allowed_tools.")
+                if not request.parallel_tool_calls and len(tool_calls or []) > 1:
+                    raise ValueError(
+                        "parallel_tool_calls=False permits at most one tool call."
+                    )
                 if (
                     request.tool_choice.allowed_tools.mode == "required"
                     and not tool_calls
@@ -2889,6 +2893,13 @@ class OpenAIServingChat(OpenAIServingBase):
             # Loose argument text can contain tags the parser reads as extra calls.
             if any(call.name not in allowed_names for call in calls):
                 raise ValueError("Generated tool call is outside allowed_tools.")
+            # K3 assigns zero-based call ordinals per choice across all chunks.
+            if not request.parallel_tool_calls and any(
+                call.tool_index > 0 for call in calls
+            ):
+                raise ValueError(
+                    "parallel_tool_calls=False permits at most one tool call."
+                )
 
         # Yield normal text
         if normal_text:
