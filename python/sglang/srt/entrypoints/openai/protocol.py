@@ -815,6 +815,16 @@ class ToolChoice(BaseModel):
     type: Literal["function"] = Field(default="function", examples=["function"])
 
 
+class AllowedTools(BaseModel):
+    mode: Literal["auto", "required"]
+    tools: List[ToolChoice]
+
+
+class AllowedToolChoice(BaseModel):
+    type: Literal["allowed_tools"]
+    allowed_tools: AllowedTools
+
+
 # OpenAI-spec string tiers for reasoning effort (current Responses/Chat API):
 # none/minimal/low/medium/high/xhigh/max. Used as-is by /v1/responses.
 ReasoningEffortTier = Literal[
@@ -880,9 +890,9 @@ class ChatCompletionRequest(BaseModel):
     top_p: Optional[float] = None
     user: Optional[str] = None
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
-    tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
-        default="auto", examples=["none"]
-    )  # noqa
+    tool_choice: Union[
+        ToolChoice, AllowedToolChoice, Literal["auto", "required", "none"]
+    ] = Field(default="auto", examples=["none"])
     parallel_tool_calls: bool = True
     return_hidden_states: Union[bool, Literal["last"]] = False
     return_routed_experts: bool = False
@@ -1177,6 +1187,11 @@ class ChatCompletionRequest(BaseModel):
         )
 
         if tool_call_constraint and has_existing_constraints:
+            if isinstance(self.tool_choice, AllowedToolChoice):
+                raise ValueError(
+                    "allowed_tools cannot be combined with an active response_format, "
+                    "regex, or ebnf constraint."
+                )
             if self.tool_choice == "required" or isinstance(
                 self.tool_choice, ToolChoice
             ):

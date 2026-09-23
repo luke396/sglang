@@ -1,11 +1,15 @@
 import json
 import sys
+from unittest.mock import Mock
 
 import pytest
 import xgrammar as xgr
 from xgrammar.testing import _is_grammar_accept_string
 
+from sglang.srt.constrained.base_grammar_backend import InvalidGrammarObject
+from sglang.srt.constrained.xgrammar_backend import XGrammarGrammarBackend
 from sglang.srt.entrypoints.openai.protocol import (
+    AllowedToolChoice,
     ChatCompletionRequest,
     Function,
     Tool,
@@ -75,6 +79,20 @@ def _tool(name="weather", strict=True):
                 "additionalProperties": False,
             },
         ),
+    )
+
+
+def _allowed_choice(mode="auto", names=("weather",)):
+    return AllowedToolChoice.model_validate(
+        {
+            "type": "allowed_tools",
+            "allowed_tools": {
+                "mode": mode,
+                "tools": [
+                    {"type": "function", "function": {"name": name}} for name in names
+                ],
+            },
+        }
     )
 
 
@@ -237,6 +255,119 @@ def test_named_tool_choice_forces_only_the_selected_tool():
 
     assert _accepts(grammar, _tools_section(forecast_call))
     assert not _accepts(grammar, _tools_section(_valid_weather_call()))
+
+
+@pytest.mark.parametrize("mode", ["auto", "required"])
+def test_allowed_tools_constrains_names_without_making_parameters_strict(mode):
+    tools = [_tool(name, strict=False) for name in ("weather", "forecast", "search")]
+    request = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "Weather?"}],
+        tools=tools,
+        tool_choice={
+            "type": "allowed_tools",
+            "allowed_tools": {
+                "mode": mode,
+                "tools": [
+                    {"type": "function", "function": {"name": name}}
+                    for name in ("weather", "forecast")
+                ],
+            },
+        },
+    )
+    with envs.SGLANG_TOOL_STRICT_LEVEL.override(ToolStrictLevel.OFF):
+        constraint = FunctionCallParser(
+            tools=tools, tool_call_parser="kimi_k3"
+        ).get_structure_constraint(request.tool_choice)
+    assert constraint is not None
+    assert constraint[0] == "structural_tag"
+    grammar = xgr.Grammar.from_structural_tag(constraint[1])
+    loose_args = _argument("unknown", "string", "not in the schema")
+    assert _accepts(grammar, _tools_section(_call("weather", 1, loose_args)))
+    assert _accepts(
+        grammar,
+        _tools_section(_call("weather", 1), _call("forecast", 2)),
+    )
+    assert not _accepts(grammar, _tools_section(_call("search", 1)))
+    assert not _accepts(
+        grammar,
+        _tools_section(_call("weather", 1), _call("search", 2)),
+    )
+    assert _accepts(grammar, "No tool needed.") == (mode == "auto")
+    assert all(not tool.function.strict for tool in tools)
+
+
+@pytest.mark.parametrize("thinking_mode", [False, True])
+def test_empty_allowed_tools_only_accepts_text(thinking_mode):
+    parser = FunctionCallParser(tools=[_tool()], tool_call_parser="kimi_k3")
+    constraint = parser.get_structure_constraint(
+        _allowed_choice(names=()), thinking_mode=thinking_mode
+    )
+    grammar = xgr.Grammar.from_structural_tag(constraint[1])
+    prefix = "Thinking." + THINK_CLOSE if thinking_mode else ""
+    assert _accepts(grammar, prefix + "No tool needed.")
+    assert not _accepts(grammar, prefix + _tools_section(_valid_weather_call()))
+    assert not _accepts(grammar, prefix + _valid_weather_call())
+
+
+@pytest.mark.parametrize("mode", ["auto", "required"])
+@pytest.mark.parametrize("parallel", [False, True])
+def test_allowed_tools_token_matching_preserves_parallel_and_strict(mode, parallel):
+    tools = [_tool(), _tool("search")]
+    with envs.SGLANG_TOOL_STRICT_LEVEL.override(ToolStrictLevel.OFF):
+        constraint = FunctionCallParser(
+            tools=tools, tool_call_parser="kimi_k3"
+        ).get_structure_constraint(
+            _allowed_choice(mode=mode), parallel_tool_calls=parallel, thinking_mode=True
+        )
+    tag = constraint[1]
+    prefix = "Thinking." + THINK_CLOSE
+    assert _token_accepts(tag, prefix + _tools_section(_valid_weather_call()))
+    assert not _token_accepts(tag, prefix + _tools_section(_call("weather", 1)))
+    assert (
+        _token_accepts(
+            tag, prefix + _tools_section(_valid_weather_call(), _valid_weather_call(2))
+        )
+        == parallel
+    )
+    matcher = xgr.GrammarMatcher(_TOKEN_COMPILER.compile_structural_tag(tag))
+    assert matcher.accept_string(prefix + TOOLS_OPEN + '<|open|>call tool="')
+    assert not matcher.accept_token(ord("s"))
+
+
+def test_allowed_tools_honors_parameter_strict_level_without_mutating_declarations():
+    tools = [_tool(strict=False)]
+    with envs.SGLANG_TOOL_STRICT_LEVEL.override(ToolStrictLevel.PARAMETER):
+        constraint = FunctionCallParser(
+            tools=tools, tool_call_parser="kimi_k3"
+        ).get_structure_constraint(_allowed_choice())
+    assert _token_accepts(constraint[1], _tools_section(_valid_weather_call()))
+    assert not _token_accepts(constraint[1], _tools_section(_call("weather", 1)))
+    assert not tools[0].function.strict
+
+
+def test_allowed_tools_compile_failure_is_an_invalid_grammar_not_unconstrained():
+    tool = _tool()
+    tool.function.parameters = {
+        "type": "object",
+        "properties": {"value": {"$ref": "#/$defs/missing"}},
+        "required": ["value"],
+    }
+    constraint = FunctionCallParser(
+        tools=[tool], tool_call_parser="kimi_k3"
+    ).get_structure_constraint(_allowed_choice())
+    request = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "Hello"}], tool_choice=_allowed_choice()
+    )
+    params = request.to_sampling_params([], {}, constraint)
+    backend = XGrammarGrammarBackend(
+        tokenizer=Mock(init_xgrammar=lambda: (_TOKENIZER_INFO, None)), vocab_size=257
+    )
+    try:
+        result = backend.dispatch_structural_tag(params["structural_tag"])
+        assert isinstance(result, InvalidGrammarObject)
+        assert "missing" in result.error_message
+    finally:
+        backend.executor.shutdown(wait=True)
 
 
 def test_function_call_parser_uses_native_tag_for_named_tool_choice():

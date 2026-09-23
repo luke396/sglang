@@ -3,6 +3,7 @@ import logging
 from typing import Dict, List, Literal, Optional, Set, Tuple, Type, Union
 
 from sglang.srt.entrypoints.openai.protocol import (
+    AllowedToolChoice,
     LegacyStructuralTagResponseFormat,
     StructuralTagResponseFormat,
     StructuresResponseFormat,
@@ -251,7 +252,7 @@ class FunctionCallParser:
 
     def get_structure_constraint(
         self,
-        tool_choice: Union[ToolChoice, Literal["auto", "required"]],
+        tool_choice: Union[ToolChoice, AllowedToolChoice, Literal["auto", "required"]],
         parallel_tool_calls: bool = True,
         thinking_mode: bool = False,
     ) -> Optional[ToolCallConstraint]:
@@ -274,6 +275,34 @@ class FunctionCallParser:
 
         # Highest priority: model-native structural_tag when available.
         try:
+            structural_tag_tools = self.tools
+            if self.tool_strict_level >= ToolStrictLevel.PARAMETER:
+                structural_tag_tools = [
+                    tool.model_copy(
+                        update={
+                            "function": tool.function.model_copy(
+                                update={"strict": True}
+                            )
+                        }
+                    )
+                    for tool in self.tools
+                ]
+
+            if isinstance(tool_choice, AllowedToolChoice):
+                if not isinstance(self.detector, KimiK3Detector):
+                    raise ValueError("allowed_tools requires the kimi_k3 tool parser")
+                structural_tag = self.detector.get_structural_tag(
+                    tools=structural_tag_tools,
+                    tool_choice=tool_choice,
+                    thinking_mode=thinking_mode,
+                    parallel_tool_calls=parallel_tool_calls,
+                )
+                return (
+                    ("structural_tag", structural_tag)
+                    if structural_tag is not None
+                    else None
+                )
+
             if tool_choice == "auto" and not should_constrain_auto:
                 structural_tag = self.detector.get_auto_tool_call_structural_tag(
                     tools=self.tools,
@@ -284,18 +313,6 @@ class FunctionCallParser:
                     return ("structural_tag", structural_tag)
 
             if is_required or should_constrain_auto:
-                structural_tag_tools = self.tools
-                if self.tool_strict_level >= ToolStrictLevel.PARAMETER:
-                    structural_tag_tools = [
-                        tool.model_copy(
-                            update={
-                                "function": tool.function.model_copy(
-                                    update={"strict": True}
-                                )
-                            }
-                        )
-                        for tool in self.tools
-                    ]
                 structural_tag = self.detector.get_structural_tag(
                     tools=structural_tag_tools,
                     thinking_mode=thinking_mode,
@@ -322,5 +339,7 @@ class FunctionCallParser:
                 )
                 return ("json_schema", json_schema)
         except Exception as e:
+            if isinstance(tool_choice, AllowedToolChoice):
+                raise ValueError(f"Cannot enforce allowed_tools: {e}") from e
             logger.error(f"Error getting structure constraint: {e}")
             return None
