@@ -26,7 +26,9 @@ from sglang.srt.entrypoints.openai.serving_responses import (
     _build_output_text_logprobs,
     _should_emit_normal_text_as_message,
 )
+from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.function_call.kimik3_format import THINK_CLOSE
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import (
@@ -324,19 +326,27 @@ class AllowedToolsResponsesTestCase(CustomTestCase):
         )
 
     @staticmethod
-    def _call(name="B"):
+    def _call(name="B", *, arguments="", count=1):
         return (
             "<|open|>tools<|sep|>"
-            f'<|open|>call tool="{name}" index="1"<|sep|><|close|>call<|sep|>'
-            "<|close|>tools<|sep|>"
+            + "".join(
+                f'<|open|>call tool="{name}" index="{index}"<|sep|>'
+                f"{arguments}<|close|>call<|sep|>"
+                for index in range(1, count + 1)
+            )
+            + "<|close|>tools<|sep|>"
         )
 
-    def _complete(self, request, text="No tool needed."):
+    def _complete(self, request, text="No tool needed.", *, chunk_size=1):
         self.internal_request = None
 
         async def generate(internal_request, raw_request):
             self.internal_request = internal_request
-            ends = range(1, len(text) + 1) if request.stream else [len(text)]
+            ends = (
+                [*range(chunk_size, len(text), chunk_size), len(text)]
+                if request.stream
+                else [len(text)]
+            )
             for end in ends:
                 yield engine_chunk(text[:end], finish=end == len(text))
 
@@ -394,6 +404,191 @@ class AllowedToolsResponsesTestCase(CustomTestCase):
                         _is_grammar_accept_string(grammar, "No tool needed."),
                         mode == "auto",
                     )
+
+    def test_allowlist_preserves_reasoning_parallel_and_strict_options(self):
+        self.serving.reasoning_parser = "kimi_k3"
+        self.serving.template_manager.reasoning_config = ReasoningToggleConfig(
+            toggle_param="thinking", default_enabled=True
+        )
+        arguments = (
+            '<|open|>argument key="count" type="number"<|sep|>2<|close|>argument<|sep|>'
+        )
+        single = self._call(arguments=arguments)
+        multiple = self._call(arguments=arguments, count=2)
+        for stream in (False, True):
+            for mode, thinking, parallel, strict in (
+                ("auto", False, False, False),
+                ("auto", True, True, True),
+                ("required", False, True, False),
+                ("required", True, False, True),
+                ("auto", False, True, True),
+                ("required", True, True, False),
+            ):
+                with (
+                    self.subTest(
+                        stream=stream,
+                        mode=mode,
+                        thinking=thinking,
+                        parallel=parallel,
+                        strict=strict,
+                    ),
+                    envs.SGLANG_TOOL_STRICT_LEVEL.override(ToolStrictLevel.OFF),
+                ):
+                    request = self._request(
+                        mode=mode,
+                        stream=stream,
+                        parallel_tool_calls=parallel,
+                        chat_template_kwargs={"thinking": thinking},
+                    )
+                    request.tools[1].strict = strict
+                    request.tools[1].parameters = {
+                        "type": "object",
+                        "properties": {"count": {"type": "integer", "minimum": 1}},
+                        "required": ["count"],
+                        "additionalProperties": False,
+                    }
+                    text = ("Thinking." + THINK_CLOSE if thinking else "") + (
+                        multiple if parallel else single
+                    )
+                    result = self._complete(request, text)
+                    if stream:
+                        self.assertEqual(result[-1]["type"], "response.completed")
+                        output = result[-1]["response"]["output"]
+                    else:
+                        self.assertIsInstance(result, ResponsesResponse)
+                        output = result.model_dump()["output"]
+                    calls = [item for item in output if item["type"] == "function_call"]
+                    self.assertEqual(
+                        [
+                            (call["name"], orjson.loads(call["arguments"]))
+                            for call in calls
+                        ],
+                        [("B", {"count": 2})] * (2 if parallel else 1),
+                    )
+                    reasoning = "".join(
+                        part["text"]
+                        for item in output
+                        if item["type"] == "reasoning"
+                        for part in item["content"]
+                    )
+                    self.assertEqual(reasoning, "Thinking." if thinking else "")
+                    self.assertEqual(self.internal_request.require_reasoning, thinking)
+                    grammar = Grammar.from_structural_tag(
+                        self.internal_request.sampling_params["structural_tag"]
+                    )
+                    self.assertTrue(_is_grammar_accept_string(grammar, single))
+                    self.assertEqual(
+                        _is_grammar_accept_string(grammar, multiple), parallel
+                    )
+                    self.assertEqual(
+                        _is_grammar_accept_string(grammar, self._call()), not strict
+                    )
+
+    def test_allowed_call_arguments_and_ids_agree_across_stream_events(self):
+        text = (
+            '<|open|>tools<|sep|><|open|>call tool="A" index="1"<|sep|>'
+            '<|open|>argument key="city" type="string"<|sep|>'
+            'Paris "rive"\\Seine\n雪<|close|>argument<|sep|>'
+            '<|open|>argument key="days" type="number"<|sep|>2<|close|>argument<|sep|>'
+            '<|open|>argument key="metadata" type="object"<|sep|>'
+            '{"tags":["windy"],"enabled":true}<|close|>argument<|sep|>'
+            '<|close|>call<|sep|><|open|>call tool="B" index="2"<|sep|>'
+            '<|open|>argument key="ok" type="boolean"<|sep|>true<|close|>argument<|sep|>'
+            "<|close|>call<|sep|><|close|>tools<|sep|>"
+        )
+        expected = [
+            (
+                "A",
+                {
+                    "city": 'Paris "rive"\\Seine\n雪',
+                    "days": 2,
+                    "metadata": {"tags": ["windy"], "enabled": True},
+                },
+            ),
+            ("B", {"ok": True}),
+        ]
+        for mode in ("auto", "required"):
+            with self.subTest(mode=mode, stream=False):
+                full = self._complete(self._request(mode=mode, names=("A", "B")), text)
+                self.assertIsInstance(full, ResponsesResponse)
+                self.assertTrue(all(item.call_id for item in full.output))
+                self.assertEqual(len({item.call_id for item in full.output}), 2)
+                self.assertEqual(
+                    [(item.name, orjson.loads(item.arguments)) for item in full.output],
+                    expected,
+                )
+            for chunk_size in (1, len(text)):
+                with self.subTest(mode=mode, chunk_size=chunk_size):
+                    events = self._complete(
+                        self._request(mode=mode, names=("A", "B"), stream=True),
+                        text,
+                        chunk_size=chunk_size,
+                    )
+                    self.assertEqual(events[-1]["type"], "response.completed")
+                    output = events[-1]["response"]["output"]
+                    self.assertEqual(
+                        [
+                            (item["name"], orjson.loads(item["arguments"]))
+                            for item in output
+                        ],
+                        expected,
+                    )
+                    self.assertEqual(
+                        {item["type"] for item in output}, {"function_call"}
+                    )
+                    for key in ("id", "call_id"):
+                        self.assertTrue(all(item[key] for item in output))
+                        self.assertEqual(len({item[key] for item in output}), 2)
+                    added = [
+                        e for e in events if e["type"] == "response.output_item.added"
+                    ]
+                    done = [
+                        e for e in events if e["type"] == "response.output_item.done"
+                    ]
+                    self.assertEqual([e["item"] for e in done], output)
+                    self.assertEqual(len(added), len(output))
+                    argument_events = [
+                        e
+                        for e in events
+                        if e["type"]
+                        in (
+                            "response.function_call_arguments.delta",
+                            "response.function_call_arguments.done",
+                        )
+                    ]
+                    self.assertEqual(
+                        {e["item_id"] for e in argument_events},
+                        {item["id"] for item in output},
+                    )
+                    for index, item in enumerate(output):
+                        for key in ("type", "id", "call_id", "name"):
+                            self.assertEqual(added[index]["item"][key], item[key])
+                        for event in (added[index], done[index]):
+                            self.assertEqual(event["output_index"], index)
+                        parts = [
+                            e for e in argument_events if e["item_id"] == item["id"]
+                        ]
+                        self.assertEqual({e["output_index"] for e in parts}, {index})
+                        self.assertEqual(
+                            "".join(
+                                e["delta"]
+                                for e in parts
+                                if e["type"].endswith(".delta")
+                            ),
+                            item["arguments"],
+                        )
+                        self.assertEqual(
+                            [
+                                e["arguments"]
+                                for e in parts
+                                if e["type"].endswith(".done")
+                            ],
+                            [item["arguments"]],
+                        )
+                    grammar = Grammar.from_structural_tag(
+                        self.internal_request.sampling_params["structural_tag"]
+                    )
+                    self.assertTrue(_is_grammar_accept_string(grammar, text))
 
     def test_allowlist_preserves_schema_admission_and_rendering(self):
         """Selecting a subset must not rewrite or reject previously accepted schemas."""
@@ -458,26 +653,70 @@ class AllowedToolsResponsesTestCase(CustomTestCase):
                     self.assertEqual(response.status_code, 400)
                     self.assertIsNone(self.internal_request)
 
-    def test_previous_response_does_not_reuse_the_previous_allowlist(self):
+    def test_tool_result_continuation_uses_new_allowlist_without_rewriting_history(
+        self,
+    ):
         self.serving.enable_response_store = True
-        first = self._request(names=("A",))
-        first.store = True
-        previous = self._complete(first, self._call("A"))
-        self.assertIsInstance(previous, ResponsesResponse)
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                first = self._request(names=("A",), stream=stream)
+                first.store = True
+                result = self._complete(first, self._call("A"))
+                if stream:
+                    self.assertEqual(result[-1]["type"], "response.completed")
+                    previous = result[-1]["response"]
+                else:
+                    self.assertIsInstance(result, ResponsesResponse)
+                    previous = result.model_dump()
+                previous_id = previous["id"]
+                call_id = previous["output"][0]["call_id"]
+                history = deepcopy(self.serving.msg_store[previous_id])
+                stored_response = self.serving.response_store[previous_id].model_dump()
+                self.assertEqual(stored_response["tool_choice"], first.tool_choice)
 
-        request = self._request(previous_response_id=previous.id)
-        result = self._complete(request, self._call())
-        self.assertIsInstance(result, ResponsesResponse)
-        self.assertEqual(result.output[0].name, "B")
-        self.assertEqual(result.tool_choice, request.tool_choice)
-        self.assertEqual(
-            self.serving.response_store[previous.id].tool_choice, first.tool_choice
-        )
-        grammar = Grammar.from_structural_tag(
-            self.internal_request.sampling_params["structural_tag"]
-        )
-        self.assertFalse(_is_grammar_accept_string(grammar, self._call("A")))
-        self.assertTrue(_is_grammar_accept_string(grammar, self._call()))
+                request = self._request(previous_response_id=previous_id, stream=stream)
+                request.input = [
+                    {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": "answer 42",
+                    }
+                ]
+                result = self._complete(request, self._call())
+                if stream:
+                    self.assertEqual(result[-1]["type"], "response.completed")
+                    response = result[-1]["response"]
+                else:
+                    self.assertIsInstance(result, ResponsesResponse)
+                    response = result.model_dump()
+                self.assertEqual(response["output"][0]["name"], "B")
+                self.assertEqual(response["tool_choice"], request.tool_choice)
+                self.assertEqual(
+                    self.serving.response_store[previous_id].model_dump(),
+                    stored_response,
+                )
+                self.assertEqual(self.serving.msg_store[previous_id], history)
+
+                rendered = self.serving.tokenizer_manager.tokenizer.apply_chat_template.call_args
+                messages = rendered.args[0]
+                self.assertEqual(
+                    [m["role"] for m in messages], ["user", "assistant", "tool"]
+                )
+                self.assertEqual(messages[0]["content"], "Choose a tool.")
+                historical_call = messages[1]["tool_calls"][0]
+                self.assertEqual(historical_call["id"], call_id)
+                self.assertEqual(historical_call["function"]["name"], "A")
+                self.assertEqual(messages[2]["tool_call_id"], call_id)
+                self.assertEqual(messages[2]["content"], "answer 42")
+                self.assertEqual(
+                    [tool["function"]["name"] for tool in rendered.kwargs["tools"]],
+                    ["A", "B", "C"],
+                )
+                grammar = Grammar.from_structural_tag(
+                    self.internal_request.sampling_params["structural_tag"]
+                )
+                self.assertFalse(_is_grammar_accept_string(grammar, self._call("A")))
+                self.assertTrue(_is_grammar_accept_string(grammar, self._call()))
 
     def test_unsupported_encoder_or_parser_does_not_fall_back_to_auto(self):
         for encoder, parser, harmony in (
@@ -561,6 +800,46 @@ class AllowedToolsResponsesTestCase(CustomTestCase):
                 else:
                     self.assertEqual(result.status_code, 400)
                     self.assertIn(b"outside allowed_tools", result.body)
+
+    def test_disallowed_call_before_thinking_ends_cannot_leak(self):
+        # Grammar is deferred during thinking, but K3 tool channels still reach the parser.
+        self.serving.reasoning_parser = "kimi_k3"
+        self.serving.template_manager.reasoning_config = ReasoningToggleConfig(
+            toggle_param="thinking", default_enabled=True
+        )
+        text = "Thinking." + self._call("C") + THINK_CLOSE
+        for stream in (False, True):
+            for mode in ("auto", "required"):
+                with self.subTest(stream=stream, mode=mode):
+                    result = self._complete(
+                        self._request(
+                            mode=mode,
+                            stream=stream,
+                            chat_template_kwargs={"thinking": True},
+                        ),
+                        text,
+                    )
+                    self.assertTrue(self.internal_request.require_reasoning)
+                    if stream:
+                        self.assertEqual(result[-1]["type"], "response.failed")
+                        self.assertIn(
+                            "outside allowed_tools",
+                            result[-1]["response"]["error"]["message"],
+                        )
+                        self.assertNotIn(
+                            "C", [event.get("item", {}).get("name") for event in result]
+                        )
+                        self.assertFalse(
+                            any(
+                                event["type"].startswith(
+                                    "response.function_call_arguments."
+                                )
+                                for event in result
+                            )
+                        )
+                    else:
+                        self.assertEqual(result.status_code, 400)
+                        self.assertIn(b"outside allowed_tools", result.body)
 
     def test_required_without_a_call_cannot_complete_successfully(self):
         for stream in (False, True):
