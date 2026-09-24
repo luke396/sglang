@@ -297,11 +297,7 @@ class FunctionCallParser:
                     thinking_mode=thinking_mode,
                     parallel_tool_calls=parallel_tool_calls,
                 )
-                return (
-                    ("structural_tag", structural_tag)
-                    if structural_tag is not None
-                    else None
-                )
+                return ("structural_tag", structural_tag)
 
             if tool_choice == "auto" and not should_constrain_auto:
                 structural_tag = self.detector.get_auto_tool_call_structural_tag(

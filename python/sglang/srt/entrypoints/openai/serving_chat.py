@@ -1324,10 +1324,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 required_parsed_natively = parser.detector.parses_required_natively()
                 if self.chat_encoding_spec == "kimi_k3":
                     tool_call_stop = parser.detector.eot_token
-            if isinstance(request.tool_choice, AllowedToolChoice):
-                if tool_call_constraint is None:
-                    raise ValueError("No structural tag was produced for allowed_tools")
-            elif (
+            if (
                 tool_call_constraint is None
                 and not required_parsed_natively
                 and not (
@@ -2237,10 +2234,6 @@ class OpenAIServingChat(OpenAIServingBase):
                     call.function.name not in allowed_names for call in tool_calls or []
                 ):
                     raise ValueError("Generated tool call is outside allowed_tools.")
-                if not request.parallel_tool_calls and len(tool_calls or []) > 1:
-                    raise ValueError(
-                        "parallel_tool_calls=False permits at most one tool call."
-                    )
                 if (
                     request.tool_choice.allowed_tools.mode == "required"
                     and not tool_calls
@@ -2893,13 +2886,6 @@ class OpenAIServingChat(OpenAIServingBase):
             # Loose argument text can contain tags the parser reads as extra calls.
             if any(call.name not in allowed_names for call in calls):
                 raise ValueError("Generated tool call is outside allowed_tools.")
-            # K3 assigns zero-based call ordinals per choice across all chunks.
-            if not request.parallel_tool_calls and any(
-                call.tool_index > 0 for call in calls
-            ):
-                raise ValueError(
-                    "parallel_tool_calls=False permits at most one tool call."
-                )
 
         # Yield normal text
         if normal_text:

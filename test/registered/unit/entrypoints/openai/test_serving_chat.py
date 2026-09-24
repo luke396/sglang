@@ -4347,16 +4347,12 @@ class TestAllowedToolsServing(CustomTestCase):
             **kwargs,
         )
 
-    def _complete(self, request, text="No tool needed.", *, chunk_size=1):
+    def _complete(self, request, text="No tool needed."):
         self.internal_request = None
 
         async def generate(internal_request, raw_request):
             self.internal_request = internal_request
-            chunks = (
-                [*range(chunk_size, len(text), chunk_size), len(text)]
-                if request.stream
-                else [len(text)]
-            )
+            chunks = range(1, len(text) + 1) if request.stream else [len(text)]
             for end in chunks:
                 results = [_spec_result(index) for index in range(request.n)]
                 for result in results:
@@ -4520,9 +4516,9 @@ class TestAllowedToolsServing(CustomTestCase):
         self.assertIn("schema", json.loads(response.body)["message"])
         self.assertIsNone(self.internal_request)
 
-    def test_constraint_construction_failure_and_missing_tag_are_not_ignored(self):
+    def test_constraint_construction_failure_is_not_ignored(self):
         for stream in (False, True):
-            with self.subTest(stream=stream, failure="construction"):
+            with self.subTest(stream=stream):
                 request = self._request(stream=stream)
                 request.tools[0].function.strict = True
                 request.tools[0].function.parameters = {"type": "array"}
@@ -4532,24 +4528,41 @@ class TestAllowedToolsServing(CustomTestCase):
                     "Cannot enforce allowed_tools", json.loads(response.body)["message"]
                 )
                 self.assertIsNone(self.internal_request)
-            with (
-                self.subTest(stream=stream, failure="missing"),
-                patch(
-                    "sglang.srt.function_call.kimik3_structural_tag.StructuralTag",
-                    return_value=None,
-                ),
-            ):
-                response = self._complete(self._request(stream=stream))
-                self.assertEqual(response.status_code, 400)
-                self.assertIn("No structural tag", json.loads(response.body)["message"])
-                self.assertIsNone(self.internal_request)
 
     def test_empty_allowlist_without_declarations_still_constrains_generation(self):
-        request = self._request(names=())
-        request.tools = None
-        response = self._complete(request)
-        self.assertIsNone(response.choices[0].message.tool_calls)
-        self.assertTrue(self.internal_request.sampling_params["structural_tag"])
+        for tools in (None, []):
+            for stream in (False, True):
+                with self.subTest(tools=tools, stream=stream):
+                    request = self._request(names=(), stream=stream)
+                    request.tools = tools
+                    response = self._complete(request)
+                    if stream:
+                        self.assertFalse(any("error" in event for event in response))
+                        deltas = [
+                            choice["delta"]
+                            for event in response
+                            for choice in event.get("choices", [])
+                        ]
+                        text = "".join(delta.get("content") or "" for delta in deltas)
+                        self.assertFalse(
+                            any(delta.get("tool_calls") for delta in deltas)
+                        )
+                    else:
+                        text = response.choices[0].message.content
+                        self.assertIsNone(response.choices[0].message.tool_calls)
+                    self.assertEqual(text, "No tool needed.")
+                    grammar = xgr.Grammar.from_structural_tag(
+                        self.internal_request.sampling_params["structural_tag"]
+                    )
+                    self.assertTrue(_is_grammar_accept_string(grammar, text))
+                    self.assertFalse(
+                        _is_grammar_accept_string(
+                            grammar,
+                            TOOLS_OPEN
+                            + '<|open|>call tool="A" index="1"<|sep|><|close|>call<|sep|>'
+                            + TOOLS_CLOSE,
+                        )
+                    )
 
     def test_output_constraints_conflict_with_both_allowed_tools_modes(self):
         constraints = [
@@ -4584,14 +4597,27 @@ class TestAllowedToolsServing(CustomTestCase):
 
     def test_invalid_allowlist_is_rejected_before_generation(self):
         for stream in (False, True):
-            for mode, names in (("auto", ("A", "missing")), ("required", ())):
-                with self.subTest(stream=stream, mode=mode, names=names):
-                    response = self._complete(
-                        self._request(mode=mode, names=names, stream=stream)
-                    )
-                    self.assertEqual(response.status_code, 400)
-                    self.assertIn("allowed_tools", json.loads(response.body)["message"])
-                    self.assertIsNone(self.internal_request)
+            for has_declarations in (False, True):
+                for mode, names in (
+                    ("auto", ("A", "missing")),
+                    ("required", ()),
+                    ("required", ("A", "missing")),
+                ):
+                    with self.subTest(
+                        stream=stream,
+                        has_declarations=has_declarations,
+                        mode=mode,
+                        names=names,
+                    ):
+                        request = self._request(mode=mode, names=names, stream=stream)
+                        if not has_declarations:
+                            request.tools = None
+                        response = self._complete(request)
+                        self.assertEqual(response.status_code, 400)
+                        self.assertIn(
+                            "allowed_tools", json.loads(response.body)["message"]
+                        )
+                        self.assertIsNone(self.internal_request)
 
     def test_parser_visible_call_in_loose_argument_never_leaks(self):
         text = (
@@ -4620,62 +4646,6 @@ class TestAllowedToolsServing(CustomTestCase):
                 else:
                     self.assertEqual(response.status_code, 400)
                     self.assertIn("allowed_tools", json.loads(response.body)["message"])
-
-    def test_parallel_disabled_rejects_embedded_allowed_call_before_emission(self):
-        """Embedded allowed calls cannot bypass the single-call limit across chunks."""
-        for second_name in ("B", "A"):
-            text = (
-                TOOLS_OPEN + '<|open|>call tool="A" index="1"<|sep|>'
-                '<|open|>argument key="body" type="string"<|sep|>'
-                "<|close|>call<|sep|>"
-                f'<|open|>call tool="{second_name}" index="1"<|sep|>'
-                "<|close|>call<|sep|><|close|>argument<|sep|>"
-                "<|close|>call<|sep|>" + TOOLS_CLOSE
-            )
-            for mode in ("auto", "required"):
-                for stream, chunk_size in ((False, 1), (True, 1), (True, len(text))):
-                    with self.subTest(
-                        second_name=second_name,
-                        mode=mode,
-                        stream=stream,
-                        chunk_size=chunk_size,
-                    ):
-                        response = self._complete(
-                            self._request(
-                                mode=mode, stream=stream, parallel_tool_calls=False
-                            ),
-                            text,
-                            chunk_size=chunk_size,
-                        )
-                        grammar = xgr.Grammar.from_structural_tag(
-                            self.internal_request.sampling_params["structural_tag"]
-                        )
-                        self.assertTrue(_is_grammar_accept_string(grammar, text))
-                        if stream:
-                            calls = [
-                                call
-                                for event in response
-                                for choice in event.get("choices", [])
-                                for call in choice.get("delta", {}).get(
-                                    "tool_calls", []
-                                )
-                            ]
-                            self.assertLessEqual(len(calls), 1)
-                            if chunk_size == 1:
-                                self.assertEqual(
-                                    [call["function"]["name"] for call in calls], ["A"]
-                                )
-                            errors = [
-                                event["error"] for event in response if "error" in event
-                            ]
-                            self.assertEqual(len(errors), 1)
-                            self.assertIn("parallel_tool_calls", errors[0]["message"])
-                        else:
-                            self.assertEqual(response.status_code, 400)
-                            self.assertIn(
-                                "parallel_tool_calls",
-                                json.loads(response.body)["message"],
-                            )
 
     def test_parallel_limit_is_per_choice_and_preserves_legal_calls(self):
         for stream in (False, True):
