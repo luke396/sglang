@@ -48,6 +48,7 @@ from openai.types.responses.response import ToolChoice
 from openai.types.responses.response_format_text_json_schema_config import (
     ResponseFormatTextJSONSchemaConfig,
 )
+from openai.types.responses.tool_choice_function import ToolChoiceFunction
 from openai.types.shared.response_format_json_object import ResponseFormatJSONObject
 from pydantic import (
     AfterValidator,
@@ -1618,6 +1619,12 @@ ResponseInputOutputItem: TypeAlias = Union[
 ]
 
 
+class ResponseAllowedToolChoice(BaseModel):
+    type: Literal["allowed_tools"]
+    mode: Literal["auto", "required"]
+    tools: List[ToolChoiceFunction]
+
+
 class ResponsesRequest(BaseModel):
     """Request body for v1/responses endpoint."""
 
@@ -1690,6 +1697,13 @@ class ResponsesRequest(BaseModel):
         "min_p": 0.0,
         "repetition_penalty": 1.0,
     }
+
+    @field_validator("tool_choice")
+    @classmethod
+    def validate_allowed_tool_choice(cls, value):
+        if isinstance(value, dict) and value.get("type") == "allowed_tools":
+            return ResponseAllowedToolChoice.model_validate(value).model_dump()
+        return value
 
     @model_validator(mode="before")
     @classmethod
@@ -1791,11 +1805,12 @@ class ResponsesRequest(BaseModel):
         return self._json_schema_from_text_format(self.text) is not None
 
     def effective_tool_choice(self) -> Union[str, Dict[str, Any]]:
-        """``tool_choice`` reduced to what the server can actually honor: of the
-        object forms only a named ``function`` survives, the rest (web_search,
-        mcp, ...) can't be forced through the tool-call parser."""
+        """Keep named tools and allowlists; unsupported built-in choices
+        cannot be forced through the tool-call parser."""
         tool_choice = self.tool_choice
         if not isinstance(tool_choice, dict):
+            return tool_choice
+        if tool_choice.get("type") == "allowed_tools":
             return tool_choice
         name = tool_choice.get("name") or (tool_choice.get("function") or {}).get(
             "name"
