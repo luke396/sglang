@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator
 from copy import deepcopy
 from unittest.mock import Mock, patch
 
+import orjson
 from openai.types.responses import (
     ResponseOutputMessage,
     ResponseOutputText,
@@ -662,7 +663,6 @@ class AllowedToolsResponsesTestCase(CustomTestCase):
     def test_tool_result_continuation_uses_new_allowlist_without_rewriting_history(
         self,
     ):
-        self.serving.enable_response_store = True
         for stream in (False, True):
             with self.subTest(stream=stream):
                 first = self._request(names=("A",), stream=stream)
@@ -681,12 +681,14 @@ class AllowedToolsResponsesTestCase(CustomTestCase):
                 self.assertEqual(stored_response["tool_choice"], first.tool_choice)
 
                 request = self._request(previous_response_id=previous_id, stream=stream)
+                # 0908 replays function calls through input, not previous_response_id.
                 request.input = [
+                    *previous["output"],
                     {
                         "type": "function_call_output",
                         "call_id": call_id,
                         "output": "answer 42",
-                    }
+                    },
                 ]
                 result = self._complete(request, self._call())
                 if stream:
@@ -877,7 +879,11 @@ class AllowedToolsResponsesTestCase(CustomTestCase):
                     )
                     if stream:
                         if mode == "prefill":
-                            self.assertEqual(result[-1]["type"], "response.incomplete")
+                            # 0908 reports truncation in status, not the event type.
+                            self.assertEqual(result[-1]["type"], "response.completed")
+                            self.assertEqual(
+                                result[-1]["response"]["status"], "incomplete"
+                            )
                             self.assertIsNone(result[-1]["response"]["error"])
                         else:
                             self.assertEqual(result[-1]["type"], "response.failed")
