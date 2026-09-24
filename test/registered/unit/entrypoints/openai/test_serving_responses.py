@@ -847,6 +847,51 @@ class AllowedToolsResponsesTestCase(CustomTestCase):
                         self.assertEqual(result.status_code, 400)
                         self.assertIn(b"outside allowed_tools", result.body)
 
+    def test_required_checks_decode_output_not_prefill_handoff(self):
+        """A PD first-token handoff must not fail the final-answer tool requirement."""
+        for mode in ("prefill", "decode"):
+            publish(
+                ServerArgs(model_path="dummy", disaggregation_mode=mode),
+                role="tokenizer",
+            )
+            self.serving = OpenAIServingResponses(
+                self.serving.tokenizer_manager, self.serving.template_manager
+            )
+            self.serving.chat_encoding_spec = "kimi_k3"
+            self.serving.tool_call_parser = "kimi_k3"
+            for stream in (False, True):
+                with self.subTest(mode=mode, stream=stream):
+                    result = self._complete(
+                        self._request(
+                            mode="required",
+                            stream=stream,
+                            max_output_tokens=512,
+                            bootstrap_host="127.0.0.1",
+                            bootstrap_room=1,
+                        ),
+                        "<|open|>",
+                        finish_type="length",
+                    )
+                    self.assertTrue(
+                        self.internal_request.sampling_params["structural_tag"]
+                    )
+                    if stream:
+                        if mode == "prefill":
+                            self.assertEqual(result[-1]["type"], "response.incomplete")
+                            self.assertIsNone(result[-1]["response"]["error"])
+                        else:
+                            self.assertEqual(result[-1]["type"], "response.failed")
+                            self.assertIn(
+                                "required", result[-1]["response"]["error"]["message"]
+                            )
+                    elif mode == "prefill":
+                        self.assertIsInstance(result, ResponsesResponse)
+                        self.assertEqual(result.status, "incomplete")
+                        self.assertIsNone(result.error)
+                    else:
+                        self.assertEqual(result.status_code, 400)
+                        self.assertIn(b"required", result.body)
+
     def test_required_fails_on_length_truncation_before_a_call(self):
         """A length limit can stop a grammar-valid prefix before a call completes."""
         prefix = '<|open|>tools<|sep|><|open|>call tool="B" index="1"<|sep|>'

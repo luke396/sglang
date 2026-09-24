@@ -995,7 +995,11 @@ class OpenAIServingResponses(OpenAIServingChat):
             allowed_names = {tool["name"] for tool in allowed_tools["tools"]}
             if any(call.name not in allowed_names for call in tool_call_items):
                 raise ValueError("Generated tool call is outside allowed_tools.")
-            if allowed_tools["mode"] == "required" and not tool_call_items:
+            if (
+                allowed_tools["mode"] == "required"
+                and not self._is_disagg_prefill
+                and not tool_call_items
+            ):
                 raise ValueError("allowed_tools required mode produced no tool call.")
 
         if content:
@@ -2556,6 +2560,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             if (
                 allowed_tools is not None
                 and allowed_tools["mode"] == "required"
+                and not self._is_disagg_prefill
                 and not tool_call_states
             ):
                 raise ValueError("allowed_tools required mode produced no tool call.")

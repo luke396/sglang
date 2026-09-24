@@ -32,6 +32,7 @@ from sglang.srt.entrypoints.openai.chat_encoding import (
 )
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
+    ChatCompletionResponse,
     MessageProcessingResult,
     ToolChoice,
     ToolChoiceFuncName,
@@ -4684,6 +4685,52 @@ class TestAllowedToolsServing(CustomTestCase):
                             for choice in response.choices
                         }
                     self.assertEqual(calls_by_choice, {0: names, 1: names})
+
+    def test_required_checks_decode_output_not_prefill_handoff(self):
+        """A PD first-token handoff must not fail the final-answer tool requirement."""
+        for mode in ("prefill", "decode"):
+            publish(
+                ServerArgs(model_path="dummy", disaggregation_mode=mode),
+                role="tokenizer",
+            )
+            self.chat = OpenAIServingChat(self.tm, self.template_manager)
+            for stream in (False, True):
+                with self.subTest(mode=mode, stream=stream):
+                    response = self._complete(
+                        self._request(
+                            mode="required",
+                            stream=stream,
+                            max_completion_tokens=512,
+                            bootstrap_host="127.0.0.1",
+                            bootstrap_room=1,
+                        ),
+                        "<|open|>",
+                        finish_type="length",
+                    )
+                    self.assertTrue(
+                        self.internal_request.sampling_params["structural_tag"]
+                    )
+                    if stream:
+                        errors = [event for event in response if "error" in event]
+                        finishes = [
+                            choice["finish_reason"]
+                            for event in response
+                            for choice in event.get("choices", [])
+                            if choice.get("finish_reason") is not None
+                        ]
+                        if mode == "prefill":
+                            self.assertEqual(errors, [])
+                            self.assertEqual(finishes, ["length"])
+                        else:
+                            self.assertIn("required", errors[0]["error"]["message"])
+                            self.assertEqual(finishes, [])
+                    elif mode == "prefill":
+                        self.assertIsInstance(response, ChatCompletionResponse)
+                        self.assertEqual(response.choices[0].finish_reason, "length")
+                        self.assertIsNone(response.choices[0].message.tool_calls)
+                    else:
+                        self.assertEqual(response.status_code, 400)
+                        self.assertIn("required", json.loads(response.body)["message"])
 
     def test_required_fails_on_length_truncation_before_a_call(self):
         """A length limit can stop a grammar-valid prefix before a call completes."""
