@@ -4347,7 +4347,7 @@ class TestAllowedToolsServing(CustomTestCase):
             **kwargs,
         )
 
-    def _complete(self, request, text="No tool needed."):
+    def _complete(self, request, text="No tool needed.", *, finish_type="stop"):
         self.internal_request = None
 
         async def generate(internal_request, raw_request):
@@ -4358,7 +4358,7 @@ class TestAllowedToolsServing(CustomTestCase):
                 for result in results:
                     result["text"] = text[:end]
                     result["meta_info"]["finish_reason"] = (
-                        {"type": "stop"} if end == len(text) else None
+                        {"type": finish_type} if end == len(text) else None
                     )
                     if request.stream:
                         yield result
@@ -4685,15 +4685,31 @@ class TestAllowedToolsServing(CustomTestCase):
                         }
                     self.assertEqual(calls_by_choice, {0: names, 1: names})
 
-    def test_required_does_not_succeed_without_a_call(self):
+    def test_required_fails_on_length_truncation_before_a_call(self):
+        """A length limit can stop a grammar-valid prefix before a call completes."""
+        prefix = TOOLS_OPEN + '<|open|>call tool="B" index="1"<|sep|>'
         for stream in (False, True):
             with self.subTest(stream=stream):
-                response = self._complete(self._request(mode="required", stream=stream))
+                response = self._complete(
+                    self._request(mode="required", stream=stream),
+                    prefix,
+                    finish_type="length",
+                )
+                compiler = xgr.GrammarCompiler(
+                    xgr.TokenizerInfo([bytes([i]) for i in range(256)])
+                )
+                matcher = xgr.GrammarMatcher(
+                    compiler.compile_structural_tag(
+                        self.internal_request.sampling_params["structural_tag"]
+                    )
+                )
+                self.assertTrue(matcher.accept_string(prefix))
+                self.assertFalse(matcher.is_completed())
                 if stream:
                     self.assertTrue(any("error" in event for event in response))
                     self.assertFalse(
                         any(
-                            choice.get("finish_reason") == "stop"
+                            choice.get("finish_reason") is not None
                             for event in response
                             for choice in event.get("choices", [])
                         )

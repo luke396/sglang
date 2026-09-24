@@ -11,7 +11,7 @@ from openai.types.responses import (
 )
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from utils import collect_stream_events, engine_chunk, event_payloads, make_serving
-from xgrammar import Grammar
+from xgrammar import Grammar, GrammarCompiler, GrammarMatcher, TokenizerInfo
 from xgrammar.testing import _is_grammar_accept_string
 
 from sglang.srt.entrypoints.context import SimpleContext
@@ -337,7 +337,9 @@ class AllowedToolsResponsesTestCase(CustomTestCase):
             + "<|close|>tools<|sep|>"
         )
 
-    def _complete(self, request, text="No tool needed.", *, chunk_size=1):
+    def _complete(
+        self, request, text="No tool needed.", *, chunk_size=1, finish_type="stop"
+    ):
         self.internal_request = None
 
         async def generate(internal_request, raw_request):
@@ -348,7 +350,11 @@ class AllowedToolsResponsesTestCase(CustomTestCase):
                 else [len(text)]
             )
             for end in ends:
-                yield engine_chunk(text[:end], finish=end == len(text))
+                chunk = engine_chunk(text[:end])
+                chunk["meta_info"]["finish_reason"] = (
+                    {"type": finish_type} if end == len(text) else None
+                )
+                yield chunk
 
         async def complete():
             self.serving.tokenizer_manager.generate_request = generate
@@ -841,10 +847,26 @@ class AllowedToolsResponsesTestCase(CustomTestCase):
                         self.assertEqual(result.status_code, 400)
                         self.assertIn(b"outside allowed_tools", result.body)
 
-    def test_required_without_a_call_cannot_complete_successfully(self):
+    def test_required_fails_on_length_truncation_before_a_call(self):
+        """A length limit can stop a grammar-valid prefix before a call completes."""
+        prefix = '<|open|>tools<|sep|><|open|>call tool="B" index="1"<|sep|>'
         for stream in (False, True):
             with self.subTest(stream=stream):
-                result = self._complete(self._request(mode="required", stream=stream))
+                result = self._complete(
+                    self._request(mode="required", stream=stream),
+                    prefix,
+                    finish_type="length",
+                )
+                compiler = GrammarCompiler(
+                    TokenizerInfo([bytes([i]) for i in range(256)])
+                )
+                matcher = GrammarMatcher(
+                    compiler.compile_structural_tag(
+                        self.internal_request.sampling_params["structural_tag"]
+                    )
+                )
+                self.assertTrue(matcher.accept_string(prefix))
+                self.assertFalse(matcher.is_completed())
                 if stream:
                     self.assertEqual(result[-1]["type"], "response.failed")
                     self.assertIn(

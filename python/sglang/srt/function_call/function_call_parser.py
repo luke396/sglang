@@ -1,6 +1,6 @@
 import inspect
 import logging
-from typing import Dict, List, Literal, Optional, Set, Tuple, Type, Union
+from typing import Dict, List, Literal, Optional, Set, Tuple, Type, Union, cast
 
 from sglang.srt.entrypoints.openai.protocol import (
     AllowedToolChoice,
@@ -289,9 +289,8 @@ class FunctionCallParser:
                 ]
 
             if isinstance(tool_choice, AllowedToolChoice):
-                if not isinstance(self.detector, KimiK3Detector):
-                    raise ValueError("allowed_tools requires the kimi_k3 tool parser")
-                structural_tag = self.detector.get_structural_tag(
+                # Request validation guarantees the K3 detector for allowed_tools.
+                structural_tag = cast(KimiK3Detector, self.detector).get_structural_tag(
                     tools=structural_tag_tools,
                     tool_choice=tool_choice,
                     thinking_mode=thinking_mode,
