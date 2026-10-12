@@ -15,6 +15,7 @@ import unittest
 import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -107,6 +108,30 @@ class TestTboFilterBatchMarker(CustomTestCase):
                 parent.defer_logits_to_eager = deferred
                 child = _filter(parent, lo=0, hi=4)
                 self.assertEqual(child.defer_logits_to_eager, deferred)
+
+    def test_extend_children_inherit_queue_counts_with_profiling_disabled(self):
+        """Admission scalars must survive TBO splitting, even when they are zero."""
+        with envs.SGLANG_FORWARD_COST_PROFILE_DIR.override(None):
+            self.assertIsNone(envs.SGLANG_FORWARD_COST_PROFILE_DIR.get())
+            for before, after in ((0, 0), (2, 1)):
+                for lo, hi in ((0, 1), (1, 2)):
+                    with self.subTest(counts=(before, after), child=(lo, hi)):
+                        parent = _make_target_verify_batch(2)
+                        parent.forward_mode = ForwardMode.EXTEND
+                        parent.extend_num_tokens = 2
+                        parent.extend_seq_lens = torch.ones(2, dtype=torch.int32)
+                        parent.extend_prefix_lens = torch.zeros(2, dtype=torch.int32)
+                        parent.extend_start_loc = torch.arange(2, dtype=torch.int32)
+                        parent.extend_seq_lens_cpu = [1, 1]
+                        parent.extend_prefix_lens_cpu = [0, 0]
+                        parent.waiting_reqs_before = before
+                        parent.waiting_reqs_after = after
+                        child = _filter(parent, lo=lo, hi=hi)
+                        self.assertEqual(child.forward_mode, ForwardMode.EXTEND)
+                        self.assertEqual(child.batch_size, 1)
+                        self.assertEqual(child.extend_num_tokens, 1)
+                        self.assertEqual(child.waiting_reqs_before, before)
+                        self.assertEqual(child.waiting_reqs_after, after)
 
     def test_filter_batch_drops_aux_hidden_states_buffer(self):
         """Decode graph capture sets the shared aux output on the parent before

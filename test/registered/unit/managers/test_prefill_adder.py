@@ -1,17 +1,24 @@
 import unittest
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
 import sglang.srt.managers.schedule_policy as schedule_policy
-from sglang.srt.managers.schedule_batch import Req
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()
+
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
     SchedulePolicy,
     estimate_prefill_extend_tile_metrics,
 )
+from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.load_inquirer import SchedulerLoadInquirer
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -30,10 +37,16 @@ from sglang.srt.mem_cache.prefill_budget import (
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
+from sglang.srt.observability.forward_cost_profiler import _snapshot_shape
 from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -158,6 +171,224 @@ class TestPrefillAdder(CustomTestCase):
         defaults.update(kwargs)
         defaults["token_to_kv_pool_allocator"].page_size = defaults["page_size"]
         return PrefillAdder(**defaults)
+
+    def _queue_snapshot_scheduler(self, *, waiting, chunked, slots, mode):
+        s = Scheduler.__new__(Scheduler)
+        s.waiting_queue = list(waiting)
+        s.chunked_req = chunked
+        s.disaggregation_mode = mode
+        s.prefill_delayer = s.min_free_slots_delayer = s.dynamic_chunk_sizer = None
+        s.enable_priority_preemption = s.is_hybrid_swa = s.is_mixed_chunk = False
+        s.enable_lora = s.enable_hicache_storage = s.enable_lmcache = False
+        s.enable_hierarchical_cache = s.enable_unified_cache_external_linker = False
+        s.enable_priority_scheduling = False
+        s.enable_overlap = True
+        s.scheduler_stage_metrics = None
+        s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
+        s.beam_coordinator = SimpleNamespace(pending_member_rows=lambda batch: 0)
+        s.processed_tokens_counter = 0
+        s.page_size = 1
+        s.max_prefill_tokens = s.chunked_prefill_size = 512
+        s.max_prefill_bs = s.max_running_requests = 64
+        s.priority_scheduling_preemption_threshold = 0
+        s.new_token_ratio_tracker = SimpleNamespace(current=1.0)
+        s.dllm_config = s.truncation_align_size = None
+        s.spec_algorithm = SpeculativeAlgorithm.NONE
+        s.tree_cache = self.create_tree_cache()
+        s.tree_cache.supports_mamba.return_value = False
+        s.tree_cache.supports_fast_match_prefix.return_value = False
+        s.token_to_kv_pool_allocator = self.create_token_allocator(available_size=32768)
+        s.token_to_kv_pool_allocator.page_size = 1
+        s.req_to_token_pool = SimpleNamespace(
+            device="cpu", mamba_allocator=None, available_size=lambda: slots
+        )
+        s.policy = SchedulePolicy(
+            policy="fcfs",
+            tree_cache=s.tree_cache,
+            enable_hierarchical_cache=False,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+        s.model_config = SimpleNamespace(
+            vocab_size=32768,
+            requires_mm_token_modalities=False,
+            model_is_mrope=False,
+            is_encoder_decoder=False,
+        )
+        s.tp_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                device="cpu",
+                is_draft_worker=False,
+                model_config=s.model_config,
+                attn_backend=SimpleNamespace(extend_attention_block_m=64),
+                prefill_aware_swa=False,
+                prefill_attention_backend_str="torch_native",
+                kv_index_translator=SimpleNamespace(
+                    rebind_write_loc=lambda batch: None
+                ),
+                ngram_embedding_manager=SimpleNamespace(enabled=False),
+                lora_manager=None,
+            )
+        )
+        s.load_inquirer = SimpleNamespace(
+            get_waiting_queue=lambda: s.waiting_queue,
+            get_chunked_req=lambda: s.chunked_req,
+        )
+        s.load_inquirer._get_num_pending_tokens = MethodType(
+            SchedulerLoadInquirer._get_num_pending_tokens, s.load_inquirer
+        )
+        return s
+
+    def _queue_snapshot_req(self, rid, n):
+        req = self.create_mock_req(rid, priority=0, max_new_tokens=1)
+        req.full_untruncated_fill_ids = list(range(n))
+        req.origin_input_ids = req.full_untruncated_fill_ids
+        req.last_node = MagicMock()
+        req.seqlen = n
+        req.token_indices_to_pool = req.beam_group = req.token_type_ids = None
+        req.lora_id = req.grammar = None
+        req.return_logprob = req.is_prefill_only = False
+        req.return_hidden_states_mode = CaptureHiddenMode.NULL
+        req.inflight_middle_chunks = 0
+        req.sampling_params.ignore_eos = False
+        req.time_stats.set_forward_entry_time = lambda ts: None
+        req.time_stats.set_last_scheduled_time = lambda *args: None
+        return req
+
+    def test_waiting_snapshot_tracks_admission_not_remaining_chunk_work(self):
+        """Pending chunk tokens and an emptied waiting queue are different states."""
+        with get_context().override_server_args(
+            device="cpu", pp_max_micro_batch_size=64
+        ):
+            for mode in (DisaggregationMode.NULL, DisaggregationMode.PREFILL):
+                for case in ("chunk_only", "all_admitted", "still_waiting"):
+                    with self.subTest(mode=mode, case=case):
+                        chunked = (
+                            self._queue_snapshot_req("long", 4096)
+                            if case == "chunk_only"
+                            else None
+                        )
+                        waiting = (
+                            []
+                            if chunked
+                            else [
+                                self._queue_snapshot_req(str(i), 128) for i in range(2)
+                            ]
+                        )
+                        s = self._queue_snapshot_scheduler(
+                            waiting=waiting,
+                            chunked=chunked,
+                            slots=1 if case == "still_waiting" else 64,
+                            mode=mode,
+                        )
+                        running = ScheduleBatch(reqs=[])
+                        # Allocation/H2D is outside the admission snapshot contract.
+                        with patch.object(ScheduleBatch, "prepare_for_extend"):
+                            if mode == DisaggregationMode.PREFILL:
+                                s.process_pending_chunked_abort = lambda: None
+                                s._process_hicache_events = lambda **kwargs: None
+                                s.resolve_waiting_queue_bootstrap = lambda: None
+                                s.process_prefill_chunk = lambda **kwargs: None
+                                s.dp_attn_adapter = SimpleNamespace(
+                                    maybe_prepare_mlp_sync_batch=lambda batch: batch
+                                )
+                                plan = s.get_next_disagg_prefill_batch_to_run(
+                                    running_batch=running, last_batch=None
+                                )
+                            else:
+                                plan = s.get_new_batch_prefill(running)
+                            batch = plan.batch_to_run
+                        stats = batch.prefill_stats
+                        expected = {
+                            "chunk_only": (0, 0),
+                            "all_admitted": (2, 0),
+                            "still_waiting": (2, 1),
+                        }[case]
+                        self.assertEqual(
+                            (stats.waiting_reqs_before, stats.waiting_reqs_after),
+                            expected,
+                        )
+                        self.assertEqual(
+                            len(batch.reqs), 2 - expected[1] if waiting else 1
+                        )
+                        if chunked:
+                            self.assertGreater(stats.num_pending_tokens, 0)
+                            self.assertIs(s.chunked_req, chunked)
+                        elif case == "still_waiting":
+                            self.assertLess(
+                                sum(r.extend_len for r in batch.reqs),
+                                s.chunked_prefill_size,
+                            )
+                        # Later arrivals/departures must not change the scheduled batch.
+                        s.waiting_queue = [self._queue_snapshot_req("later", 32)] * 7
+                        batch = batch.copy()
+                        self.assertEqual(
+                            (
+                                batch.prefill_stats.waiting_reqs_before,
+                                batch.prefill_stats.waiting_reqs_after,
+                            ),
+                            expected,
+                        )
+                        self._check_forward_queue_snapshot(batch, s, expected)
+
+    def _check_forward_queue_snapshot(self, batch, scheduler, expected):
+        # Supply CPU tensors in place of GPU allocation, then run the real factory.
+        batch.forward_mode = ForwardMode.EXTEND
+        batch.extend_lens = [r.extend_len for r in batch.reqs]
+        batch.prefix_lens = [r.prefix_len for r in batch.reqs]
+        batch.extend_num_tokens = sum(batch.extend_lens)
+        batch.input_ids = torch.zeros(batch.extend_num_tokens, dtype=torch.int64)
+        batch.seq_lens = torch.tensor([r.extend_end for r in batch.reqs])
+        batch.seq_lens_cpu = batch.seq_lens
+        batch.seq_lens_sum = int(batch.seq_lens.sum())
+        stats = batch.prefill_stats
+        prefill_forwards = []
+        for mode in (ForwardMode.EXTEND, ForwardMode.MIXED, ForwardMode.SPLIT_PREFILL):
+            batch.forward_mode = mode
+            prefill_forwards.append(
+                ForwardBatch.init_new(
+                    batch,
+                    scheduler.tp_worker.model_runner,
+                    capture_hidden_mode=CaptureHiddenMode.NULL,
+                    return_hidden_states_before_norm=False,
+                )
+            )
+
+        # Model the prior forward's output and isolate only KV allocation.
+        batch.forward_mode = ForwardMode.EXTEND
+        batch.input_ids = torch.zeros(len(batch.reqs), dtype=torch.int64)
+        batch.orig_seq_lens = batch.seq_lens.clone()
+        batch.sampling_info = SimpleNamespace(
+            penalizer_orchestrator=SimpleNamespace(is_required=False)
+        )
+        for req in batch.reqs:
+            req.decode_batch_idx = 0
+        with patch(
+            "sglang.srt.managers.schedule_batch.alloc_for_decode",
+            return_value=torch.zeros(len(batch.reqs), dtype=torch.int64),
+        ):
+            batch.prepare_for_decode()
+        self.assertEqual(batch.forward_mode, ForwardMode.DECODE)
+        self.assertIs(batch.prefill_stats, stats)
+        decode = ForwardBatch.init_new(
+            batch,
+            scheduler.tp_worker.model_runner,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            return_hidden_states_before_norm=False,
+        )
+        decode_shape = _snapshot_shape(forward_batch=decode, split_forward_count=1)
+        self.assertEqual(decode_shape.forward_mode, "DECODE")
+        self.assertIsNone(decode_shape.waiting_reqs_before)
+        self.assertIsNone(decode_shape.waiting_reqs_after)
+        self.assertIs(batch.prefill_stats, stats)
+        self.assertEqual(
+            (stats.waiting_reqs_before, stats.waiting_reqs_after), expected
+        )
+        for forward in prefill_forwards:
+            shape = _snapshot_shape(forward_batch=forward, split_forward_count=1)
+            self.assertEqual(
+                (shape.waiting_reqs_before, shape.waiting_reqs_after), expected
+            )
 
     def create_shared_adder(self, *, num_mixed_decode_tokens=0):
         self.mock_tree_cache.supports_mamba.return_value = False

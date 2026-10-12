@@ -92,7 +92,7 @@ def _decode_total_seq_lens(batch: ScheduleBatch) -> int:
 
 @dataclasses.dataclass
 class PrefillStats:
-    """Stats for logging prefill batch metrics."""
+    """Batch-time prefill statistics for logging and forward-cost profiling."""
 
     log_input_tokens: int
     log_hit_tokens: int
@@ -106,6 +106,9 @@ class PrefillStats:
     log_storage_hit_tokens: int = 0
     num_pending_tokens: int = 0
     log_replay_tokens: int = 0
+    # Waiting queue only, excluding chunk remainder; None if not snapshotted.
+    waiting_reqs_before: Optional[int] = None
+    waiting_reqs_after: Optional[int] = None
 
     @classmethod
     def from_adder(
@@ -114,6 +117,9 @@ class PrefillStats:
         running_reqs: List[Req],
         enable_priority_scheduling: bool = False,
         num_pending_tokens: int = 0,
+        *,
+        waiting_reqs_before: Optional[int] = None,
+        waiting_reqs_after: Optional[int] = None,
     ):
         return cls(
             log_input_tokens=adder.log_input_tokens,
@@ -130,6 +136,8 @@ class PrefillStats:
             ),
             num_new_seqs=len(adder.can_run_list),
             num_pending_tokens=num_pending_tokens,
+            waiting_reqs_before=waiting_reqs_before,
+            waiting_reqs_after=waiting_reqs_after,
         )
 
 

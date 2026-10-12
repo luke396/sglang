@@ -464,6 +464,8 @@ class Envs:
     # precedence when both are set.
     SGLANG_GRAPH_BATCH_CAPTURE = EnvBool(False)
     SGLANG_TORCH_PROFILER_DIR = EnvStr("/tmp")
+    # Directory for per-forward cost samples (forward_cost.dp<rank>.jsonl); unset = off.
+    SGLANG_FORWARD_COST_PROFILE_DIR = EnvStr(None)
     # Allocator-history buffer for /start_profile activities=["MEM"]; the
     # default truncates long windows (each entry is one alloc/free event).
     SGLANG_MEM_PROFILE_MAX_ENTRIES = EnvInt(100000)
