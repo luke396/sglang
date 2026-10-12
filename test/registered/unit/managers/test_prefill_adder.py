@@ -1,4 +1,5 @@
 import unittest
+from array import array
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -44,6 +45,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.observability.forward_cost_profiler import _snapshot_shape
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -194,9 +196,7 @@ class TestPrefillAdder(CustomTestCase):
         s.new_token_ratio_tracker = SimpleNamespace(current=1.0)
         s.dllm_config = s.truncation_align_size = None
         s.spec_algorithm = SpeculativeAlgorithm.NONE
-        s.tree_cache = self.create_tree_cache()
-        s.tree_cache.supports_mamba.return_value = False
-        s.tree_cache.supports_fast_match_prefix.return_value = False
+        s.tree_cache = RadixCache.create_simulated()
         s.token_to_kv_pool_allocator = self.create_token_allocator(available_size=32768)
         s.token_to_kv_pool_allocator.page_size = 1
         s.req_to_token_pool = SimpleNamespace(
@@ -240,20 +240,12 @@ class TestPrefillAdder(CustomTestCase):
         return s
 
     def _queue_snapshot_req(self, rid, n):
-        req = self.create_mock_req(rid, priority=0, max_new_tokens=1)
-        req.full_untruncated_fill_ids = list(range(n))
-        req.origin_input_ids = req.full_untruncated_fill_ids
-        req.last_node = MagicMock()
-        req.seqlen = n
-        req.token_indices_to_pool = req.beam_group = req.token_type_ids = None
-        req.lora_id = req.grammar = None
-        req.return_logprob = req.is_prefill_only = False
-        req.return_hidden_states_mode = CaptureHiddenMode.NULL
-        req.inflight_middle_chunks = 0
-        req.sampling_params.ignore_eos = False
-        req.time_stats.set_forward_entry_time = lambda ts: None
-        req.time_stats.set_last_scheduled_time = lambda *args: None
-        return req
+        return Req(
+            rid=rid,
+            origin_input_text="",
+            origin_input_ids=array("q", range(n)),
+            sampling_params=SamplingParams(max_new_tokens=1),
+        )
 
     def test_waiting_snapshot_tracks_admission_not_remaining_chunk_work(self):
         """Pending chunk tokens and an emptied waiting queue are different states."""
