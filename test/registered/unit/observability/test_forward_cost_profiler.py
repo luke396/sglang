@@ -8,9 +8,13 @@ from unittest.mock import patch
 
 import msgspec
 
+from sglang.srt.distributed import parallel_state
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.model_executor import model_runner
 from sglang.srt.observability import forward_cost_profiler as fcp
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -256,6 +260,87 @@ class TestForwardCostProfiler(CustomTestCase):
             self.assertTrue(
                 os.path.exists(os.path.join(self.dir, f"forward_cost.dp{rank}.jsonl"))
             )
+
+
+class _ReachedModelLoad(Exception):
+    pass
+
+
+class TestModelRunnerCreatesProfilerAfterParallelGroups(CustomTestCase):
+    """The leader check reads live attention groups; it must run after they exist."""
+
+    def setUp(self):
+        super().setUp()
+        reset_context()
+        self.addCleanup(reset_context)
+        groups = (parallel_state._ATTN_TP, parallel_state._ATTN_CP)
+        self.addCleanup(
+            lambda: (
+                setattr(parallel_state, "_ATTN_TP", groups[0])
+                or setattr(parallel_state, "_ATTN_CP", groups[1])
+            )
+        )
+        self.server_args = ServerArgs(model_path="dummy", device="cpu")
+        publish(self.server_args, role="scheduler")
+        self.dir = tempfile.mkdtemp()
+
+    def _construct(self, *, attn_tp_rank):
+        def init_torch_distributed(runner):
+            # What bootstrap.init_torch_distributed provides to the rank getters.
+            parallel_state._ATTN_TP = types.SimpleNamespace(
+                rank_in_group=attn_tp_rank, world_size=2
+            )
+            parallel_state._ATTN_CP = types.SimpleNamespace(
+                rank_in_group=0, world_size=1
+            )
+            runner.tp_group = runner.pp_group = runner.attention_tp_group = None
+            runner.pre_model_load_memory = 0
+
+        captured = {}
+
+        def initialize(runner):
+            captured["profiler"] = runner.forward_cost_profiler
+            raise _ReachedModelLoad
+
+        model_config = types.SimpleNamespace(
+            is_generation=True,
+            is_multimodal=False,
+            is_multimodal_chunked_prefill_supported=False,
+            is_hybrid_swa=False,
+            is_hybrid_swa_compress=False,
+            attention_arch=None,
+            attention_chunk_size=None,
+        )
+        Runner = model_runner.ModelRunner
+        parallel_state._ATTN_TP = parallel_state._ATTN_CP = None
+        with (
+            envs.SGLANG_FORWARD_COST_PROFILE_DIR.override(self.dir),
+            patch.object(Runner, "init_torch_distributed", init_torch_distributed),
+            patch.object(Runner, "init_shared_mooncake_transfer_engine"),
+            # CPU-only OpenMP binding shells out to lscpu.
+            patch.object(Runner, "init_threads_binding"),
+            patch.object(Runner, "initialize", initialize),
+            self.assertRaises(_ReachedModelLoad),
+        ):
+            Runner(
+                model_config=model_config,
+                mem_fraction_static=0.5,
+                gpu_id=0,
+                ps=ParallelState.trivial(dp_rank=None),
+                nccl_port=0,
+                server_args=self.server_args,
+            )
+        return captured["profiler"]
+
+    def test_leader_creates_profiler_before_model_load(self):
+        profiler = self._construct(attn_tp_rank=0)
+        self.assertIsNotNone(profiler)
+        profiler.close(drain=False)
+        self.assertEqual(os.listdir(self.dir), ["forward_cost.dp0.jsonl"])
+
+    def test_non_leader_reads_its_initialized_group_rank(self):
+        self.assertIsNone(self._construct(attn_tp_rank=1))
+        self.assertEqual(os.listdir(self.dir), [])
 
 
 if __name__ == "__main__":

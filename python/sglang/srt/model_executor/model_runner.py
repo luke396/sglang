@@ -391,8 +391,6 @@ class ModelRunner:
 
         self.init_startup_observability()
 
-        self.maybe_init_forward_cost_profiler()
-
         self.init_remote_instance_weight_transporter()
 
         self.init_msprobe()
@@ -437,6 +435,9 @@ class ModelRunner:
         # Get available memory before model loading.
         # Stored for later use by alloc_memory_pool().
         self.init_torch_distributed()
+
+        # Its leader check reads the attention groups created just above.
+        self.maybe_init_forward_cost_profiler()
 
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
