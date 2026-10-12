@@ -169,6 +169,10 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.observability.forward_cost_profiler import (
+    ForwardCostProfiler,
+    forward_cost_scope,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     assert_published,
@@ -387,6 +391,8 @@ class ModelRunner:
 
         self.init_startup_observability()
 
+        self.maybe_init_forward_cost_profiler()
+
         self.init_remote_instance_weight_transporter()
 
         self.init_msprobe()
@@ -554,6 +560,13 @@ class ModelRunner:
 
     def init_msprobe(self):
         self.msprobe_debugger = misc_utils.create_msprobe_debugger()
+
+    def maybe_init_forward_cost_profiler(self):
+        """Per-forward cost sampling for offline cost-model fitting (env-gated)."""
+        self.forward_cost_profiler = ForwardCostProfiler.maybe_create(
+            is_draft_worker=self.is_draft_worker,
+            enable_elastic_ep=self.enable_elastic_ep,
+        )
 
     def init_weight_updater(self):
         self.weight_updater = WeightUpdater(
@@ -1682,6 +1695,11 @@ class ModelRunner:
                 self.forward_pass_id,
                 forward_batch,
             ) as recorder_outputs,
+            forward_cost_scope(
+                self.forward_cost_profiler,
+                forward_batch=forward_batch,
+                split_forward_count=split_forward_count,
+            ),
         ):
             output = self._forward_raw(
                 forward_batch,

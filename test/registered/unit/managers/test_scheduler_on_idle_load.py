@@ -29,6 +29,8 @@ class TestOnIdleStallPublish(CustomTestCase):
         s.load_publisher = MagicMock()
         s.load_inquirer = MagicMock()
         s.metrics_reporter = MagicMock()
+        s.tp_worker = MagicMock()
+        s.tp_worker.model_runner.forward_cost_profiler = None
         s._last_stall_publish_ts = float("-inf")
         return s
 

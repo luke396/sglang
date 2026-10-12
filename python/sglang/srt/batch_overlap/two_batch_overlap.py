@@ -757,6 +757,9 @@ class TboForwardBatchPreparer:
             "dp_prefill_cuda_graph_max_prefix_len",
             "dp_padding_mode",
             "global_forward_mode",
+            # Queue counts describe the parent admission, not each child slice.
+            "waiting_reqs_before",
+            "waiting_reqs_after",
             "is_prefill_only",
             "spec_algorithm",
             "capture_hidden_mode",

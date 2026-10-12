@@ -3849,6 +3849,7 @@ class Scheduler(
             running_batch.batch_is_full = True
             return None, running_batch
 
+        waiting_reqs_before = len(self.waiting_queue)
         # Get priority queue
         self.policy.calc_priority(
             self.waiting_queue,
@@ -4103,6 +4104,7 @@ class Scheduler(
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
+        waiting_reqs_after = len(self.waiting_queue)
 
         if round_robin_enabled:
             self.suspended_prefill_queue = [
@@ -4153,6 +4155,8 @@ class Scheduler(
             adder,
             running_batch.reqs,
             self.enable_priority_scheduling,
+            waiting_reqs_before=waiting_reqs_before,
+            waiting_reqs_after=waiting_reqs_after,
             num_pending_tokens=self.load_inquirer._get_num_pending_tokens(
                 chunk_deduct=(
                     self.chunked_req.extend_range.length
@@ -4865,6 +4869,8 @@ class Scheduler(
     @scheduler_stage_method(SCHEDULER_STAGE_IDLE)
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
+        if (profiler := self.tp_worker.model_runner.forward_cost_profiler) is not None:
+            profiler.poll()
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
 
@@ -6093,10 +6099,17 @@ def run_scheduler_process(
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.
             scheduler.metrics_reporter._shutdown_fpm()
-            # Graceful path only: on the exception path the GPU may be wedged
-            # and the synchronize() in destroy() could itself hang.
-            if scheduler.gracefully_exit:
-                scheduler.release_host_resources()
+            try:
+                if (
+                    profiler := scheduler.tp_worker.model_runner.forward_cost_profiler
+                ) is not None:
+                    # Synchronizing could hang on a wedged GPU after an exception.
+                    profiler.close(drain=scheduler.gracefully_exit)
+            finally:
+                # Graceful path only: on the exception path the GPU may be wedged
+                # and the synchronize() in destroy() could itself hang.
+                if scheduler.gracefully_exit:
+                    scheduler.release_host_resources()
 
 
 def _make_abort_req(

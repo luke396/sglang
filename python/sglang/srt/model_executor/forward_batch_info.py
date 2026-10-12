@@ -477,6 +477,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Optional seq_lens on cpu (CPU mirror of seq_lens)
     seq_lens_cpu: Optional[torch.Tensor] = None
 
+    # Admission-time waiting queue counts, not remaining chunk tokens.
+    # None for batches without a scheduler snapshot.
+    waiting_reqs_before: Optional[int] = None
+    waiting_reqs_after: Optional[int] = None
+
     # For logprob
     top_logprobs_nums: Optional[List[int]] = None
     token_ids_logprobs: Optional[List[List[int]]] = None
@@ -811,6 +816,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if batch.seq_lens_sum is None and seq_lens_cpu is not None:
             batch.seq_lens_sum = int(seq_lens_cpu.sum())
 
+        # Decode retains statistics from an earlier prefill admission.
+        prefill_stats = None if batch.forward_mode.is_decode() else batch.prefill_stats
         ret = cls(
             # Required core inputs
             forward_mode=batch.forward_mode,
@@ -848,6 +855,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return_hidden_states_before_norm=return_hidden_states_before_norm,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             # Host-side metadata
+            waiting_reqs_before=(
+                prefill_stats.waiting_reqs_before if prefill_stats is not None else None
+            ),
+            waiting_reqs_after=(
+                prefill_stats.waiting_reqs_after if prefill_stats is not None else None
+            ),
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
             mm_inputs=batch.multimodal_inputs,
