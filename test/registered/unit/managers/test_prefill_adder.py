@@ -148,6 +148,8 @@ class TestPrefillAdder(CustomTestCase):
         s = Scheduler.__new__(Scheduler)
         s.waiting_queue = list(waiting)
         s.chunked_req = chunked
+        s.suspended_prefill_queue = []
+        s.enable_chunked_prefill_round_robin = False
         s.disaggregation_mode = mode
         s.prefill_delayer = s.min_free_slots_delayer = s.dynamic_chunk_sizer = None
         s.enable_priority_preemption = s.is_hybrid_swa = s.is_mixed_chunk = False
@@ -189,6 +191,7 @@ class TestPrefillAdder(CustomTestCase):
             model_runner=SimpleNamespace(
                 device="cpu",
                 is_draft_worker=False,
+                ps=SimpleNamespace(attn_dcp_size=1),
                 model_config=s.model_config,
                 attn_backend=SimpleNamespace(extend_attention_block_m=64),
                 prefill_aware_swa=False,
@@ -203,6 +206,7 @@ class TestPrefillAdder(CustomTestCase):
         s.load_inquirer = SimpleNamespace(
             get_waiting_queue=lambda: s.waiting_queue,
             get_chunked_req=lambda: s.chunked_req,
+            get_round_robin_requests=lambda: (),
         )
         s.load_inquirer._get_num_pending_tokens = MethodType(
             SchedulerLoadInquirer._get_num_pending_tokens, s.load_inquirer
@@ -278,7 +282,7 @@ class TestPrefillAdder(CustomTestCase):
                             self.assertIs(s.chunked_req, chunked)
                         elif case == "still_waiting":
                             self.assertLess(
-                                sum(r.extend_len for r in batch.reqs),
+                                sum(r.extend_range.length for r in batch.reqs),
                                 s.chunked_prefill_size,
                             )
                         # Later arrivals/departures must not change the scheduled batch.
@@ -296,11 +300,11 @@ class TestPrefillAdder(CustomTestCase):
     def _check_forward_queue_snapshot(self, batch, scheduler, expected):
         # Supply CPU tensors in place of GPU allocation, then run the real factory.
         batch.forward_mode = ForwardMode.EXTEND
-        batch.extend_lens = [r.extend_len for r in batch.reqs]
-        batch.prefix_lens = [r.prefix_len for r in batch.reqs]
+        batch.extend_lens = [r.extend_range.length for r in batch.reqs]
+        batch.prefix_lens = [len(r.prefix_indices) for r in batch.reqs]
         batch.extend_num_tokens = sum(batch.extend_lens)
         batch.input_ids = torch.zeros(batch.extend_num_tokens, dtype=torch.int64)
-        batch.seq_lens = torch.tensor([r.extend_end for r in batch.reqs])
+        batch.seq_lens = torch.tensor([r.extend_range.end for r in batch.reqs])
         batch.seq_lens_cpu = batch.seq_lens
         batch.seq_lens_sum = int(batch.seq_lens.sum())
         stats = batch.prefill_stats

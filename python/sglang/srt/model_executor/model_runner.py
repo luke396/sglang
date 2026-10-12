@@ -566,6 +566,7 @@ class ModelRunner:
         self.forward_cost_profiler = ForwardCostProfiler.maybe_create(
             is_draft_worker=self.is_draft_worker,
             enable_elastic_ep=self.enable_elastic_ep,
+            dp_rank=self.ps.dp_rank,
         )
 
     def init_weight_updater(self):

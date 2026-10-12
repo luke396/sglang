@@ -62,7 +62,11 @@ class ForwardCostProfiler:
 
     @classmethod
     def maybe_create(
-        cls, *, is_draft_worker: bool, enable_elastic_ep: bool
+        cls,
+        *,
+        is_draft_worker: bool,
+        enable_elastic_ep: bool,
+        dp_rank: Optional[int],
     ) -> Optional["ForwardCostProfiler"]:
         out_dir = envs.SGLANG_FORWARD_COST_PROFILE_DIR.get()
         if out_dir is None or is_draft_worker:
@@ -75,7 +79,8 @@ class ForwardCostProfiler:
         # One writer per DP rank; attn TP/CP peers run the same forward.
         if parallel.attn_tp_rank != 0 or parallel.attn_cp_rank != 0:
             return None
-        dp_rank = parallel.dp_rank if parallel.dp_rank is not None else 0
+        # None: no data-parallel controller, so a single replica.
+        dp_rank = dp_rank if dp_rank is not None else 0
         os.makedirs(out_dir, exist_ok=True)
         path = os.path.join(out_dir, f"forward_cost.dp{dp_rank}.jsonl")
         return cls(path=path, dp_rank=dp_rank)

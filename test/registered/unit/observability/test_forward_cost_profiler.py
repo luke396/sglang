@@ -10,6 +10,7 @@ import msgspec
 
 from sglang.srt.environ import envs
 from sglang.srt.observability import forward_cost_profiler as fcp
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -227,31 +228,34 @@ class TestForwardCostProfiler(CustomTestCase):
         self.assertEqual(_FakeEvent.created, [])
 
     def test_maybe_create_gating(self):
-        def parallel(**kw):
-            base = dict(pp_size=1, attn_tp_rank=0, attn_cp_rank=0, dp_rank=2)
-            base.update(kw)
-            return types.SimpleNamespace(**base)
-
-        def create(par, *, is_draft_worker=False, enable_elastic_ep=False):
-            with patch.object(fcp, "get_parallel", return_value=par):
+        # The real ParallelContext: a stand-in hid a rank this branch lacks.
+        def create(
+            *, is_draft_worker=False, enable_elastic_ep=False, dp_rank=2, **ranks
+        ):
+            parallel = dict(pp_size=1, attn_tp_rank=0, attn_cp_rank=0)
+            parallel.update(ranks)
+            with get_parallel().override(**parallel):
                 return fcp.ForwardCostProfiler.maybe_create(
-                    is_draft_worker=is_draft_worker, enable_elastic_ep=enable_elastic_ep
+                    is_draft_worker=is_draft_worker,
+                    enable_elastic_ep=enable_elastic_ep,
+                    dp_rank=dp_rank,
                 )
 
-        self.assertIsNone(create(parallel()))  # env unset: off
+        self.assertIsNone(create())  # env unset: off
         with envs.SGLANG_FORWARD_COST_PROFILE_DIR.override(self.dir):
-            self.assertIsNone(create(parallel(), is_draft_worker=True))
-            self.assertIsNone(create(parallel(attn_tp_rank=1)))
-            self.assertIsNone(create(parallel(attn_cp_rank=1)))
+            self.assertIsNone(create(is_draft_worker=True))
+            self.assertIsNone(create(attn_tp_rank=1))
+            self.assertIsNone(create(attn_cp_rank=1))
             with self.assertRaises(ValueError):
-                create(parallel(pp_size=2))
+                create(pp_size=2)
             with self.assertRaises(ValueError):
-                create(parallel(), enable_elastic_ep=True)
-            profiler = create(parallel())
-            profiler.close(drain=True)
-        self.assertTrue(
-            os.path.exists(os.path.join(self.dir, "forward_cost.dp2.jsonl"))
-        )
+                create(enable_elastic_ep=True)
+            create().close(drain=True)
+            create(dp_rank=None).close(drain=True)  # no DP controller
+        for rank in (2, 0):
+            self.assertTrue(
+                os.path.exists(os.path.join(self.dir, f"forward_cost.dp{rank}.jsonl"))
+            )
 
 
 if __name__ == "__main__":

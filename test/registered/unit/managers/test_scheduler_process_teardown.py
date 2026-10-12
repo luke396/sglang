@@ -34,7 +34,7 @@ class TestRunSchedulerProcessTeardown(CustomTestCase):
                 actions.append(("profile_close", drain))
                 raise OSError("profile flush: disk full")
 
-        def make_scheduler(server_args, port_args):
+        def make_scheduler(server_args, port_args, *ranks):
             s = MagicMock()
             s.gracefully_exit = gracefully_exit
             s.tp_worker.model_runner.forward_cost_profiler = _Profiler()
@@ -59,6 +59,9 @@ class TestRunSchedulerProcessTeardown(CustomTestCase):
                     PortArgs.init_new(server_args),
                     gpu_id=0,
                     tp_rank=0,
+                    attn_cp_rank=0,
+                    moe_dp_rank=0,
+                    moe_ep_rank=0,
                     pp_rank=0,
                     dp_rank=None,
                     pipe_writer=MagicMock(),
