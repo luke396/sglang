@@ -56,11 +56,9 @@ class ForwardCostProfiler:
     def __init__(self, *, path: str, dp_rank: int):
         # "xb" refuses to append to an earlier run's samples.
         self._file = open(path, "xb")
-        self._encoder = msgspec.json.Encoder()
         self._dp_rank = dp_rank
         self._timer = DeviceTimer(reporter=self._write)
-        self._num_started = 0
-        self._num_written = 0
+        self._num_unwritten = 0
 
     @classmethod
     def maybe_create(
@@ -87,7 +85,7 @@ class ForwardCostProfiler:
         shape = _snapshot_shape(
             forward_batch=forward_batch, split_forward_count=split_forward_count
         )
-        self._num_started += 1
+        self._num_unwritten += 1
         metadata = {"launch_unix_s": time.time(), "failed": False, "shape": shape}
         with self._timer.wrap(metadata=metadata):
             try:
@@ -110,7 +108,7 @@ class ForwardCostProfiler:
             self._timer._report()
         finally:
             self._file.close()
-        lost = self._num_started - self._num_written
+        lost = self._num_unwritten
         if lost:
             logger.warning(
                 "forward cost profiler closed with %d unwritten samples", lost
@@ -126,8 +124,8 @@ class ForwardCostProfiler:
             failed=failed,
             shape=shape,
         )
-        self._file.write(self._encoder.encode(record) + b"\n")
-        self._num_written += 1
+        self._file.write(msgspec.json.encode(record) + b"\n")
+        self._num_unwritten -= 1
 
 
 def forward_cost_scope(
