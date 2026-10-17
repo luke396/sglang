@@ -166,44 +166,68 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
         self.assertEqual(pool.logical_page_size, PHYSICAL_PAGE)
 
     def test_zero_copy_metadata_folds_widened_indices(self):
-        for dcp_size in (1, DCP_SIZE):
-            for dcp_rank in range(dcp_size):
-                with self.subTest(dcp_size=dcp_size, dcp_rank=dcp_rank):
-                    pool = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
-                    pool.dcp_size = dcp_size
-                    pool.dcp_rank = dcp_rank
-                    pool.page_size = PHYSICAL_PAGE
-                    pool.layout = "layer_first"
-                    pool.layer_num = 2
-                    pool.size = 1024
-                    pool.kv_cache_dim = 8
-                    pool.dtype = torch.float16
-                    pool.kv_buffer = torch.zeros(
-                        (pool.layer_num, pool.size, 1, pool.kv_cache_dim),
-                        dtype=pool.dtype,
-                    )
-                    logical_page = PHYSICAL_PAGE * dcp_size
-                    # Nonzero, noncontiguous logical pages must map to the
-                    # corresponding physical pages on every DCP rank.
-                    logical_indices = torch.cat(
-                        [
-                            torch.arange(p * logical_page, (p + 1) * logical_page)
-                            for p in (2, 4)
-                        ]
-                    )
-                    ptrs, sizes = pool.get_page_buffer_meta(logical_indices)
-                    stride = pool.kv_cache_dim * pool.dtype.itemsize
-                    layer_stride = pool.size * stride
-                    expected = []
-                    for page_start in (2 * PHYSICAL_PAGE, 4 * PHYSICAL_PAGE):
-                        for layer_id in range(pool.layer_num):
-                            expected.append(
-                                pool.kv_buffer.data_ptr()
-                                + page_start * stride
-                                + layer_id * layer_stride
+        """L3 metadata must identify physical pages, including non-DCP FP8."""
+        for layout, dtype in (
+            ("layer_first", torch.float16),
+            ("page_first_direct", torch.float16),
+            ("page_first_direct", torch.float8_e4m3fn),
+        ):
+            for dcp_size in (1, DCP_SIZE):
+                for dcp_rank in range(dcp_size):
+                    with self.subTest(
+                        layout=layout, dtype=dtype, dcp_size=dcp_size, dcp_rank=dcp_rank
+                    ):
+                        pool = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
+                        pool.dcp_size = dcp_size
+                        pool.dcp_rank = dcp_rank
+                        pool.page_size = PHYSICAL_PAGE
+                        pool.layout = layout
+                        pool.layer_num = 2
+                        pool.size = 1024
+                        pool.kv_cache_dim = 8
+                        pool.dtype = dtype
+                        shape = (
+                            (pool.layer_num, pool.size, 1, pool.kv_cache_dim)
+                            if layout == "layer_first"
+                            else (
+                                pool.size // PHYSICAL_PAGE,
+                                pool.layer_num,
+                                PHYSICAL_PAGE,
+                                1,
+                                pool.kv_cache_dim,
                             )
-                    self.assertEqual(ptrs, expected)
-                    self.assertEqual(sizes, [PHYSICAL_PAGE * stride] * 4)
+                        )
+                        pool.kv_buffer = torch.zeros(shape, dtype=dtype)
+                        logical_page = PHYSICAL_PAGE * dcp_size
+                        # Nonzero, noncontiguous logical pages must map to the
+                        # corresponding physical pages on every DCP rank.
+                        logical_indices = torch.cat(
+                            [
+                                torch.arange(p * logical_page, (p + 1) * logical_page)
+                                for p in (2, 4)
+                            ]
+                        )
+                        ptrs, sizes = pool.get_page_buffer_meta(logical_indices)
+                        if layout == "layer_first":
+                            stride = pool.kv_cache_dim * pool.dtype.itemsize
+                            layer_stride = pool.size * stride
+                            expected = []
+                            for page_start in (2 * PHYSICAL_PAGE, 4 * PHYSICAL_PAGE):
+                                for layer_id in range(pool.layer_num):
+                                    expected.append(
+                                        pool.kv_buffer.data_ptr()
+                                        + page_start * stride
+                                        + layer_id * layer_stride
+                                    )
+                            self.assertEqual(ptrs, expected)
+                            self.assertEqual(sizes, [PHYSICAL_PAGE * stride] * 4)
+                        else:
+                            buffers = [pool.kv_buffer[p] for p in (2, 4)]
+                            self.assertEqual(ptrs, [buf.data_ptr() for buf in buffers])
+                            self.assertEqual(
+                                sizes,
+                                [buf.numel() * buf.element_size() for buf in buffers],
+                            )
 
 
 class TestTransferEntryPointsTranslate(CustomTestCase):

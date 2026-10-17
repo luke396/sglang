@@ -1057,7 +1057,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         """
         meta data for zero copy
         """
-        indices = self.maybe_dcp_kernel_indices(indices)
+        indices = maybe_dcp_kernel_indices(indices, self.dcp_size, self.dcp_rank)
         assert len(indices) % self.page_size == 0
         ptr_list = []
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()
